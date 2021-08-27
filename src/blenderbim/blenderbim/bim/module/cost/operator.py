@@ -27,6 +27,7 @@ from blenderbim.bim.ifc import IfcStore
 from bpy_extras.io_utils import ImportHelper
 from ifcopenshell.api.cost.data import Data
 from ifcopenshell.api.unit.data import Data as UnitData
+from ifcopenshell.api.resource.data import Data as ResourceData
 
 
 class AddCostSchedule(bpy.types.Operator):
@@ -590,6 +591,7 @@ class AddCostValue(bpy.types.Operator):
 
     def _execute(self, context):
         self.file = IfcStore.get_file()
+        parent = self.file.by_id(self.parent)
         if self.cost_type == "FIXED":
             category = None
             attributes = {"AppliedValue": 0.0}
@@ -599,14 +601,17 @@ class AddCostValue(bpy.types.Operator):
         elif self.cost_type == "CATEGORY":
             category = self.cost_category
             attributes = {"Category": category}
-        value = ifcopenshell.api.run("cost.add_cost_value", self.file, parent=self.file.by_id(self.parent))
+        value = ifcopenshell.api.run("cost.add_cost_value", self.file, parent=parent)
         ifcopenshell.api.run("cost.edit_cost_value", self.file, cost_value=value, attributes=attributes)
-        Data.load(self.file)
+        if parent.is_a("IfcConstructionResource"):
+            ResourceData.load(self.file)
+        else:
+            Data.load(self.file)
         return {"FINISHED"}
 
 
 class RemoveCostItemValue(bpy.types.Operator):
-    bl_idname = "bim.remove_cost_item_value"
+    bl_idname = "bim.remove_cost_value"
     bl_label = "Add Cost Item Value"
     bl_options = {"REGISTER", "UNDO"}
     parent: bpy.props.IntProperty()
@@ -617,13 +622,17 @@ class RemoveCostItemValue(bpy.types.Operator):
 
     def _execute(self, context):
         self.file = IfcStore.get_file()
+        parent = self.file.by_id(self.parent)
         ifcopenshell.api.run(
-            "cost.remove_cost_item_value",
+            "cost.remove_cost_value",
             self.file,
-            parent=self.file.by_id(self.parent),
+            parent=parent,
             cost_value=self.file.by_id(self.cost_value),
         )
-        Data.load(self.file)
+        if parent.is_a("IfcConstructionResource"):
+            ResourceData.load(self.file)
+        else:
+            Data.load(self.file)
         return {"FINISHED"}
 
 
@@ -636,7 +645,8 @@ class EnableEditingCostItemValue(bpy.types.Operator):
     def execute(self, context):
         self.props = context.scene.BIMCostProperties
         self.props.cost_value_attributes.clear()
-        self.props.active_cost_item_value_id = self.cost_value
+        self.props.active_cost_value_id = self.cost_value
+        self.props.cost_value_editing_type = "ATTRIBUTES"
         data = Data.cost_values[self.cost_value]
 
         blenderbim.bim.helper.import_attributes(
@@ -705,13 +715,51 @@ class DisableEditingCostItemValue(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.BIMCostProperties
-        props.active_cost_item_value_id = 0
+        props.active_cost_value_id = 0
+        props.cost_value_editing_type = ""
         return {"FINISHED"}
 
 
-class EditCostValue(bpy.types.Operator):
+class EnableEditingCostItemValueFormula(bpy.types.Operator):
+    bl_idname = "bim.enable_editing_cost_item_value_formula"
+    bl_label = "Enable Editing Cost Item Value Formula"
+    bl_options = {"REGISTER", "UNDO"}
+    cost_value: bpy.props.IntProperty()
+
+    def execute(self, context):
+        self.props = context.scene.BIMCostProperties
+        self.props.cost_value_attributes.clear()
+        self.props.active_cost_value_id = self.cost_value
+        self.props.cost_value_editing_type = "FORMULA"
+        self.props.cost_value_formula = Data.cost_values[self.cost_value]["Formula"]
+        return {"FINISHED"}
+
+
+class EditCostItemValueFormula(bpy.types.Operator):
+    bl_idname = "bim.edit_cost_value_formula"
+    bl_label = "Edit Cost Value Formula"
+    bl_options = {"REGISTER", "UNDO"}
+    cost_value: bpy.props.IntProperty()
+
+    def execute(self, context):
+        return IfcStore.execute_ifc_operator(self, context)
+
+    def _execute(self, context):
+        props = context.scene.BIMCostProperties
+        self.file = IfcStore.get_file()
+        ifcopenshell.api.run(
+            "cost.edit_cost_value_formula",
+            self.file,
+            **{"cost_value": self.file.by_id(self.cost_value), "formula": props.cost_value_formula},
+        )
+        Data.load(IfcStore.get_file())
+        bpy.ops.bim.disable_editing_cost_item_value()
+        return {"FINISHED"}
+
+
+class EditCostItemValue(bpy.types.Operator):
     bl_idname = "bim.edit_cost_value"
-    bl_label = "Edit Cost Item Value"
+    bl_label = "Edit Cost Value"
     bl_options = {"REGISTER", "UNDO"}
     cost_value: bpy.props.IntProperty()
 
