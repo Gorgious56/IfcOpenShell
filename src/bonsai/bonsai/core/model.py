@@ -314,3 +314,39 @@ def closest_endpoint_midpoint(
     closest_pair = min(((a, b) for a in endpoints_a for b in endpoints_b), key=lambda pair: _distance_sq(*pair))
     a, b = closest_pair
     return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
+
+
+def compute_path_connection_location(
+    seg_self: tuple[tuple[float, float, float], tuple[float, float, float]],
+    self_conn_type: str,
+    seg_other: tuple[tuple[float, float, float], tuple[float, float, float]],
+    other_conn_type: str,
+    parallel_threshold: float = 0.9994,
+) -> tuple[float, float, float]:
+    """World-space location of a single ``IfcRelConnectsPathElements`` between two
+    wall axes, given each wall's connection type (``ATSTART`` | ``ATEND`` | ``ATPATH``
+    | ``NOTDEFINED``).
+
+    The physical join sits at whichever wall has an end-type connection: an end-joined
+    wall ends AT the join, while an ATPATH wall passes THROUGH it. Priority order:
+
+    1. ``self`` is ATSTART/ATEND → that endpoint of ``self``.
+    2. Else ``other`` is ATSTART/ATEND → that endpoint of ``other``.
+    3. Else (both ATPATH or NOTDEFINED — cross junction or under-specified):
+       fall back to the 2D axis intersection. If the axes are parallel,
+       degenerate to :func:`closest_endpoint_midpoint` so the caller still gets
+       a usable point on screen rather than ``None``.
+
+    Pure tuple-in/tuple-out — runs in the core test lane without ``mathutils``."""
+    if self_conn_type == "ATSTART":
+        return seg_self[0]
+    if self_conn_type == "ATEND":
+        return seg_self[1]
+    if other_conn_type == "ATSTART":
+        return seg_other[0]
+    if other_conn_type == "ATEND":
+        return seg_other[1]
+    intersection = project_axis_intersection(seg_self, seg_other, parallel_threshold)
+    if intersection is not None:
+        return intersection
+    return closest_endpoint_midpoint(seg_self, seg_other)

@@ -241,3 +241,79 @@ class TestVerticalHeightFromExtrusionDepth:
         positive = subject.vertical_height_from_extrusion_depth(3.0, math.radians(30))
         negative = subject.vertical_height_from_extrusion_depth(3.0, math.radians(-30))
         assert positive == pytest.approx(negative)
+
+
+class TestComputePathConnectionLocation:
+    """Single-wall unjoin gizmo placement. For each ``IfcRelConnectsPathElements``
+    between two walls, the visible join point is whichever wall has an end-type
+    connection (``ATSTART``/``ATEND``) — that wall ends AT the join, while the
+    other wall passes THROUGH it (``ATPATH``) or also ends there. Tests pin the
+    priority order plus the cross-junction fallback for ATPATH/ATPATH."""
+
+    def _seg_self(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        return ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+
+    def _seg_other_perpendicular(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        # Other wall starts at (2.5, 0, 0) — middle of self's path — and goes north.
+        # Used for T-junction cases.
+        return ((2.5, 0.0, 0.0), (2.5, 3.0, 0.0))
+
+    def test_self_atstart_returns_self_start(self):
+        seg_self = self._seg_self()
+        seg_other = self._seg_other_perpendicular()
+        result = subject.compute_path_connection_location(seg_self, "ATSTART", seg_other, "ATEND")
+        assert result == (pytest.approx(0.0), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_self_atend_returns_self_end(self):
+        seg_self = self._seg_self()
+        seg_other = self._seg_other_perpendicular()
+        result = subject.compute_path_connection_location(seg_self, "ATEND", seg_other, "ATSTART")
+        assert result == (pytest.approx(5.0), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_self_atstart_takes_priority_over_other_atend(self):
+        # If both walls claim an end-connection (geometrically rare but legal in
+        # IFC), self wins so the placement stays anchored to the selected wall.
+        seg_self = self._seg_self()
+        seg_other = ((0.0, 0.0, 0.0), (0.0, 3.0, 0.0))
+        result = subject.compute_path_connection_location(seg_self, "ATSTART", seg_other, "ATEND")
+        # self ATSTART is (0,0,0); other ATEND is (0,3,0). Priority picks self.
+        assert result == (pytest.approx(0.0), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_self_atpath_other_atstart_returns_other_start(self):
+        # T-junction: self is the through-wall, other ends at self's middle.
+        seg_self = self._seg_self()
+        seg_other = self._seg_other_perpendicular()
+        result = subject.compute_path_connection_location(seg_self, "ATPATH", seg_other, "ATSTART")
+        # other ATSTART is (2.5, 0, 0) — the T point on self's path.
+        assert result == (pytest.approx(2.5), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_self_atpath_other_atend_returns_other_end(self):
+        seg_self = self._seg_self()
+        # Other wall ends at (2.5, 0, 0) from the north.
+        seg_other = ((2.5, 3.0, 0.0), (2.5, 0.0, 0.0))
+        result = subject.compute_path_connection_location(seg_self, "ATPATH", seg_other, "ATEND")
+        assert result == (pytest.approx(2.5), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_both_atpath_falls_back_to_intersection(self):
+        # Cross junction (+): both walls pass through each other's middle.
+        seg_self = self._seg_self()
+        seg_other = ((2.5, -2.0, 0.0), (2.5, 2.0, 0.0))
+        result = subject.compute_path_connection_location(seg_self, "ATPATH", seg_other, "ATPATH")
+        assert result[0] == pytest.approx(2.5)
+        assert result[1] == pytest.approx(0.0)
+
+    def test_both_atpath_parallel_falls_back_to_midpoint(self):
+        # Parallel-but-ATPATH/ATPATH shouldn't crash; degenerate fallback to
+        # closest_endpoint_midpoint so the gizmo still gets a placeable point.
+        seg_self = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_other = ((6.0, 0.0, 0.0), (11.0, 0.0, 0.0))
+        result = subject.compute_path_connection_location(seg_self, "ATPATH", seg_other, "ATPATH")
+        # closest endpoints are (5,0,0) and (6,0,0) → midpoint at (5.5, 0, 0).
+        assert result == (pytest.approx(5.5), pytest.approx(0.0), pytest.approx(0.0))
+
+    def test_notdefined_on_both_falls_back_to_intersection(self):
+        seg_self = self._seg_self()
+        seg_other = ((2.5, -2.0, 0.0), (2.5, 2.0, 0.0))
+        result = subject.compute_path_connection_location(seg_self, "NOTDEFINED", seg_other, "NOTDEFINED")
+        assert result[0] == pytest.approx(2.5)
+        assert result[1] == pytest.approx(0.0)
