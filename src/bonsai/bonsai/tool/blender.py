@@ -418,6 +418,34 @@ class Blender(bonsai.core.tool.Blender):
             bpy.ops.wm.tool_set_by_id(name=tool_name)
 
     @classmethod
+    def is_view_top_down(cls, context: bpy.types.Context, threshold: float = 0.9659) -> bool:
+        """True when the viewport camera is looking ~straight down (or up) the world Z axis.
+
+        Default threshold of 0.9659 = cos(15°) — a 15° tilt cone around ±world Z.
+        Above the threshold the world-Z axis projects to a small fraction of its
+        true length on screen, so callers that lay icons or markers out along
+        world Z should switch to a screen-space offset and any gizmo whose intent
+        is specifically "vertical" loses its visual cue. The cone is kept narrow
+        so vertical-intent gizmos stay visible across the typical orbit range of
+        3D viewport work and drop out only near genuine plan view."""
+        rv3d = context.region_data
+        if rv3d is None:
+            return False
+        view_forward = Vector(rv3d.view_matrix.inverted().col[2][:3]).normalized()
+        return abs(view_forward.z) > threshold
+
+    @classmethod
+    def get_screen_up_world(cls, context: bpy.types.Context) -> Vector:
+        """World-space direction corresponding to the camera's up axis (screen-vertical).
+
+        Returns ``+Y`` when region data is unavailable so callers can compute an
+        offset without a guard branch."""
+        rv3d = context.region_data
+        if rv3d is None:
+            return Vector((0.0, 1.0, 0.0))
+        return Vector(rv3d.view_matrix.inverted().col[1][:3]).normalized()
+
+    @classmethod
     def get_shader_editor_context(cls) -> Union[dict[str, Any], None]:
         for screen in bpy.data.screens:
             for area in screen.areas:

@@ -167,3 +167,106 @@ class TestGetDebugInfo(NewFile):
     def test_failed_to_load_returns_only_base_keys(self):
         info = bonsai.get_debug_info(bonsai_failed_to_load=True)
         assert set(info.keys()) == self.EXPECTED_KEYS
+
+
+class TestIsViewTopDown(NewFile):
+    """Pin the default threshold of ``is_view_top_down`` against synthetic view
+    matrices. Drivers that lay out icons or gate gizmos against world-Z rely on
+    this cone width to switch behaviour; a silent default change would shift
+    those callers without their tests noticing."""
+
+    @staticmethod
+    def _ctx(view_matrix):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(region_data=SimpleNamespace(view_matrix=view_matrix))
+
+    def test_returns_false_when_region_data_is_none(self):
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(region_data=None)
+        assert subject.is_view_top_down(ctx) is False
+
+    def test_true_for_exact_top_view(self):
+        from mathutils import Matrix
+
+        # Identity view-matrix: camera Z aligns with world Z exactly.
+        ctx = self._ctx(Matrix.Identity(4))
+        assert subject.is_view_top_down(ctx) is True
+
+    def test_true_for_view_inside_default_cone(self):
+        import math
+
+        from mathutils import Matrix
+
+        # 10° tilt → |view_forward.z| = cos(10°) ≈ 0.985 > 0.9659 default threshold.
+        # Inside the narrow plan-view cone — vertical-intent gizmos should switch
+        # to screen-space (or hide) at this view angle.
+        ctx = self._ctx(Matrix.Rotation(math.radians(10), 4, "X"))
+        assert subject.is_view_top_down(ctx) is True
+
+    def test_false_for_view_outside_default_cone(self):
+        import math
+
+        from mathutils import Matrix
+
+        # 20° tilt → |view_forward.z| = cos(20°) ≈ 0.94 < 0.9659 default threshold.
+        # Outside the cone — Z still projects to ~34% of its world length on
+        # screen, so vertical-intent gizmos remain readable here and should stay
+        # in their world-space positions.
+        ctx = self._ctx(Matrix.Rotation(math.radians(20), 4, "X"))
+        assert subject.is_view_top_down(ctx) is False
+
+    def test_false_for_45_degree_tilt(self):
+        import math
+
+        from mathutils import Matrix
+
+        # 45° tilt → cos(45°) ≈ 0.707; well outside the cone at any reasonable
+        # threshold. Regression guard: a refactor that accidentally widens the
+        # cone past ~45° would silently degrade the typical 3D-orbit experience.
+        ctx = self._ctx(Matrix.Rotation(math.radians(45), 4, "X"))
+        assert subject.is_view_top_down(ctx) is False
+
+    def test_false_for_side_view(self):
+        import math
+
+        from mathutils import Matrix
+
+        # 90° tilt = front/back view → |view_forward.z| = 0.
+        ctx = self._ctx(Matrix.Rotation(math.radians(90), 4, "X"))
+        assert subject.is_view_top_down(ctx) is False
+
+    def test_threshold_parameter_overrides_default(self):
+        import math
+
+        from mathutils import Matrix
+
+        # A 45° tilt that fails the default cone passes when the cone is widened.
+        ctx = self._ctx(Matrix.Rotation(math.radians(45), 4, "X"))
+        assert subject.is_view_top_down(ctx, threshold=0.5) is True
+
+
+class TestGetScreenUpWorld(NewFile):
+    """Pin the contract that ``get_screen_up_world`` returns the camera's up
+    axis in world space, with a safe ``+Y`` fallback when no region is active."""
+
+    @staticmethod
+    def _ctx(view_matrix):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(region_data=SimpleNamespace(view_matrix=view_matrix))
+
+    def test_returns_plus_y_when_region_data_is_none(self):
+        from types import SimpleNamespace
+
+        from mathutils import Vector
+
+        ctx = SimpleNamespace(region_data=None)
+        assert subject.get_screen_up_world(ctx) == Vector((0.0, 1.0, 0.0))
+
+    def test_identity_view_matrix_maps_screen_up_to_plus_y(self):
+        from mathutils import Matrix, Vector
+
+        ctx = self._ctx(Matrix.Identity(4))
+        assert subject.get_screen_up_world(ctx) == Vector((0.0, 1.0, 0.0))
