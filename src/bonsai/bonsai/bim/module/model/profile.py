@@ -15,6 +15,8 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
+#
+# This file was modified with the assistance of an AI coding tool.
 
 import copy
 from math import atan2, degrees, pi, radians
@@ -946,6 +948,7 @@ class Rotate90(bpy.types.Operator, tool.Ifc.Operator):
     bl_label = "Rotate 90"
     bl_options = {"REGISTER", "UNDO"}
     axis: bpy.props.StringProperty()
+    angle: bpy.props.FloatProperty(default=pi / 2, options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -965,7 +968,7 @@ class Rotate90(bpy.types.Operator, tool.Ifc.Operator):
                 ifcopenshell.api.geometry.disconnect_path(tool.Ifc.get(), element=element, connection_type="ATSTART")
                 ifcopenshell.api.geometry.disconnect_path(tool.Ifc.get(), element=element, connection_type="ATEND")
                 ifcopenshell.api.geometry.disconnect_path(tool.Ifc.get(), element=element, connection_type="ATPATH")
-            rotate_matrix = Matrix.Rotation(pi / 2, 4, self.axis)
+            rotate_matrix = Matrix.Rotation(self.angle, 4, self.axis)
             obj.matrix_world @= rotate_matrix
         bpy.context.view_layer.update()
         DumbProfileRecalculator().recalculate(profile_objs)
