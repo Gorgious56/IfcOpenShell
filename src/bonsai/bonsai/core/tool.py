@@ -1023,6 +1023,7 @@ class Spatial:
     def get_container(cls, element): pass
     def get_decomposed_elements(cls, container, recursive): pass
     def get_decomposition(cls, element): pass
+    def get_host_element(cls, filling): pass
     def get_host_wall(cls, filling): pass
     def get_object_matrix(cls, obj): pass
     def get_relative_object_matrix(cls, target_obj, relative_to_obj): pass

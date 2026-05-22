@@ -118,8 +118,7 @@ class Root(bonsai.core.tool.Root):
             element = tool.Ifc.get_entity(obj)
             if not element:
                 continue
-            if hasattr(element, "FillsVoids") and element.FillsVoids:
-                building = element.FillsVoids[0].RelatingOpeningElement.VoidsElements[0].RelatingBuildingElement
+            if building := tool.Spatial.get_host_element(element):
                 relationships[element] = {"type": "fill", "element": building}
         return relationships
 
