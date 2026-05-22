@@ -33,7 +33,12 @@ from .add_door_representation import add_door_representation
 from .add_footprint_representation import add_footprint_representation
 from .add_mesh_representation import add_mesh_representation
 from .add_profile_representation import add_profile_representation
-from .add_railing_representation import add_railing_representation
+from .add_railing_representation import (
+    RailingSupport,
+    WallMountedHandrailGeometry,
+    add_railing_representation,
+    compute_wall_mounted_handrail_geometry,
+)
 
 try:
     from .add_representation import add_representation
@@ -72,8 +77,11 @@ __all__ = [
     "add_door_representation",
     "add_footprint_representation",
     "add_mesh_representation",
+    "RailingSupport",
+    "WallMountedHandrailGeometry",
     "add_profile_representation",
     "add_railing_representation",
+    "compute_wall_mounted_handrail_geometry",
     "add_representation",
     "add_shape_aspect",
     "add_slab_representation",

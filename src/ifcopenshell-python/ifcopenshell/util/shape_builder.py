@@ -34,6 +34,11 @@ import ifcopenshell.util.representation
 import ifcopenshell.util.unit
 
 PRECISION = 1.0e-5
+# Tolerance for equality / deviation checks ("how close to exact is close enough?").
+# Currently equal to PRECISION, but logically separate — if some future equality test
+# needs a looser bound than the rounding precision, change this literal here without
+# also moving PRECISION (which is consumed by round_to_precision below).
+TOLERANCE = 1.0e-5
 
 
 if TYPE_CHECKING:
@@ -77,7 +82,7 @@ def ifc_safe_vector_type(v: Union[VectorType, SequenceOfVectors]) -> Any:
 def is_x(value: float, x: float, si_conversion: Optional[float] = None) -> bool:
     if si_conversion is not None:
         value = value * si_conversion
-    return (x + PRECISION) > value > (x - PRECISION)
+    return (x + TOLERANCE) > value > (x - TOLERANCE)
 
 
 def round_to_precision(x: float, si_conversion: float) -> float:
