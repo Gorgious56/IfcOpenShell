@@ -1289,6 +1289,23 @@ class Blender(bonsai.core.tool.Blender):
             return tool.Model.get_usage_type(element) == "LAYER2"
 
         @classmethod
+        def is_pipe_segment(cls, element: entity_instance) -> bool:
+            """Total predicate for the pipe-segment dimension gizmo.
+
+            Like walls, pipe segments have no proprietary BBIM_PipeSegment pset
+            — parametric length lives in the standard IFC extrusion depth and
+            is mutated via ``DumbProfileJoiner.set_depth``. ``entity_instance.is_a``
+            returns False for non-matching types without raising, so the
+            predicate-totality test passes by construction."""
+            return element.is_a("IfcPipeSegment")
+
+        @classmethod
+        def is_duct_segment(cls, element: entity_instance) -> bool:
+            """Total predicate for the duct-segment dimension gizmo. Mirror of
+            the pipe-segment predicate above."""
+            return element.is_a("IfcDuctSegment")
+
+        @classmethod
         def is_editing_railing_path(cls, obj: bpy.types.Object):
             props = tool.Model.get_railing_props(obj)
             return props.is_editing_path
