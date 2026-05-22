@@ -19,11 +19,16 @@
 import ifcopenshell.api
 from bpy.app.handlers import persistent
 
-from bonsai.bim.module.model import opening, product, profile, task
+from bonsai.bim.module.model import opening, product, profile, task, wall_offset_gizmos
 
 
 @persistent
 def load_post(*args):
+    # Drop file-scoped caches before any of the post-listeners below fire —
+    # the wall-offset gizmo cache is keyed by filling obj name and would
+    # otherwise carry stale entries from the previous file's openings.
+    wall_offset_gizmos.clear_caches()
+
     # TODO: the goal is to slowly remove these API listeners. In hindsight it
     # isn't a good idea because it leads to domino events being triggered. It's
     # less buggy to explicitly code the logic in core.
