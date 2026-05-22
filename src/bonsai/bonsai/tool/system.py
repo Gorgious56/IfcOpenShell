@@ -26,6 +26,7 @@ import bpy
 import ifcopenshell.api.geometry
 import ifcopenshell.api.system
 import ifcopenshell.util.element
+import ifcopenshell.util.placement
 import ifcopenshell.util.system
 from mathutils import Matrix, Vector
 
@@ -457,6 +458,115 @@ class System(bonsai.core.tool.System):
     @classmethod
     def is_mep_element(cls, element: ifcopenshell.entity_instance) -> bool:
         return element.is_a("IfcFlowSegment") or element.is_a("IfcFlowFitting")
+
+    @classmethod
+    def walk_connected_mep_elements(
+        cls,
+        start_element: ifcopenshell.entity_instance,
+        max_nodes: int = 5000,
+    ) -> list[ifcopenshell.entity_instance]:
+        """Return all MEP elements reachable from ``start_element`` via
+        ``IfcRelConnectsPorts`` (in either direction), including the start.
+
+        BFS with a visited set keyed by ifcopenshell entity instance — the
+        cycle case (closed loop in a distribution network) terminates
+        normally instead of looping. Filtered via ``is_mep_element`` so only
+        ``IfcFlowSegment`` and ``IfcFlowFitting`` instances make it into the
+        result; ports are followed as traversal edges but never returned.
+
+        ``max_nodes`` caps the traversal at a defensive bound — typical MEP
+        runs are 5-50 elements, large buildings 100-500; the cap only fires
+        on pathological 10k+ networks where the per-frame draw cost would
+        also exceed the user's patience. When the cap fires, returns the
+        partial result so the decorator still draws SOMETHING."""
+        if not cls.is_mep_element(start_element):
+            return []
+        result: list[ifcopenshell.entity_instance] = []
+        visited: set[int] = set()
+        queue: list[ifcopenshell.entity_instance] = [start_element]
+        while queue and len(result) < max_nodes:
+            element = queue.pop(0)
+            if element.id() in visited:
+                continue
+            visited.add(element.id())
+            if not cls.is_mep_element(element):
+                # Non-MEP element reached via a fitting's connection (e.g. a
+                # terminal). Walked through to keep the path continuous, but
+                # don't add it to the result — the caller only renders MEP
+                # axes / fittings.
+                continue
+            result.append(element)
+            # Walk every port of this element to its connected counterpart's
+            # element. ``get_connected_port`` already handles both
+            # ConnectedTo and ConnectedFrom directions, so we get bidirectional
+            # traversal "for free" without separately querying each direction.
+            for port in cls.get_ports(element):
+                connected_port = cls.get_connected_port(port)
+                if connected_port is None:
+                    continue
+                neighbor = cls.get_port_relating_element(connected_port)
+                if neighbor is None or neighbor.id() in visited:
+                    continue
+                queue.append(neighbor)
+        return result
+
+    @classmethod
+    def get_port_world_position(cls, port: ifcopenshell.entity_instance) -> Vector:
+        """Return the world-space position of an ``IfcDistributionPort``.
+
+        Computes the port's position by combining (a) the port's IFC
+        placement relative to its parent element's IFC frame with (b) the
+        parent element's CURRENT Blender ``matrix_world``. This means the
+        port follows the parent's live Blender rotation / translation even
+        when the IFC placement hasn't been re-committed — critical for the
+        MEP path overlay because the segment axes are drawn from
+        ``obj.matrix_world`` (live Blender) while ports were previously
+        drawn from raw IFC placement (stale on uncommitted rotation),
+        producing visible drift on rotated fittings.
+
+        Falls back to the raw IFC-placement world position when the parent
+        element / object can't be resolved — preserves the old behaviour as
+        the defensive default for free-standing ports or for callers that
+        don't care about the parent-Blender-rotation case.
+
+        Pure read — no IFC mutation."""
+        placement = getattr(port, "ObjectPlacement", None)
+        if placement is None:
+            return Vector((0.0, 0.0, 0.0))
+        # ``get_local_placement`` returns a 4x4 numpy array resolving the
+        # full IFC placement chain to world space — this is the port's
+        # world position AS RECORDED IN IFC. May lag behind Blender if the
+        # user has moved / rotated the parent without committing.
+        port_ifc_matrix = Matrix(ifcopenshell.util.placement.get_local_placement(placement).tolist())
+
+        try:
+            parent_element = cls.get_port_relating_element(port)
+        except Exception:
+            parent_element = None
+        if parent_element is None:
+            return Vector(port_ifc_matrix.translation)
+
+        parent_obj = tool.Ifc.get_object(parent_element)
+        if parent_obj is None:
+            return Vector(port_ifc_matrix.translation)
+
+        parent_placement = getattr(parent_element, "ObjectPlacement", None)
+        if parent_placement is None:
+            return Vector(port_ifc_matrix.translation)
+        parent_ifc_matrix = Matrix(ifcopenshell.util.placement.get_local_placement(parent_placement).tolist())
+
+        # Port expressed in the parent's LOCAL frame (cancels the parent's
+        # IFC world transform). When parent's Blender matrix_world matches
+        # its IFC placement (the steady-state case) this gives the same
+        # result as the raw IFC-placement read; when they diverge (Blender
+        # rotation un-committed) it gives the up-to-date world position.
+        try:
+            port_local_to_parent = parent_ifc_matrix.inverted() @ port_ifc_matrix
+        except ValueError:
+            # parent_ifc_matrix not invertible (degenerate placement) —
+            # fall back to raw IFC world.
+            return Vector(port_ifc_matrix.translation)
+        return (parent_obj.matrix_world @ port_local_to_parent).translation
 
     @classmethod
     def get_flow_element_controls(cls, element: ifcopenshell.entity_instance) -> list[ifcopenshell.entity_instance]:

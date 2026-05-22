@@ -26,6 +26,7 @@ import ifcopenshell.api.feature
 import ifcopenshell.api.geometry
 import ifcopenshell.api.root
 import ifcopenshell.api.style
+import ifcopenshell.api.system
 import ifcopenshell.util.element
 import ifcopenshell.util.placement
 import ifcopenshell.util.representation
@@ -39,6 +40,34 @@ from bonsai.bim.module.spatial.decorator import GridDecorator
 
 if TYPE_CHECKING:
     from bonsai.bim.module.root.prop import BIMRootProperties
+
+
+def direction_from_port_pair(port_a: ifcopenshell.entity_instance, port_b: ifcopenshell.entity_instance) -> str:
+    """Derive the ``direction`` argument that ``ifcopenshell.api.system.connect_port``
+    would have received, by reading each port's ``IfcDistributionPort.FlowDirection``.
+
+    ``connect_port`` writes the supplied ``direction`` onto the ports'
+    FlowDirection attributes (see connect_port.py:128-136), so the
+    reverse-mapping below reads it back from the same source. This is
+    the only round-tripable place to recover direction — ``IfcRelConnectsPorts``
+    does NOT have a Direction attribute (the earlier code tried to read
+    it from the rel and crashed at runtime). Used by
+    ``Root.get_port_connection_relationships`` to preserve direction
+    across duplication.
+
+    Falls through to NOTDEFINED for any FlowDirection combo the canonical
+    (SOURCE↔SINK / SOURCEANDSINK↔SOURCEANDSINK / NOTDEFINED↔NOTDEFINED)
+    pairs don't cover — that's the safest default: ``connect_port`` will
+    leave the ports' existing FlowDirection alone for NOTDEFINED."""
+    a = getattr(port_a, "FlowDirection", None) or "NOTDEFINED"
+    b = getattr(port_b, "FlowDirection", None) or "NOTDEFINED"
+    if a == "SOURCE" and b == "SINK":
+        return "SOURCE"
+    if a == "SINK" and b == "SOURCE":
+        return "SINK"
+    if a == "SOURCEANDSINK" and b == "SOURCEANDSINK":
+        return "SOURCEANDSINK"
+    return "NOTDEFINED"
 
 
 class Root(bonsai.core.tool.Root):
@@ -165,6 +194,180 @@ class Root(bonsai.core.tool.Root):
                         "relating_priorities": path.RelatingPriorities,
                     }
         return relationships
+
+    @classmethod
+    def get_port_connection_relationships(cls, objs: list[bpy.types.Object]) -> list[dict[str, Any]]:
+        """Snapshot ``IfcRelConnectsPorts`` connections among MEP elements in
+        the to-be-duplicated set.
+
+        Counterpart to ``get_connection_relationships`` for the MEP world:
+        the latter only captures ``IfcRelConnectsPathElements`` (wall-style
+        joins), so MEP segments + fittings lost their port-to-port linkage
+        on Shift+D. This snapshot captures only the relationships where
+        BOTH endpoints' parent elements are in the input set — duplicates
+        should be wired to each other, not back to the originals.
+
+        Port mapping uses POSITIONAL INDICES within each element's port
+        list. ``ifcopenshell.api.root.copy_class`` preserves the order of
+        the new element's nested ports relative to the source (see
+        ``copy_class.copy_indirect_attributes`` — it iterates the original
+        ``IfcRelNests.RelatedObjects`` and stores them on the new
+        ``IfcRelNests`` in the same order), so ``get_ports(new)[i]``
+        corresponds to ``get_ports(old)[i]``."""
+        relationships: list[dict[str, Any]] = []
+        elements_in_set: set[ifcopenshell.entity_instance] = set()
+        for obj in objs:
+            element = tool.Ifc.get_entity(obj)
+            if element is not None and tool.System.is_mep_element(element):
+                elements_in_set.add(element)
+        if not elements_in_set:
+            return relationships
+
+        # ``seen`` canonicalises each port pair so the symmetric counterpart
+        # (the same connection encountered from the other side) isn't
+        # captured twice.
+        seen: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for element in elements_in_set:
+            ports = tool.System.get_ports(element)
+            for port_index, port in enumerate(ports):
+                connected_port = tool.System.get_connected_port(port)
+                if connected_port is None:
+                    continue
+                try:
+                    other_element = tool.System.get_port_relating_element(connected_port)
+                except Exception:
+                    continue
+                if other_element is None or other_element not in elements_in_set:
+                    continue
+                other_ports = tool.System.get_ports(other_element)
+                try:
+                    other_port_index = other_ports.index(connected_port)
+                except ValueError:
+                    continue
+                pair_key = tuple(
+                    sorted(
+                        [
+                            (element.id(), port_index),
+                            (other_element.id(), other_port_index),
+                        ]
+                    )
+                )
+                if pair_key in seen:
+                    continue
+                seen.add(pair_key)
+
+                # Derive the connection's ``direction`` from each port's
+                # ``IfcDistributionPort.FlowDirection``. The earlier code
+                # tried to read ``rel.Direction`` directly, but
+                # ``IfcRelConnectsPorts`` only carries GlobalId /
+                # OwnerHistory / Name / Description / RelatingPort /
+                # RelatedPort / RealizingElement — Direction lives on
+                # the port itself. ``connect_port`` writes the supplied
+                # ``direction`` arg onto each port's FlowDirection at
+                # connect time (see connect_port.py:128-136), so the
+                # reverse-mapping below reads it back from the same
+                # source. Falls through to NOTDEFINED for any combo the
+                # canonical (SOURCE↔SINK / SOURCEANDSINK↔SOURCEANDSINK)
+                # pairs don't cover.
+                direction = direction_from_port_pair(port, connected_port)
+
+                relationships.append(
+                    {
+                        "relating_element": element,
+                        "relating_port_index": port_index,
+                        "related_element": other_element,
+                        "related_port_index": other_port_index,
+                        "direction": direction,
+                    }
+                )
+        return relationships
+
+    @classmethod
+    def recreate_port_connections(
+        cls,
+        port_connections: list[dict[str, Any]],
+        old_to_new: dict[ifcopenshell.entity_instance, list[ifcopenshell.entity_instance]],
+        original_port_counts: dict[ifcopenshell.entity_instance, int] | None = None,
+    ) -> None:
+        """Recreate ``IfcRelConnectsPorts`` between duplicated MEP elements.
+
+        ``copy_class`` for an MEP element creates new ports (in the same
+        positional order as the source) but explicitly disconnects them
+        from the original network — every new port has its IfcRelConnectsPorts
+        cleared on copy. This method restores the connections AMONG the
+        duplicates — for each captured (element_a, port_index_a) ↔
+        (element_b, port_index_b) entry, it looks up the new elements via
+        ``old_to_new`` and calls ``connect_port`` on the matching new
+        ports. Direction (SOURCE / SINK / etc.) is carried over from the
+        snapshot.
+
+        Positional-index contract — IMPORTANT
+        --------------------------------------
+        Port mapping relies on ``tool.System.get_ports(new)[i]``
+        corresponding to ``tool.System.get_ports(old)[i]``. This holds
+        because ``copy_class`` walks the source's nested-port list in
+        order and stores each copy on the new element's nesting
+        relationship in the same order. The invariant breaks if the
+        new element ends up with a different port count than the
+        source — e.g. if a future change to ``copy_class`` filters or
+        reorders ports, or if some external mutation interleaves
+        between snapshot and recreation.
+
+        When ``original_port_counts`` is supplied (recommended for the
+        Shift+D path), the recreation skips entries whose new-element
+        port count differs from the snapshot's. This degrades
+        gracefully — the user loses the specific connection, but the
+        rest of the batch survives — rather than silently wiring the
+        wrong port pair. Callers that don't supply the mapping accept
+        the legacy best-effort behaviour."""
+        for entry in port_connections:
+            try:
+                new_relating = old_to_new[entry["relating_element"]][0]
+                new_related = old_to_new[entry["related_element"]][0]
+            except (KeyError, IndexError):
+                continue
+            new_relating_ports = tool.System.get_ports(new_relating)
+            new_related_ports = tool.System.get_ports(new_related)
+
+            # Defensive guard: if the new element's port count diverges
+            # from the snapshot's, the positional-index contract above
+            # is no longer trustworthy. Skip rather than connect ports
+            # at potentially wrong positions.
+            if original_port_counts is not None:
+                expected_relating = original_port_counts.get(entry["relating_element"])
+                expected_related = original_port_counts.get(entry["related_element"])
+                if expected_relating is not None and len(new_relating_ports) != expected_relating:
+                    print(
+                        f"Bonsai: skipping port reconnect — duplicate has "
+                        f"{len(new_relating_ports)} ports, snapshot had {expected_relating}"
+                    )
+                    continue
+                if expected_related is not None and len(new_related_ports) != expected_related:
+                    print(
+                        f"Bonsai: skipping port reconnect — duplicate has "
+                        f"{len(new_related_ports)} ports, snapshot had {expected_related}"
+                    )
+                    continue
+
+            try:
+                new_port_a = new_relating_ports[entry["relating_port_index"]]
+                new_port_b = new_related_ports[entry["related_port_index"]]
+            except IndexError:
+                continue
+            try:
+                # Route through Bonsai's undo-aware wrapper so the
+                # restoration shows up in the addon's transaction history
+                # alongside the rest of the duplicate flow.
+                tool.Ifc.run(
+                    "system.connect_port",
+                    port1=new_port_a,
+                    port2=new_port_b,
+                    direction=entry.get("direction") or "NOTDEFINED",
+                )
+            except Exception as e:
+                # Failure on one connection shouldn't tank the whole batch
+                # — surface to the console and keep recreating the rest.
+                print(f"Bonsai: failed to recreate port connection between duplicates: {e}")
 
     @classmethod
     def get_element_representation(
