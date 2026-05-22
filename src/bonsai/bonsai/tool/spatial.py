@@ -91,6 +91,22 @@ class Spatial(bonsai.core.tool.Spatial):
         return element
 
     @classmethod
+    def get_host_wall(cls, filling: ifcopenshell.entity_instance) -> ifcopenshell.entity_instance | None:
+        """The ``IfcWall`` that hosts a filling (door/window), or ``None``.
+
+        Walks ``filling.FillsVoids[0].RelatingOpeningElement.VoidsElements[0].RelatingBuildingElement``
+        with safety guards at each hop, and only returns the host if it is an
+        ``IfcWall`` — fillings hosted in slabs / roofs / arbitrary elements
+        produce ``None`` so wall-offset callers stay opted out cleanly."""
+        if not filling.FillsVoids:
+            return None
+        opening = filling.FillsVoids[0].RelatingOpeningElement
+        if not opening.VoidsElements:
+            return None
+        host = opening.VoidsElements[0].RelatingBuildingElement
+        return host if host.is_a("IfcWall") else None
+
+    @classmethod
     def can_contain(cls, container: ifcopenshell.entity_instance, element: ifcopenshell.entity_instance) -> bool:
         if tool.Ifc.get_schema() == "IFC2X3":
             if not container.is_a("IfcSpatialStructureElement"):

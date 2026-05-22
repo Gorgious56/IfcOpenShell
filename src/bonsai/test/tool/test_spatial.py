@@ -157,6 +157,58 @@ class TestGetDecomposedElements(NewFile):
         assert subject.get_decomposed_elements(site) == {wall}
 
 
+class TestGetHostWall(NewFile):
+    """``get_host_wall`` is the chain-walk callers reach for when a filling's
+    wall-offset gizmo needs the host wall's length/height — the four guards
+    here exist because the chain is sparse: a hosted door, an orphaned door,
+    a half-built opening, and a door voiding a non-wall element all need
+    distinct handling, and an exception at any link would bubble up to the
+    gizmo's per-frame draw."""
+
+    def test_door_in_wall_returns_wall(self):
+        ifc = ifcopenshell.file()
+        wall = ifc.createIfcWall()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=wall)
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_wall(door) == wall
+
+    def test_window_in_wall_returns_wall(self):
+        ifc = ifcopenshell.file()
+        wall = ifc.createIfcWall()
+        opening = ifc.createIfcOpeningElement()
+        window = ifc.createIfcWindow()
+        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=wall)
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=window)
+        assert subject.get_host_wall(window) == wall
+
+    def test_filling_with_no_opening_returns_none(self):
+        # Standalone door — never inserted into anything.
+        ifc = ifcopenshell.file()
+        door = ifc.createIfcDoor()
+        assert subject.get_host_wall(door) is None
+
+    def test_opening_with_no_void_returns_none(self):
+        # Orphaned opening: door was filled into an opening that lost its host.
+        ifc = ifcopenshell.file()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_wall(door) is None
+
+    def test_host_is_slab_returns_none(self):
+        # Door voiding a slab (a skylight, conceptually) — host exists but is
+        # not an ``IfcWall``; the wall-offset gizmo callers must hide cleanly.
+        ifc = ifcopenshell.file()
+        slab = ifc.createIfcSlab()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=slab)
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_wall(door) is None
+
+
 class TestGetObjectMatrix(NewFile):
     def test_run(self):
         obj = bpy.data.objects.new("Object", None)
