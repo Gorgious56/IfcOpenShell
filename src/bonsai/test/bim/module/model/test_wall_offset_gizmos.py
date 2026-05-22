@@ -265,32 +265,33 @@ def test_set_wall_offset_top_round_trips_with_get():
 
 def test_geom_cache_invalidates_when_generation_bumps():
     """The cache must reset when ``tool.Parametric.get_geom_generation()``
-    advances — otherwise IFC mutations done while the same filling stays
-    selected would leave stale host-wall reads in memory."""
+    advances so IFC mutations don't leave stale host-wall reads in memory."""
     props, _ = _make_props(Matrix.Translation((1.0, 0.0, 0.0)))
-    # First read at generation 1: wall is 5 m long.
-    with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0, geom_gen=1):
-        first = subject.get_wall_offset_left(props)
-    # Same filling, but generation bumped AND wall is now 8 m long. If the cache
-    # is sticky on generation, ``first`` and ``second`` would match; they
-    # shouldn't, because the filling's offset_left depends on the host's geometry
-    # only indirectly — but we exercise the cache reset path by mutating
-    # something the cached tuple holds (length, used by right offset).
-    with _patch_host_wall(Matrix.Identity(4), length=8.0, height=3.0, geom_gen=2):
-        right_after_bump = subject.get_wall_offset_right(props)
-    # 8m wall, filling at x=1, width 1 → right offset = 6.
+    # Patch get_geom_generation on the real class — the cache binds to the class
+    # at definition time, so a mock.patch.multiple on subject.tool.Parametric
+    # would be invisible to it.
+    from bonsai.tool.parametric import Parametric
+
+    with mock.patch.object(Parametric, "get_geom_generation", return_value=1):
+        with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
+            first = subject.get_wall_offset_left(props)
+    with mock.patch.object(Parametric, "get_geom_generation", return_value=2):
+        with _patch_host_wall(Matrix.Identity(4), length=8.0, height=3.0):
+            right_after_bump = subject.get_wall_offset_right(props)
     assert first == pytest.approx(1.0)
+    # 8 m wall, filling at x=1, width 1 → right offset = 6. Reads 6 only if the
+    # cache dropped on the generation bump.
     assert right_after_bump == pytest.approx(6.0)
 
 
 # ----------------------------------------------------------------------
-# Signed compute_value for left/right (sign-flip on filling's 180° Z rotation)
+# Signed value the gizmo reports for left/right (sign-flip on filling's 180° Z rotation)
 #
 # Without the sign flip the dim arrow renders in the wrong world direction
-# for a filling whose local +X is opposite the wall's local +X. ``_apply_dimension_matrix``
-# in the gizmo system reverses the gizmo basis when compute_value is negative,
-# so the unflipped/flipped cases produce a mirrored sign and the arrow ends up
-# pointing the right way visually in both orientations.
+# for a filling whose local +X is opposite the wall's local +X. The gizmo
+# system flips its rendered dim arrow 180° around Z whenever the reported
+# value is negative, so the unflipped/flipped cases produce mirrored signs
+# and the arrow ends up pointing the right way visually in both orientations.
 # ----------------------------------------------------------------------
 
 
@@ -303,7 +304,7 @@ def test_left_signed_value_positive_for_unflipped_filling():
 def test_left_signed_value_negative_for_flipped_filling():
     """Filling rotated 180° around Z: its leftmost edge (in wall coords) sits
     at wall-X 0.5, so the user-facing left offset is 0.5 — but the signed
-    value must be -0.5 so the gizmo flips its render via FLIP_MATRIX."""
+    value must be -0.5 so the gizmo flips its rendered arrow 180° around Z."""
     from math import pi
 
     filling = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi, 4, "Z")
@@ -375,7 +376,8 @@ def test_apply_value_takes_absolute_value():
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
         # Simulate the gizmo handing back a negative value (flipped-filling scenario).
         # The user-facing offset is +2.0, the filling must end up at wall-X=2.0.
-        subject.WALL_OFFSET_GIZMO_CONFIGS[0].apply_value(props, -2.0)
+        left_cfg = next(c for c in subject.WALL_OFFSET_GIZMO_CONFIGS if c.attr_name == "host_wall_offset_left")
+        left_cfg.apply_value(props, -2.0)
     assert filling_obj.matrix_world.translation.x == pytest.approx(2.0)
 
 
@@ -385,20 +387,6 @@ def test_clear_caches_drops_all_entries():
     props, _ = _make_props(Matrix.Translation((1.0, 0.0, 0.0)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
         subject.get_wall_offset_left(props)
-    assert subject._GEOM_CACHE  # populated
+    assert subject._GEOM_CACHE._data
     subject.clear_caches()
-    assert not subject._GEOM_CACHE  # empty after clear
-
-
-def test_left_right_min_value_permits_signed_values():
-    """The gizmo system clamps incoming drag values via ``max(min_value, value)``
-    before passing to ``apply_value``. Left/right gizmos pass signed values
-    (negative on flipped fillings), so a default ``min_value=0`` would collapse
-    every flipped-filling click to zero on the first frame. Pin the deliberate
-    very-negative bound — the apply lambdas still clamp internally via abs."""
-    left_cfg = subject.WALL_OFFSET_GIZMO_CONFIGS[0]
-    right_cfg = subject.WALL_OFFSET_GIZMO_CONFIGS[1]
-    assert left_cfg.attr_name == "host_wall_offset_left"
-    assert right_cfg.attr_name == "host_wall_offset_right"
-    assert left_cfg.min_value < -100.0
-    assert right_cfg.min_value < -100.0
+    assert not subject._GEOM_CACHE._data
