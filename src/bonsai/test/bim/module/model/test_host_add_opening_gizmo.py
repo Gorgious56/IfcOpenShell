@@ -26,11 +26,17 @@ the void object's elevation. Each branch is exercised independently with
 mocks so the per-type contract is pinned without launching a full Blender
 modelling session."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import bpy
 import pytest
 from mathutils import Matrix, Vector
+
+import bonsai.tool as tool
+from test.bim.bootstrap import NewFile
+from test.bim.module.model.conftest import make_context
 
 pytestmark = pytest.mark.model
 
@@ -40,22 +46,43 @@ pytestmark = pytest.mark.model
 # ---------------------------------------------------------------------------
 
 
-def _make_context(active, selected):
-    return SimpleNamespace(active_object=active, selected_objects=list(selected))
+_IFC_CLASS_BY_KIND = {
+    "wall": "IfcWall",
+    "slab": "IfcSlab",
+    "roof": "IfcRoof",
+    "plain": "IfcDiscreteAccessory",
+}
 
 
-def _patch_for_poll(prefs_on, selected, active_kind, other_kind):
-    """Build a stack of patches that simulates a single poll() invocation.
+class _FakeIfcEntity:
+    """Minimal stand-in for an ``ifcopenshell.entity_instance`` in poll tests.
 
-    ``active_kind`` / ``other_kind`` accept ``"wall"``, ``"slab"``, ``"roof"``,
-    ``"plain"`` (non-host IFC element), ``"mesh"`` (no IFC entity), or
-    ``None`` (object outside the selection set). The patches drive
-    ``tool.Ifc.get_entity`` and the three host predicates accordingly."""
-    from bonsai import tool
+    Provides the two surfaces the gizmo's poll consults: ``is_a(type_name)``
+    (used directly by ``is_supported_host`` for slab/roof) and an optional
+    ``HasOpenings`` attribute (probed by the poll's ``hasattr`` guard)."""
 
-    # SimpleNamespace, not bare object(): the host sentinels need a settable
-    # ``HasOpenings`` attribute so the poll's ``hasattr`` branch can hit.
-    sentinels = {kind: SimpleNamespace() for kind in ("wall", "slab", "roof", "plain")}
+    def __init__(self, ifc_class: str, has_openings: bool = True):
+        self._ifc_class = ifc_class
+        if has_openings:
+            self.HasOpenings = ()
+
+    def is_a(self, type_name: str) -> bool:
+        return self._ifc_class == type_name
+
+
+def _build_poll_callbacks(selected, active_kind, other_kind):
+    """Build the ``(get_entity, is_wall)`` side-effect callables that simulate
+    one poll() invocation. ``active_kind`` / ``other_kind`` accept ``"wall"``,
+    ``"slab"``, ``"roof"``, ``"plain"`` (non-host IFC element), ``"mesh"``
+    (no IFC entity), or ``None`` (object outside the selection set).
+
+    Wall recognition still goes through ``tool.Blender.Modifier.is_wall``
+    (production: parametric LAYER2); slab/roof use ``is_a`` on the fake
+    entity so the broadened class-based predicate is exercised."""
+    sentinels = {kind: _FakeIfcEntity(_IFC_CLASS_BY_KIND[kind]) for kind in _IFC_CLASS_BY_KIND}
+    # The "plain" sentinel intentionally lacks HasOpenings so the hasattr
+    # guard branch is reachable from the corresponding poll test.
+    sentinels["plain"] = _FakeIfcEntity(_IFC_CLASS_BY_KIND["plain"], has_openings=False)
 
     def entity_for(kind):
         if kind in (None, "mesh"):
@@ -74,71 +101,52 @@ def _patch_for_poll(prefs_on, selected, active_kind, other_kind):
     def is_wall(element):
         return element is sentinels["wall"]
 
-    def is_slab(element):
-        return element is sentinels["slab"]
-
-    def is_roof(element):
-        return element is sentinels["roof"]
-
-    # ``HasOpenings`` must look real for the wall/slab/roof sentinels but be
-    # absent on the "plain" sentinel so the corresponding poll branch can
-    # reject it. SimpleNamespace doesn't have HasOpenings unless we set it.
-    sentinels["wall"].HasOpenings = ()
-    sentinels["slab"].HasOpenings = ()
-    sentinels["roof"].HasOpenings = ()
-    # sentinels["plain"] intentionally lacks HasOpenings
-
-    return [
-        patch.object(tool.Blender, "are_viewport_gizmos_enabled", return_value=prefs_on),
-        patch.object(tool.Blender, "get_selected_objects", return_value=set(selected)),
-        patch.object(tool.Ifc, "get_entity", side_effect=get_entity),
-        patch.object(tool.Blender.Modifier, "is_wall", side_effect=is_wall),
-        patch.object(tool.Blender.Modifier, "is_slab", side_effect=is_slab),
-        patch.object(tool.Blender.Modifier, "is_roof", side_effect=is_roof),
-    ]
+    return get_entity, is_wall
 
 
-def _run_poll(prefs_on=True, n_selected=2, active_in_selected=True, active_kind="wall", other_kind="mesh"):
+def _run_poll(
+    patched_tool, prefs_on=True, n_selected=2, active_in_selected=True, active_kind="wall", other_kind="mesh"
+):
     from bonsai.bim.module.model.host_add_opening_gizmo import GizmoHostAddOpening
 
     selected = [object() for _ in range(n_selected)]
     active = selected[0] if (active_in_selected and selected) else object()
+    get_entity, is_wall = _build_poll_callbacks(selected, active_kind, other_kind)
 
-    patches = _patch_for_poll(prefs_on, selected, active_kind, other_kind)
-    for p in patches:
-        p.start()
-    try:
-        return GizmoHostAddOpening.poll(_make_context(active, selected))
-    finally:
-        for p in patches:
-            p.stop()
+    with patched_tool(
+        viewport_gizmos=prefs_on,
+        selected=selected,
+        entity=get_entity,
+        modifier_predicates={"is_wall": is_wall},
+    ):
+        return GizmoHostAddOpening.poll(make_context(active=active, selected=selected))
 
 
 @pytest.mark.parametrize("host_kind", ["wall", "slab", "roof"])
-def test_poll_accepts_each_host_with_a_plain_mesh_void(host_kind):
-    assert _run_poll(active_kind=host_kind, other_kind="mesh") is True
+def test_poll_accepts_each_host_with_a_plain_mesh_void(host_kind, patched_tool):
+    assert _run_poll(patched_tool, active_kind=host_kind, other_kind="mesh") is True
 
 
-def test_poll_rejects_when_gizmo_toggle_off():
-    assert _run_poll(prefs_on=False) is False
+def test_poll_rejects_when_gizmo_toggle_off(patched_tool):
+    assert _run_poll(patched_tool, prefs_on=False) is False
 
 
-def test_poll_rejects_when_selection_count_is_not_two():
-    assert _run_poll(n_selected=1) is False
-    assert _run_poll(n_selected=3) is False
+def test_poll_rejects_when_selection_count_is_not_two(patched_tool):
+    assert _run_poll(patched_tool, n_selected=1) is False
+    assert _run_poll(patched_tool, n_selected=3) is False
 
 
-def test_poll_rejects_when_active_is_not_in_selection():
-    assert _run_poll(active_in_selected=False) is False
+def test_poll_rejects_when_active_is_not_in_selection(patched_tool):
+    assert _run_poll(patched_tool, active_in_selected=False) is False
 
 
-def test_poll_rejects_when_active_has_no_ifc_entity():
-    assert _run_poll(active_kind="mesh") is False
+def test_poll_rejects_when_active_has_no_ifc_entity(patched_tool):
+    assert _run_poll(patched_tool, active_kind="mesh") is False
 
 
-def test_poll_rejects_when_active_is_not_a_host():
+def test_poll_rejects_when_active_is_not_a_host(patched_tool):
     # "plain" sentinel is recognised as an IFC entity but is none of wall/slab/roof.
-    assert _run_poll(active_kind="plain") is False
+    assert _run_poll(patched_tool, active_kind="plain") is False
 
 
 @pytest.mark.parametrize(
@@ -152,17 +160,16 @@ def test_poll_rejects_when_active_is_not_a_host():
         ("roof", "wall"),
     ],
 )
-def test_poll_rejects_host_host_pairs(active_kind, other_kind):
+def test_poll_rejects_host_host_pairs(active_kind, other_kind, patched_tool):
     """Host + host pairings must be suppressed so the icon never stacks with
     the wall-join / extend-vertical / future slab-edit gizmos."""
-    assert _run_poll(active_kind=active_kind, other_kind=other_kind) is False
+    assert _run_poll(patched_tool, active_kind=active_kind, other_kind=other_kind) is False
 
 
-def test_poll_rejects_active_host_without_has_openings():
+def test_poll_rejects_active_host_without_has_openings(patched_tool):
     # Real-world equivalent: an IFC class that the active schema strips
     # ``HasOpenings`` from (e.g., a non-element subtype). The active sentinel
     # is set up to be ``is_wall``-true but with no HasOpenings attribute.
-    from bonsai import tool
     from bonsai.bim.module.model.host_add_opening_gizmo import GizmoHostAddOpening
 
     selected = [object(), object()]
@@ -170,23 +177,13 @@ def test_poll_rejects_active_host_without_has_openings():
     host_sentinel = object()  # No HasOpenings attribute
     other_sentinel = None
 
-    patches = [
-        patch.object(tool.Blender, "are_viewport_gizmos_enabled", return_value=True),
-        patch.object(tool.Blender, "get_selected_objects", return_value=set(selected)),
-        patch.object(
-            tool.Ifc, "get_entity", side_effect=lambda o: host_sentinel if o is selected[0] else other_sentinel
-        ),
-        patch.object(tool.Blender.Modifier, "is_wall", side_effect=lambda e: e is host_sentinel),
-        patch.object(tool.Blender.Modifier, "is_slab", return_value=False),
-        patch.object(tool.Blender.Modifier, "is_roof", return_value=False),
-    ]
-    for p in patches:
-        p.start()
-    try:
-        assert GizmoHostAddOpening.poll(_make_context(active, selected)) is False
-    finally:
-        for p in patches:
-            p.stop()
+    with patched_tool(
+        viewport_gizmos=True,
+        selected=selected,
+        entity=lambda o: host_sentinel if o is selected[0] else other_sentinel,
+        modifier_predicates={"is_wall": lambda e: e is host_sentinel},
+    ):
+        assert GizmoHostAddOpening.poll(make_context(active=active, selected=selected)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +191,9 @@ def test_poll_rejects_active_host_without_has_openings():
 # ---------------------------------------------------------------------------
 
 
-def _run_position_wall_branch(*, other_translation=(0.5, 0.0, 0.0), top_down=True):
+def _run_position_wall_branch(patched_tool, *, other_translation=(0.5, 0.0, 0.0), top_down=True):
     """Drive the wall branch with stub IFC reads, returning the icon's
     matrix_basis translation."""
-    from bonsai import tool
     from bonsai.bim.module.drawing import gizmos as gizmo_module
     from bonsai.bim.module.model import host_add_opening_gizmo as host_mod
     from bonsai.bim.module.model.host_add_opening_gizmo import GizmoHostAddOpening
@@ -211,46 +207,48 @@ def _run_position_wall_branch(*, other_translation=(0.5, 0.0, 0.0), top_down=Tru
     icon = SimpleNamespace(matrix_basis=None, hide=True)
     self_stub = SimpleNamespace(add_opening_icon=icon)
 
-    patches = [
-        patch.object(tool.Blender, "get_selected_objects", return_value=selected),
-        patch.object(tool.Ifc, "get_entity", return_value=wall_element),
-        patch.object(tool.Blender.Modifier, "is_wall", return_value=True),
-        patch.object(host_mod, "get_wall_geom_cached", return_value=geom),
-        patch.object(host_mod, "wall_camera_facing_icon_y", return_value=0.0),
-        patch.object(tool.Blender, "is_view_top_down", return_value=top_down),
-        patch.object(tool.Blender, "get_screen_up_world", return_value=Vector((0.0, 1.0, 0.0))),
-        patch.object(gizmo_module, "get_billboard_rotation", return_value=Matrix.Identity(4)),
-        patch.object(gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)),
-    ]
-    for p in patches:
-        p.start()
-    try:
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patched_tool(
+                selected_list=selected,
+                entity=wall_element,
+                modifier_predicates={"is_wall": True},
+                view_top_down=top_down,
+                screen_up=Vector((0.0, 1.0, 0.0)),
+            )
+        )
+        stack.enter_context(patch.object(host_mod, "get_wall_geom_cached", return_value=geom))
+        stack.enter_context(patch.object(host_mod, "wall_camera_facing_icon_y", return_value=0.0))
+        stack.enter_context(patch.object(gizmo_module, "get_billboard_rotation", return_value=Matrix.Identity(4)))
+        stack.enter_context(
+            patch.object(
+                gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)
+            )
+        )
         GizmoHostAddOpening.position_gizmos(self_stub, context)
-    finally:
-        for p in patches:
-            p.stop()
     return icon.matrix_basis.translation
 
 
-def test_wall_branch_drops_height_lift_in_top_down_view():
-    """Regression: in plan view the wall branch must collapse the wall-top
-    Z lift and offset along screen-up instead — pin from the prior
-    GizmoWallAddOpening behaviour so the refactor preserves it."""
+def test_wall_branch_drops_height_lift_in_top_down_view(patched_tool):
+    """In plan view the wall-top Z lift must collapse to zero and the icon
+    must instead offset along screen-up — otherwise the icon stacks on top
+    of the wall outline and the user can't see it."""
     from bonsai.bim.module.drawing.gizmos import BaseParametricGizmoGroup
 
-    pos = _run_position_wall_branch(top_down=True)
+    pos = _run_position_wall_branch(patched_tool, top_down=True)
     assert pos.z == pytest.approx(0.0)
     assert pos.y == pytest.approx(BaseParametricGizmoGroup.SCREEN_STACK_OFFSET)
 
 
-def _run_position_layer3_branch(*, host_world_z_range=(0.0, 0.2), other_z=1.0, other_xy=(0.7, 0.4), is_wall=False):
+def _run_position_layer3_branch(
+    patched_tool, *, host_world_z_range=(0.0, 0.2), other_z=1.0, other_xy=(0.7, 0.4), is_wall=False
+):
     """Drive the LAYER3 (slab/roof) branch and return the icon translation.
 
     ``host_world_z_range`` sets the world-Z extents of the host's bounding box
     (the gizmo picks top vs bottom by comparing the void's Z to the box
     midpoint). ``is_wall`` keeps a single helper for both branches by
     flipping the dispatch predicate."""
-    from bonsai import tool
     from bonsai.bim.module.drawing import gizmos as gizmo_module
     from bonsai.bim.module.model.host_add_opening_gizmo import GizmoHostAddOpening
 
@@ -266,39 +264,40 @@ def _run_position_layer3_branch(*, host_world_z_range=(0.0, 0.2), other_z=1.0, o
     self_stub = SimpleNamespace(add_opening_icon=icon)
 
     host_element = object()
-    patches = [
-        patch.object(tool.Blender, "get_selected_objects", return_value=selected),
-        patch.object(tool.Ifc, "get_entity", return_value=host_element),
-        patch.object(tool.Blender.Modifier, "is_wall", return_value=is_wall),
-        patch.object(gizmo_module, "get_billboard_rotation", return_value=Matrix.Identity(4)),
-        patch.object(gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)),
-    ]
-    for p in patches:
-        p.start()
-    try:
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patched_tool(
+                selected_list=selected,
+                entity=host_element,
+                modifier_predicates={"is_wall": is_wall},
+            )
+        )
+        stack.enter_context(patch.object(gizmo_module, "get_billboard_rotation", return_value=Matrix.Identity(4)))
+        stack.enter_context(
+            patch.object(
+                gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)
+            )
+        )
         GizmoHostAddOpening.position_gizmos(self_stub, context)
-    finally:
-        for p in patches:
-            p.stop()
     return icon.matrix_basis.translation
 
 
-def test_layer3_branch_places_icon_above_when_void_is_above():
+def test_layer3_branch_places_icon_above_when_void_is_above(patched_tool):
     """Void above the slab midplane → icon sits above the top face (with the
     ICON_Z_OFFSET lift) at the void's world XY."""
     from bonsai.bim.module.drawing.gizmos import BaseParametricGizmoGroup
 
-    pos = _run_position_layer3_branch(host_world_z_range=(0.0, 0.2), other_z=1.0, other_xy=(0.7, 0.4))
+    pos = _run_position_layer3_branch(patched_tool, host_world_z_range=(0.0, 0.2), other_z=1.0, other_xy=(0.7, 0.4))
     assert pos.x == pytest.approx(0.7)
     assert pos.y == pytest.approx(0.4)
     assert pos.z == pytest.approx(0.2 + BaseParametricGizmoGroup.ICON_Z_OFFSET)
 
 
-def test_layer3_branch_places_icon_below_when_void_is_below():
+def test_layer3_branch_places_icon_below_when_void_is_below(patched_tool):
     """Void below the slab midplane → icon sits below the bottom face."""
     from bonsai.bim.module.drawing.gizmos import BaseParametricGizmoGroup
 
-    pos = _run_position_layer3_branch(host_world_z_range=(0.0, 0.2), other_z=-1.0, other_xy=(0.7, 0.4))
+    pos = _run_position_layer3_branch(patched_tool, host_world_z_range=(0.0, 0.2), other_z=-1.0, other_xy=(0.7, 0.4))
     assert pos.x == pytest.approx(0.7)
     assert pos.y == pytest.approx(0.4)
     assert pos.z == pytest.approx(0.0 - BaseParametricGizmoGroup.ICON_Z_OFFSET)
@@ -314,3 +313,74 @@ def test_is_supported_host_returns_false_for_none():
     from bonsai.bim.module.model.host_add_opening_gizmo import is_supported_host
 
     assert is_supported_host(None) is False
+
+
+def test_is_supported_host_accepts_bare_ifc_slab():
+    """The slab branch is class-based — any ``IfcSlab`` qualifies, even
+    without LAYER3 parametric usage. The positioner reads ``obj.bound_box``,
+    which works for both parametric and imported geometry."""
+    from bonsai.bim.module.model.host_add_opening_gizmo import is_supported_host
+
+    assert is_supported_host(_FakeIfcEntity("IfcSlab")) is True
+
+
+def test_is_supported_host_accepts_bare_ifc_roof():
+    """The roof branch is class-based, not pset-based — a bare ``IfcRoof``
+    imported from another IFC tool qualifies even without the Bonsai
+    BBIM_Roof parametric marker that ``tool.Blender.Modifier.is_roof``
+    would require."""
+    from bonsai.bim.module.model.host_add_opening_gizmo import is_supported_host
+
+    assert is_supported_host(_FakeIfcEntity("IfcRoof")) is True
+
+
+def test_is_supported_host_rejects_non_host_ifc_class():
+    """Non-host IFC classes are filtered — covers ``IfcCovering`` (which has
+    HasOpenings but is not a wall/slab/roof) and prevents the gizmo from
+    surfacing on arbitrary building elements."""
+    from bonsai.bim.module.model.host_add_opening_gizmo import is_supported_host
+
+    assert is_supported_host(_FakeIfcEntity("IfcCovering")) is False
+    assert is_supported_host(_FakeIfcEntity("IfcDiscreteAccessory")) is False
+
+
+# ---------------------------------------------------------------------------
+# End-to-end smoke: gizmo's target operator handles host + mesh-void selection
+# ---------------------------------------------------------------------------
+#
+# The gizmo binds ``bim.add_opening`` via ``setup_icon_gizmo`` — clicking the
+# icon dispatches that operator with the current selection set. The operator
+# has its own target/opening detection that swaps based on which selected
+# object carries an IFC entity. This smoke test pins that handoff: with a
+# host as the active object and a non-IFC mesh as the "void", the operator
+# creates an ``IfcOpeningElement`` linked to the host via the standard
+# ``HasOpenings`` inverse.
+
+
+class TestAddOpeningIntegrationOnSlab(NewFile):
+    def test_creates_opening_when_slab_is_active_with_mesh_void(self):
+        tool.Project.get_project_props().template_file = "IFC4 Demo Template.ifc"
+        bpy.ops.bim.create_project()
+        ifc_file = tool.Ifc.get()
+        slab_type = ifc_file.by_type("IfcSlabType")[0]
+        bpy.ops.bim.add_occurrence(relating_type_id=slab_type.id())
+        slab = ifc_file.by_type("IfcSlab")[0]
+        slab_obj = tool.Ifc.get_object(slab)
+        assert isinstance(slab_obj, bpy.types.Object)
+        assert len(slab.HasOpenings) == 0
+
+        void_obj = bpy.data.objects.new("VoidMesh", bpy.data.meshes.new("VoidMesh"))
+        bpy.context.scene.collection.objects.link(void_obj)
+        void_obj.matrix_world = void_obj.matrix_world.copy()
+        void_obj.matrix_world.translation = (
+            slab_obj.matrix_world.translation.x,
+            slab_obj.matrix_world.translation.y,
+            slab_obj.matrix_world.translation.z + 1.0,
+        )
+
+        tool.Blender.set_objects_selection(bpy.context, slab_obj, (slab_obj, void_obj))
+        bpy.ops.bim.add_opening()
+
+        assert len(slab.HasOpenings) == 1
+        opening = slab.HasOpenings[0].RelatedOpeningElement
+        assert opening.is_a("IfcOpeningElement")

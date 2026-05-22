@@ -41,13 +41,16 @@ from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.wall_offset_gizmos import WALL_OFFSET_GIZMO_CONFIGS
 from bonsai.bim.parametric_lifecycle import FeatureModifierEditMixin
+from bonsai.tool.cad import WELD_TOLERANCE
 
 if TYPE_CHECKING:
     from bonsai.bim.module.model.prop import BIMWindowProperties
 
 V_ = tool.Blender.V_
-# Shorthand for gizmo offset constants used in DimensionGizmoConfig lambdas
 _G = gizmo.BaseParametricGizmoGroup
+
+# Pane glass thickness for window panels.
+_GLASS_THICKNESS = 0.01
 
 
 def update_window_modifier_representation(context: bpy.types.Context) -> None:
@@ -88,15 +91,14 @@ def update_window_modifier_representation(context: bpy.types.Context) -> None:
 
     active_context = tool.Geometry.get_active_representation_context(obj)
 
-    # ELEVATION_VIEW representation
     profile = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Profile", "ELEVATION_VIEW")
     if profile:
         representation_data["context"] = profile
         elevation_representation = ifcopenshell.api.geometry.add_window_representation(ifc_file, **representation_data)
         tool.Model.replace_object_ifc_representation(profile, obj, elevation_representation)
 
-    # MODEL_VIEW representation
-    # (Model/Body defined only BEFORE Plan/Body to prevent #2744)
+    # Model/Body MUST be defined before Plan/Body — reverse ordering yields a duplicate
+    # representation that breaks downstream consumers.
     body = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
     representation_data["context"] = body
     representation_data["part_of_product"] = ifcopenshell.util.representation.get_part_of_product(element, body)
@@ -149,11 +151,7 @@ def update_window_modifier_representation(context: bpy.types.Context) -> None:
 def create_bm_window_frame(
     bm: bmesh.types.BMesh, size: Vector, thickness: float | list[float], position: Vector = V_(0, 0, 0).freeze()
 ) -> list[bmesh.types.BMVert]:
-    """`thickness` of the profile is defined as list in the following order:
-    `(LEFT, TOP, RIGHT, BOTTOM)`
-
-    `thickness` can be also defined just as 1 float value.
-    """
+    """``thickness`` is a single float (uniform) or a ``(LEFT, TOP, RIGHT, BOTTOM)`` 4-tuple."""
 
     if not isinstance(thickness, collections.abc.Iterable):
         thickness = [thickness] * 4
@@ -288,7 +286,7 @@ def update_window_modifier_bmesh(context: bpy.types.Context) -> None:
     first_transom_offset = props.first_transom_offset
     second_transom_offset = props.second_transom_offset
 
-    glass_thickness = 0.01
+    glass_thickness = _GLASS_THICKNESS
 
     bm = bmesh.new()
     panel_schema = list(reversed(panel_schema))
@@ -398,7 +396,7 @@ def update_window_modifier_bmesh(context: bpy.types.Context) -> None:
             accumulated_width += panel_width
 
     bmesh.ops.translate(bm, vec=V_(0, lining_offset, 0), verts=bm.verts)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     if bpy.context.active_object.mode == "EDIT":
@@ -559,8 +557,8 @@ class CycleWindowType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixi
     bl_label = "Cycle Window Type"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = "is_window"
-    props_getter = "get_window_props"
+    element_checker = tool.Blender.Modifier.is_window
+    props_getter = tool.Model.get_window_props
     type_literal = tool.Model.WindowType
     type_attr = "window_type"
 
@@ -568,20 +566,11 @@ class CycleWindowType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixi
         return self._cycle_type(context)
 
 
-# Frame accessor factory - creates callbacks that delegate to BIMWindowProperties methods
 def _make_frame_accessors(attr_name: str, panel_index: int) -> tuple[
     "collections.abc.Callable[[BIMWindowProperties], float]",
     "collections.abc.Callable[[BIMWindowProperties, float], None]",
 ]:
-    """Create compute/apply callbacks for frame properties at a specific panel index.
-
-    Args:
-        attr_name: Property name ("frame_depth" or "frame_thickness")
-        panel_index: Panel index (0, 1, or 2)
-
-    Returns:
-        Tuple of (compute_fn, apply_fn) that delegate to BIMWindowProperties methods
-    """
+    """Return (compute_fn, apply_fn) for a per-panel frame property gizmo binding."""
     return (
         lambda props: props.get_frame_value(attr_name, panel_index),
         lambda props, value: props.set_frame_value(attr_name, panel_index, value),
@@ -747,7 +736,7 @@ class GizmoWindowEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         *WALL_OFFSET_GIZMO_CONFIGS,
     ]
 
-    props_getter = "get_window_props"
+    props_getter = tool.Model.get_window_props
     gizmo_pref_name = "window"
 
     @classmethod
@@ -755,22 +744,14 @@ class GizmoWindowEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         return tool.Blender.Modifier.is_window(element)
 
     def get_icon_y_extent(self, props: "BIMWindowProperties") -> tuple[float, float]:
-        """Get Y extents for window icon positioning.
-
-        Window geometry can extend asymmetrically in +Y and -Y directions
-        depending on lining_offset (which can be negative).
-        """
+        """Return ``(+y, -y)`` extents of the window; asymmetric because ``lining_offset`` can be negative."""
         furthest_positive_y = (
             max(0, props.lining_offset) + props.lining_depth + props.lining_to_panel_offset_y + 2 * self.GIZMO_OFFSET
         )
         furthest_negative_y = abs(min(0, props.lining_offset)) + 2 * self.GIZMO_OFFSET
         return (furthest_positive_y, furthest_negative_y)
 
-    # Window uses base class setup() and refresh() - no element-specific gizmos needed
-
     def _update_dimension_gizmo_positions(
         self, context: bpy.types.Context, mw: Matrix, props: "BIMWindowProperties"
     ) -> None:
-        """Update dimension gizmo positions based on camera view direction."""
-        # Window uses base implementation with default casing_offset=0
         self._update_view_dependent_dimensions(context, mw, props)

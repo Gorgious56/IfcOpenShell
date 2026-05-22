@@ -40,14 +40,24 @@ from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.wall_offset_gizmos import WALL_OFFSET_GIZMO_CONFIGS
 from bonsai.bim.module.model.window import create_bm_box, create_bm_window
 from bonsai.bim.parametric_lifecycle import FeatureModifierEditMixin
+from bonsai.tool.cad import WELD_TOLERANCE
 
 if TYPE_CHECKING:
     from bonsai.bim.module.model.prop import BIMDoorProperties
 
 V_ = tool.Blender.V_
 
-# Shorthand for gizmo offset constants used in DimensionGizmoConfig lambdas
 _G = gizmo.BaseParametricGizmoGroup
+
+# Hardware geometry (millimetres). Converted to metres at use site.
+_HANDLE_SIZE_MM = V_(120, 40, 20)
+_HANDLE_OFFSET_MM = V_(60, 0, 1000)
+# Air gap between the two panels of a double door so the meshes don't visually
+# t-junction at the centerline.
+_DOUBLE_DOOR_GAP = 0.001
+# Pane glass thickness for door/window panels.
+_GLASS_THICKNESS = 0.01
+_MM_TO_M = 0.001
 
 
 def update_door_modifier_representation(obj: bpy.types.Object) -> None:
@@ -85,15 +95,14 @@ def update_door_modifier_representation(obj: bpy.types.Object) -> None:
 
     active_context = tool.Geometry.get_active_representation_context(obj)
 
-    # ELEVATION_VIEW representation
     profile = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Profile", "ELEVATION_VIEW")
     if profile:
         representation_data["context"] = profile
         elevation_representation = ifcopenshell.api.geometry.add_door_representation(ifc_file, **representation_data)
         tool.Model.replace_object_ifc_representation(profile, obj, elevation_representation)
 
-    # MODEL_VIEW representation
-    # (Model/Body defined only BEFORE Plan/Body to prevent #2744)
+    # Model/Body MUST be defined before Plan/Body — reverse ordering yields a duplicate
+    # representation that breaks downstream consumers.
     body = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
     representation_data["context"] = body
     representation_data["part_of_product"] = ifcopenshell.util.representation.get_part_of_product(element, body)
@@ -118,14 +127,12 @@ def update_door_modifier_representation(obj: bpy.types.Object) -> None:
         if not material.is_a("IfcMaterial") and not ifc_file.get_total_inverses(material):
             ifcopenshell.api.material.remove_material_set(ifc_file, material=material)
 
-    # Body/PLAN_VIEW representation
     plan_body = ifcopenshell.util.representation.get_context(ifc_file, "Plan", "Body", "PLAN_VIEW")
     if plan_body:
         representation_data["context"] = plan_body
         plan_representation = ifcopenshell.api.geometry.add_door_representation(ifc_file, **representation_data)
         tool.Model.replace_object_ifc_representation(plan_body, obj, plan_representation)
 
-    # Annotation/PLAN_VIEW representation
     plan_annotation = ifcopenshell.util.representation.get_context(ifc_file, "Plan", "Annotation", "PLAN_VIEW")
     if plan_annotation:
         if not sliding_door:
@@ -344,11 +351,10 @@ def update_door_modifier_bmesh(context: bpy.types.Context) -> None:
     frame_depth = props.frame_depth
     frame_thickness = props.frame_thickness
     frame_height = window_lining_height - lining_to_panel_offset_x * 2
-    glass_thickness = 0.01
+    glass_thickness = _GLASS_THICKNESS
 
-    # handle dimensions (hardcoded)
-    handle_size = V_(120, 40, 20) * 0.001
-    handle_offset = V_(60, 0, 1000) * 0.001  # to the handle center
+    handle_size = _HANDLE_SIZE_MM * _MM_TO_M
+    handle_offset = _HANDLE_OFFSET_MM * _MM_TO_M  # to the handle center
     handle_center_offset = V_(handle_size.y / 2, 0, handle_size.z) / 2
 
     if transfom_offset:
@@ -438,8 +444,7 @@ def update_door_modifier_bmesh(context: bpy.types.Context) -> None:
 
     if double_door:
         # keeping a little space between doors for readibility
-        double_door_offset = 0.001
-        panel_size.x = panel_size.x / 2 - double_door_offset
+        panel_size.x = panel_size.x / 2 - _DOUBLE_DOOR_GAP
         door_verts.extend(create_bm_door_panel(panel_size, panel_position, "LEFT"))
 
         mirror_point = panel_position + V_(door_opening_width / 2, 0, 0)
@@ -477,7 +482,7 @@ def update_door_modifier_bmesh(context: bpy.types.Context) -> None:
 
     lining_offset_verts = lining_verts + door_verts + window_lining_verts + frame_verts + glass_verts
     bmesh.ops.translate(bm, vec=V_(0, lining_offset, 0), verts=lining_offset_verts)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     if bpy.context.active_object.mode == "EDIT":
@@ -708,8 +713,8 @@ class CycleDoorType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin)
     bl_label = "Cycle Door Type"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = "is_door"
-    props_getter = "get_door_props"
+    element_checker = tool.Blender.Modifier.is_door
+    props_getter = tool.Model.get_door_props
     type_literal = tool.Model.DoorType
     type_attr = "door_type"
 
@@ -837,7 +842,7 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         *WALL_OFFSET_GIZMO_CONFIGS,
     ]
 
-    props_getter = "get_door_props"
+    props_getter = tool.Model.get_door_props
     gizmo_pref_name = "door"
 
     @classmethod
@@ -868,13 +873,11 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         self.gizmo_door_type = self.create_arc_gizmo(
             special_color,
             "bim.toggle_door_swing",
-            prop_path="BIMDoorProperties.door_type",
             flip_geometry=False,
         )
         self.gizmo_flip_arc = self.create_arc_gizmo(
             inactive_color,
             "bim.toggle_door_swing",
-            prop_path="BIMDoorProperties.door_type",
             flip_geometry=True,
             flip_local_axes="XY",
         )
@@ -895,30 +898,33 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         """Update dimension gizmo positions based on camera view direction."""
         self._update_view_dependent_dimensions(context, mw, props)
 
+    @staticmethod
+    def _compute_swing_arc_matrices(mw: Matrix, props: "BIMDoorProperties") -> tuple[Matrix, Matrix]:
+        """``(door_type_matrix, flip_arc_matrix)`` for swing visualisation. Arc renders the
+        LEFT shape; flip-X gives RIGHT, mirror-Y previews the alternate swing direction."""
+        is_right = "RIGHT" in props.door_type
+        swing_x_offset = props.overall_width if is_right else 0.0
+        base_swing_transform = Matrix.Translation(V_(swing_x_offset, props.lining_offset, 0)) @ Matrix.Scale(
+            props.overall_width, 4
+        )
+        flip_x = Matrix.Scale(-1, 4, (1, 0, 0)) if is_right else Matrix.Identity(4)
+        mirror_y = Matrix.Scale(-1, 4, (0, 1, 0))
+        return mw @ base_swing_transform @ flip_x, mw @ base_swing_transform @ flip_x @ mirror_y
+
     def update_swing_gizmos(self, mw: Matrix, props: "BIMDoorProperties") -> None:
         """Update swing gizmo position and color based on editing state."""
-        prefs = self.get_addon_prefs()
-        door_gizmo_prefs = prefs.gizmos.door
-
-        door_type_visible = self.update_gizmo_visibility(
-            self.gizmo_door_type, props.is_editing, door_gizmo_prefs.swing_arc
-        )
-        flip_arc_visible = self.update_gizmo_visibility(
-            self.gizmo_flip_arc, props.is_editing, door_gizmo_prefs.flip_arc
-        )
+        door_type_visible = self.update_gizmo_visibility(self.gizmo_door_type, props.is_editing, True)
+        flip_arc_visible = self.update_gizmo_visibility(self.gizmo_flip_arc, props.is_editing, True)
 
         if not door_type_visible and not flip_arc_visible:
             return
 
-        swing_x_offset = props.overall_width if "RIGHT" in props.door_type else 0.0
-        base_swing_transform = Matrix.Translation(V_(swing_x_offset, props.lining_offset, 0)) @ Matrix.Scale(
-            props.overall_width, 4
-        )
+        door_type_matrix, flip_arc_matrix = self._compute_swing_arc_matrices(mw, props)
 
         if door_type_visible:
-            self.gizmo_door_type.matrix_basis = mw @ base_swing_transform
+            self.gizmo_door_type.matrix_basis = door_type_matrix
+            prefs = self.get_addon_prefs()
             self.gizmo_door_type.color = prefs.decorations_colour[:3]
 
         if flip_arc_visible:
-            mirror_y = Matrix.Scale(-1, 4, (0, 1, 0))
-            self.gizmo_flip_arc.matrix_basis = mw @ base_swing_transform @ mirror_y
+            self.gizmo_flip_arc.matrix_basis = flip_arc_matrix

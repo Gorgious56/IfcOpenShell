@@ -21,11 +21,12 @@
 """Generic single-click "Add Opening" gizmo for hosts (walls, slabs, roofs).
 
 One GizmoGroup serves every IFC host type that exposes ``HasOpenings``:
-LAYER2 walls, LAYER3 slabs, and BBIM_Roof-tagged roofs. The poll guards
-host-host pairings so this gizmo never overlaps with the existing wall-join /
-extend-vertically gizmos. The positioner dispatches on element type — walls
-keep the existing axis-projection + camera-facing-Y math; LAYER3 hosts use a
-world-Z face bias driven by the void object's elevation."""
+parametric LAYER2 walls, any ``IfcSlab``, and any ``IfcRoof``. The poll
+guards host-host pairings so this gizmo never overlaps with the existing
+wall-join / extend-vertically gizmos. The positioner dispatches on element
+type — walls use axis-projection + camera-facing-Y math (which requires the
+parametric layer-set); slabs and roofs use a world-Z face bias driven by
+the void object's elevation against the host's bounding box."""
 
 import bpy
 from mathutils import Vector
@@ -40,23 +41,16 @@ from bonsai.bim.module.model.wall import (
 
 
 def is_supported_host(element) -> bool:
-    """Element types this gizmo can dock onto. Total predicate — accepts
-    ``None`` (returns ``False``) so the poll's ``other_element`` check stays a
-    single boolean expression. Kept as a module-level helper so ``poll()`` and
-    tests can exercise the dispatch decision independently."""
+    """Total predicate (None → False). Walls need parametric LAYER2 (the axis polyline +
+    layer-set offsets drive the icon); slabs and roofs only need the bound box so any
+    IfcSlab / IfcRoof qualifies regardless of parametric modifier state."""
     if element is None:
         return False
-    return (
-        tool.Blender.Modifier.is_wall(element)
-        or tool.Blender.Modifier.is_slab(element)
-        or tool.Blender.Modifier.is_roof(element)
-    )
+    return tool.Blender.Modifier.is_wall(element) or element.is_a("IfcSlab") or element.is_a("IfcRoof")
 
 
 def _world_aabb_z(obj: bpy.types.Object) -> tuple[float, float]:
-    """World-space (min_z, max_z) of an object's bounding box. Used to choose
-    between the top and bottom face of a LAYER3 host without needing to know
-    the IFC extrusion direction convention."""
+    """World-space ``(min_z, max_z)`` of the object's bound box."""
     mw = obj.matrix_world
     corners = [mw @ Vector(c) for c in obj.bound_box]
     zs = [c.z for c in corners]
@@ -69,11 +63,10 @@ class GizmoHostAddOpening(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin)
 
     Renders a single ``VIEW3D_GT_add_opening`` icon at the void object's
     projected location on the host. A click dispatches ``bim.add_opening``,
-    which the operator and ``FilledOpeningGenerator`` already handle for any
-    element with an ``HasOpenings`` inverse — no operator-side change needed.
+    which handles any element exposing the ``HasOpenings`` inverse.
 
-    Per-frame positioning (``BillboardingGizmoGroupMixin``) keeps the icon
-    facing the camera as the viewport orbits."""
+    Per-frame positioning keeps the icon facing the camera as the viewport
+    orbits."""
 
     bl_idname = "OBJECT_GGT_bim_host_add_opening"
     bl_label = "Host Add Opening Gizmo"
@@ -100,8 +93,9 @@ class GizmoHostAddOpening(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin)
         if not hasattr(element, "HasOpenings"):
             return False
         other = next(o for o in selected if o is not active)
-        # Host + host pairings belong to the wall-join / extend-vertical / future
-        # slab-edit gizmos — block them here so icons never stack.
+        # Host + host pairings are claimed by host-specific gizmos (wall-join,
+        # extend-vertical, …) — suppress here so the add-opening icon never
+        # stacks on top of them.
         if is_supported_host(tool.Ifc.get_entity(other)):
             return False
         return True
@@ -136,10 +130,9 @@ class GizmoHostAddOpening(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin)
 def wall_anchor(
     context: bpy.types.Context, group: bpy.types.GizmoGroup, wall_obj: bpy.types.Object, other: bpy.types.Object
 ) -> Vector | None:
-    """Wall branch — preserves the prior ``GizmoWallAddOpening`` math: project
-    the void onto the wall's reference-line X, clamp to the extents, and pick
-    base-vs-top by camera visibility. Kept module-level so tests can drive it
-    without instantiating a real ``GizmoGroup``."""
+    """World-space anchor for the add-opening icon on a wall host: void origin
+    projected onto the wall reference-line X (clamped to wall extents), lifted to
+    the camera-facing wall-local Y."""
     geom = get_wall_geom_cached(group, wall_obj)
     if not geom:
         return None
@@ -153,14 +146,10 @@ def wall_anchor(
 
 
 def layer3_anchor(host_obj: bpy.types.Object, other: bpy.types.Object) -> Vector:
-    """LAYER3 host branch (slabs, roofs) — anchor at the void's world XY,
-    offset to the camera-facing face along world Z.
-
-    Uses the host's world-AABB rather than reading the IFC extrusion direction:
-    this works for parametric LAYER3 slabs and for mesh-bodied roofs alike,
-    without diverging Phase-1 readers for each host class. For sloped slabs the
-    icon may sit a few centimetres off the true face, which is acceptable for
-    a click-target hint."""
+    """World-space anchor for the add-opening icon on a LAYER3 host (slab / roof):
+    void's world XY, lifted to the AABB face nearer the void. AABB-driven so it works
+    for both parametric slabs and mesh-bodied roofs; may drift a few cm on sloped
+    hosts (click-target hint only — the operator places the actual opening)."""
     min_z, max_z = _world_aabb_z(host_obj)
     other_z = other.matrix_world.translation.z
     face_z = max_z if other_z >= (min_z + max_z) * 0.5 else min_z
