@@ -1890,6 +1890,10 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     # ever visible at a time so they don't overlap.
     ICON_ROTATE_X = 1.24
 
+    # Shifts the base class's ARRAY button outward past the rotate icon —
+    # otherwise the array glyph stacks on top of the rotate gizmo at 1.24.
+    FEATURE_ICON_MAX_X = ICON_ROTATE_X
+
     # Mapping from BIMWallProperties.desired_offset_baseline value to the
     # attribute on `self` that holds the corresponding state icon.
     _BASELINE_GIZMO_ATTRS: ClassVar[dict[str, str]] = {

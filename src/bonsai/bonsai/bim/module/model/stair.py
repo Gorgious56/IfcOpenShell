@@ -472,6 +472,11 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     ICON_CYCLE_SCALE = 0.3  # Scale for cycle type icon
     ICON_Z_OFFSET = 0.5  # Z offset above geometry for editing icons
 
+    # Shifts the base class's ARRAY button outward past the minus icon —
+    # otherwise the array glyph stacks on top of one of the tread-lock / +/-
+    # gizmos in the 1.24–1.98 range.
+    FEATURE_ICON_MAX_X = ICON_MINUS_X
+
     enable_editing_operator = "bim.enable_editing_stair"
     finish_editing_operator = "bim.finish_editing_stair"
     cancel_editing_operator = "bim.cancel_editing_stair"

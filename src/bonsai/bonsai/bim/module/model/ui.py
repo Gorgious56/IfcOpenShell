@@ -235,9 +235,42 @@ class BIM_PT_array(bpy.types.Panel):
             if ArrayData.data["parameters"]["data_dict"]:
                 row.operator("bim.add_array", icon="ADD", text="")
 
-            for i, array in enumerate(ArrayData.data["parameters"]["data_dict"]):
+            data_dict = ArrayData.data["parameters"]["data_dict"]
+            element = tool.Ifc.get_entity(obj)
+            has_host = element is not None and tool.Spatial.get_host_element(element) is not None
+            # Element-wide triad UX surfaces only for single-layer arrays — that's
+            # the scope the parametric registry / gizmos commit to. Multi-layer
+            # arrays continue to use the per-item flow below.
+            if len(data_dict) == 1 and props.is_editing:
                 box = self.layout.box()
-                if props.is_editing == i:
+                row = box.row(align=True)
+                row.prop(props, "count", icon="MOD_ARRAY")
+                row.operator("bim.finish_editing_array", icon="CHECKMARK", text="")
+                row.operator("bim.cancel_editing_array", icon="CANCEL", text="")
+                row = box.row(align=True)
+                row.prop(props, "method")
+                row = box.row(align=True)
+                row.prop(props, "use_local_space")
+                if has_host:
+                    row = box.row(align=True)
+                    row.prop(props, "mirror_to_host")
+                col = box.column()
+                row = col.row(align=True)
+                row.prop(props, "x")
+                row.operator("bim.input_cursor_x_array", icon="CURSOR", text="")
+                row = col.row(align=True)
+                row.prop(props, "y")
+                row.operator("bim.input_cursor_y_array", icon="CURSOR", text="")
+                row = col.row(align=True)
+                row.prop(props, "z")
+                row.operator("bim.input_cursor_z_array", icon="CURSOR", text="")
+                row = col.row(align=True)
+                row.prop(props, "relating_array_object", icon="COPYDOWN")
+                return
+
+            for i, array in enumerate(data_dict):
+                box = self.layout.box()
+                if props.editing_item_index == i:
                     row = box.row(align=True)
                     row.prop(props, "count", icon="MOD_ARRAY")
                     row.operator("bim.edit_array", icon="CHECKMARK", text="").item = i
@@ -246,6 +279,9 @@ class BIM_PT_array(bpy.types.Panel):
                     row.prop(props, "method")
                     row = box.row(align=True)
                     row.prop(props, "use_local_space")
+                    if has_host:
+                        row = box.row(align=True)
+                        row.prop(props, "mirror_to_host")
                     col = box.column()
                     row = col.row(align=True)
                     row.prop(props, "x")
@@ -262,11 +298,23 @@ class BIM_PT_array(bpy.types.Panel):
                     row = box.row(align=True)
                     name = f"{array['count']} Items ({array.get('method', 'OFFSET').capitalize()})"
                     row.label(text=name, icon="MOD_ARRAY")
-                    row.operator("bim.enable_editing_array", icon="GREASEPENCIL", text="").item = i
+                    if len(data_dict) == 1:
+                        # Element-wide triad entry; surfaces only for the
+                        # single-layer scope the gizmo group also gates on.
+                        row.operator("bim.enable_editing_array", icon="GREASEPENCIL", text="")
+                    else:
+                        row.operator("bim.enable_editing_array_item", icon="GREASEPENCIL", text="").item = i
                     apply_button = row.row(align=True)
                     apply_button.operator("bim.apply_array", text="", icon="CHECKMARK")
-                    apply_button.enabled = i == len(ArrayData.data["parameters"]["data_dict"]) - 1
+                    apply_button.enabled = i == len(data_dict) - 1
                     row.operator("bim.remove_array", icon="X", text="").item = i
+                    if has_host:
+                        mirrors = array.get("mirror_to_host", True)
+                        row = box.row(align=True)
+                        row.label(
+                            text="Host: Mirror" if mirrors else "Host: Free",
+                            icon="MOD_BOOLEAN" if mirrors else "X",
+                        )
                     row = box.row(align=True)
                     icon = "EMPTY_ARROWS" if array.get("use_local_space", False) else "EMPTY_AXIS"
                     row.label(text=f"X: {array['x']}", icon=icon)
