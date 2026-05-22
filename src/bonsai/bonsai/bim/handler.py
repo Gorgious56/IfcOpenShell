@@ -39,9 +39,15 @@ from bonsai.bim.module.aggregate.decorator import AggregateDecorator
 from bonsai.bim.module.georeference.decorator import GeoreferenceDecorator
 from bonsai.bim.module.model.data import AuthoringData
 from bonsai.bim.module.model.decorator import (
+    ArrayPreviewDecorator,
+    ArraySelectionHighlightDecorator,
+    BendPreviewDecorator,
     BoundingBoxDecorator,
+    MEPSegmentExtendPreviewDecorator,
+    MEPSystemPathDecorator,
     SlabDirectionDecorator,
     WallAxisDecorator,
+    WallGizmoPreviewDecorator,
 )
 from bonsai.bim.module.nest.decorator import NestDecorator
 
@@ -427,6 +433,10 @@ def load_post(scene):
     NestDecorator.uninstall()
     WallAxisDecorator.uninstall()
     SlabDirectionDecorator.uninstall()
+    WallGizmoPreviewDecorator.uninstall()
+    MEPSegmentExtendPreviewDecorator.uninstall()
+    BendPreviewDecorator.uninstall()
+    MEPSystemPathDecorator.uninstall()
     if georeference_props.should_visualise:
         GeoreferenceDecorator.install(bpy.context)
     if aggregate_props.aggregate_decorator:
@@ -439,6 +449,30 @@ def load_post(scene):
         SlabDirectionDecorator.install(bpy.context)
     if model_props.show_bounding_box:
         BoundingBoxDecorator.install(bpy.context)
+    if getattr(model_props, "show_mep_path", False):
+        # Faint axis-line overlay tracing the selected MEP element's
+        # connected distribution system. Self-gates on the toggle every
+        # redraw; only installed when the user has flipped show_mep_path
+        # on, so the cost is zero when off.
+        MEPSystemPathDecorator.install(bpy.context)
+    # Faint preview lines for wall click-to-act gizmos. Always-on (no scene
+    # toggle); the handler self-gates on the gizmo addon-pref each draw.
+    WallGizmoPreviewDecorator.install(bpy.context)
+    # Bounding-box preview at each future instance while the array triad
+    # edit is active. Self-gates on ``BIMArrayProperties.is_editing``.
+    ArrayPreviewDecorator.install(bpy.context)
+    # Parent + sibling highlight when an array child is selected. Self-gates
+    # on ``is_array_child(active_element)``.
+    ArraySelectionHighlightDecorator.install(bpy.context)
+    # Faint preview line for the MEP-segment extend-to-cursor gizmo. Always-on;
+    # self-gates on per-feature ``extend`` toggle in gizmo preferences.
+    MEPSegmentExtendPreviewDecorator.install(bpy.context)
+    # Bend-creation preview: leg projections + arc polyline drawn while
+    # ``scene.BIMBendPreviewProperties.is_active`` (entered via
+    # ``bim.enable_bend_preview``). Always-installed; the draw callback's
+    # first action is the is_active check, so cost is one attribute read
+    # per redraw when no bend is being previewed.
+    BendPreviewDecorator.install(bpy.context)
 
     if preferences.should_use_snap and (scene := bpy.context.scene):
         # Snapping is off by default in Blender, but in BIM, it's more useful to be on
