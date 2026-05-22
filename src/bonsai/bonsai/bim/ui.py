@@ -477,6 +477,25 @@ class GizmoPreferencesRoof(bpy.types.PropertyGroup):
         roof_thickness: bool
 
 
+class GizmoPreferencesRailing(bpy.types.PropertyGroup):
+    """Property group for railing gizmo visibility settings."""
+
+    height: BoolProperty(name="Height", default=True)
+    thickness: BoolProperty(name="Thickness", default=True)
+    spacing: BoolProperty(name="Picket Spacing", default=True)
+    railing_diameter: BoolProperty(name="Railing Diameter", default=True)
+    clear_width: BoolProperty(name="Clear Width", default=True)
+    support_spacing: BoolProperty(name="Support Spacing", default=True)
+
+    if TYPE_CHECKING:
+        height: bool
+        thickness: bool
+        spacing: bool
+        railing_diameter: bool
+        clear_width: bool
+        support_spacing: bool
+
+
 class GizmoPreferences(bpy.types.PropertyGroup):
     """Property group for all gizmo visibility settings."""
 
@@ -490,6 +509,7 @@ class GizmoPreferences(bpy.types.PropertyGroup):
     stair: bpy.props.PointerProperty(type=GizmoPreferencesStair)
     wall: bpy.props.PointerProperty(type=GizmoPreferencesWall)
     roof: bpy.props.PointerProperty(type=GizmoPreferencesRoof)
+    railing: bpy.props.PointerProperty(type=GizmoPreferencesRailing)
 
     if TYPE_CHECKING:
         draw_gizmos_in_3d_viewport: bool
@@ -498,6 +518,7 @@ class GizmoPreferences(bpy.types.PropertyGroup):
         stair: GizmoPreferencesStair
         wall: GizmoPreferencesWall
         roof: GizmoPreferencesRoof
+        railing: GizmoPreferencesRailing
 
 
 class DocPreferences(bpy.types.PropertyGroup):

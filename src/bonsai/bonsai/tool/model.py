@@ -1514,6 +1514,8 @@ class Model(bonsai.core.tool.Model):
 
     RoofGenerationMethod = Literal["HEIGHT", "ANGLE"]
 
+    RailingType = Literal["FRAMELESS_PANEL", "WALL_MOUNTED_HANDRAIL"]
+
     @classmethod
     def generate_stair_2d_profile(
         cls,
