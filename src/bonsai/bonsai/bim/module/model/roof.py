@@ -17,7 +17,7 @@
 # along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
 
 import json
-from math import cos, pi, radians, tan
+from math import atan2, cos, degrees, pi, radians, tan
 from typing import Any, Literal, Union
 
 import bmesh
@@ -32,6 +32,8 @@ from mathutils import Quaternion, Vector
 
 import bonsai.core.root
 import bonsai.tool as tool
+from bonsai.bim.module.drawing import gizmos as gizmo
+from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.data import RoofData, refresh
 from bonsai.bim.module.model.decorator import ProfileDecorator
 from bonsai.bim.parametric_lifecycle import PathPreservingEditMixin
@@ -662,6 +664,125 @@ class FinishEditingRoof(_RoofEditMixin, bpy.types.Operator, tool.Ifc.Operator):
 
     def _execute(self, context):
         return self._finish_targets(context)
+
+
+# Fixed horizontal run for the slope gizmo: the draggable value is the
+# vertical rise at this distance from the anchor, in the rise/run convention.
+_ROOF_SLOPE_REFERENCE_RUN = 1.0
+
+
+class CycleRoofGenerationMethod(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
+    """Cycle the roof generation method (HEIGHT ↔ ANGLE). Shift+click cycles in reverse."""
+
+    bl_idname = "bim.cycle_roof_generation_method"
+    bl_label = "Cycle Roof Generation Method"
+    bl_options = {"REGISTER", "UNDO"}
+
+    element_checker = "is_roof"
+    props_getter = "get_roof_props"
+    type_literal = tool.Model.RoofGenerationMethod
+    type_attr = "generation_method"
+
+    def _execute(self, context: bpy.types.Context) -> set[str]:
+        return self._cycle_type(context)
+
+
+class GizmoRoofEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
+    bl_idname = "OBJECT_GGT_bim_roof_edition"
+    bl_label = "Roof Editing Gizmo"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_options = {"3D", "PERSISTENT"}
+
+    enable_editing_operator = "bim.enable_editing_roof"
+    finish_editing_operator = "bim.finish_editing_roof"
+    cancel_editing_operator = "bim.cancel_editing_roof"
+    cycle_type_operator = "bim.cycle_roof_generation_method"
+
+    # Positions for all three dimensions are set per-frame by the position
+    # override below; no static ``matrix_position`` is needed.
+    dimension_gizmo_props = [
+        DimensionGizmoConfig(
+            attr_name="height",
+            axis=(0, 0, 1),
+            min_value=0.01,
+            visibility_condition=lambda p: p.generation_method == "HEIGHT",
+        ),
+        DimensionGizmoConfig(
+            attr_name="angle",
+            axis=(0, 0, 1),
+            prop_name="Slope",
+            min_value=0.0,
+            visibility_condition=lambda p: p.generation_method == "ANGLE",
+            compute_value=lambda p: tan(p.angle) * _ROOF_SLOPE_REFERENCE_RUN,
+            apply_value=lambda p, rise: setattr(
+                p, "angle", min(pi / 2 - 0.001, max(0.0, atan2(rise, _ROOF_SLOPE_REFERENCE_RUN)))
+            ),
+            text_formatter=lambda p, rise: (f"{tool.Unit.format_distance(rise)} ({degrees(p.angle):.1f}°)"),
+        ),
+        DimensionGizmoConfig(
+            attr_name="roof_thickness",
+            axis=(0, 0, -1),
+            min_value=0.001,
+            # The line shows the perpendicular slab thickness (matching the
+            # pset value and the drag delta); the true vertical span is
+            # ``roof_thickness / cos(angle)``, longer than what is drawn.
+        ),
+    ]
+
+    props_getter = "get_roof_props"
+    gizmo_pref_name = "roof"
+
+    @classmethod
+    def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
+        return tool.Blender.Modifier.is_roof(element)
+
+    def _get_footprint_extents(self) -> tuple[float, float, float, float, float] | None:
+        """Footprint anchor in object-local SI units.
+
+        Returns ``(anchor_x, anchor_y, min_y, max_y, polyline_z)`` or
+        ``None`` when the pset footprint is not loaded. The anchor is
+        Shapely's ``representative_point`` — guaranteed to lie inside the
+        polygon, including for L- and U-shaped footprints whose AABB
+        centroid would fall outside the polygon. Reads the pset rather
+        than the mesh bound-box because the mesh AABB covers the apex
+        and slab bottom (not the eave plane) and downstream mesh ops
+        reorder vertices, so the pset is the only stable polyline source.
+        """
+        path_data = RoofData.data.get("path_data") if RoofData.is_loaded else None
+        if not path_data:
+            return None
+        verts = path_data.get("verts")
+        if not verts:
+            return None
+        si_conversion = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
+        scaled = [(v[0] * si_conversion, v[1] * si_conversion) for v in verts]
+        ys = [y for _, y in scaled]
+        polyline_z = verts[0][2] * si_conversion
+        polygon = shapely.Polygon(scaled)
+        if polygon.is_valid and polygon.area > 0:
+            anchor = polygon.representative_point()
+            anchor_x, anchor_y = anchor.x, anchor.y
+        else:
+            # Self-intersecting / degenerate footprint: fall back to AABB midpoint.
+            xs = [x for x, _ in scaled]
+            anchor_x = (min(xs) + max(xs)) / 2
+            anchor_y = (min(ys) + max(ys)) / 2
+        return (anchor_x, anchor_y, min(ys), max(ys), polyline_z)
+
+    def _update_dimension_gizmo_positions(self, context: bpy.types.Context, mw, props) -> None:  # noqa: ARG002
+        """Anchor height/slope at the footprint's representative point and
+        thickness at the camera-facing eave; called once per frame."""
+        extents = self._get_footprint_extents()
+        if extents is None or self._frame_view_dir is None:
+            return
+        anchor_x, anchor_y, min_y, max_y, polyline_z = extents
+        viewing_from_neg_y, _ = self._frame_view_dir
+        eave_y = self.get_camera_facing_outer_y(viewing_from_neg_y, min_y, max_y, self.GIZMO_OFFSET)
+
+        self.set_dimension_gizmo_position("height", mw, Vector((anchor_x, anchor_y, polyline_z)), (0, 0, 1))
+        self.set_dimension_gizmo_position("angle", mw, Vector((anchor_x, anchor_y, polyline_z)), (0, 0, 1))
+        self.set_dimension_gizmo_position("roof_thickness", mw, Vector((anchor_x, eave_y, polyline_z)), (0, 0, -1))
 
 
 class EnableEditingRoofPath(bpy.types.Operator, tool.Ifc.Operator):

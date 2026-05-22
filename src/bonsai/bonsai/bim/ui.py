@@ -452,6 +452,31 @@ class GizmoPreferencesWall(bpy.types.PropertyGroup):
         toggle_openings: bool
 
 
+class GizmoPreferencesRoof(bpy.types.PropertyGroup):
+    """Property group for roof gizmo visibility settings."""
+
+    height: BoolProperty(
+        name="Height",
+        default=True,
+        description="Show the apex-height dimension gizmo when generation method is HEIGHT.",
+    )
+    angle: BoolProperty(
+        name="Slope",
+        default=True,
+        description="Show the slope dimension gizmo when generation method is ANGLE.",
+    )
+    roof_thickness: BoolProperty(
+        name="Thickness",
+        default=True,
+        description="Show the slab-thickness dimension gizmo on the camera-facing eave.",
+    )
+
+    if TYPE_CHECKING:
+        height: bool
+        angle: bool
+        roof_thickness: bool
+
+
 class GizmoPreferences(bpy.types.PropertyGroup):
     """Property group for all gizmo visibility settings."""
 
@@ -464,6 +489,7 @@ class GizmoPreferences(bpy.types.PropertyGroup):
     window: bpy.props.PointerProperty(type=GizmoPreferencesWindow)
     stair: bpy.props.PointerProperty(type=GizmoPreferencesStair)
     wall: bpy.props.PointerProperty(type=GizmoPreferencesWall)
+    roof: bpy.props.PointerProperty(type=GizmoPreferencesRoof)
 
     if TYPE_CHECKING:
         draw_gizmos_in_3d_viewport: bool
@@ -471,6 +497,7 @@ class GizmoPreferences(bpy.types.PropertyGroup):
         window: GizmoPreferencesWindow
         stair: GizmoPreferencesStair
         wall: GizmoPreferencesWall
+        roof: GizmoPreferencesRoof
 
 
 class DocPreferences(bpy.types.PropertyGroup):

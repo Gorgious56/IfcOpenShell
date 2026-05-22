@@ -1512,6 +1512,8 @@ class Model(bonsai.core.tool.Model):
         "TRIPLE_PANEL_VERTICAL",
     ]
 
+    RoofGenerationMethod = Literal["HEIGHT", "ANGLE"]
+
     @classmethod
     def generate_stair_2d_profile(
         cls,
