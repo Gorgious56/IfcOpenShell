@@ -1223,6 +1223,41 @@ class Blender(bonsai.core.tool.Blender):
             return tool.Blender.is_object_an_ifc_class(obj, ("IfcRoof", "IfcRoofType"))
 
         @classmethod
+        def _get_array_pset(cls, element: entity_instance) -> dict | None:
+            """Return ``element``'s ``BBIM_Array`` pset dict, or ``None`` /
+            empty when the element isn't part of a Bonsai parametric array.
+            The pset's ``Parent`` GlobalId distinguishes the array parent
+            (== element's own GlobalId) from a child (== someone else's)."""
+            return ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+
+        @classmethod
+        def is_array(cls, element: entity_instance) -> bool:
+            """True if element is the PARENT of a Bonsai parametric array.
+
+            Array children also carry a ``BBIM_Array`` pset (their ``Parent``
+            field points back to the original), so checking pset presence alone
+            would falsely match them. The parent is distinguished by
+            ``pset.Parent == element.GlobalId``."""
+            pset = cls._get_array_pset(element)
+            if not pset:
+                return False
+            return pset.get("Parent") == element.GlobalId
+
+        @classmethod
+        def is_array_child(cls, element: entity_instance) -> bool:
+            """True if element is a CHILD of a Bonsai parametric array.
+
+            Children are managed replicas regenerated from the parent's pset —
+            their parametric attributes (door dimensions, wall lengths, …) are
+            overwritten on the next ``regenerate_array``. Parametric gizmo
+            groups skip children via this predicate in ``poll``."""
+            pset = cls._get_array_pset(element)
+            if not pset:
+                return False
+            parent_guid = pset.get("Parent")
+            return parent_guid is not None and parent_guid != element.GlobalId
+
+        @classmethod
         def is_railing(cls, element: entity_instance) -> bool:
             return tool.Pset.get_element_pset(element, "BBIM_Railing")
 
