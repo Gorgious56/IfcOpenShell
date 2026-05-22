@@ -127,6 +127,30 @@ class Aggregate(bonsai.core.tool.Aggregate):
                 aggregates.append(element)
         return aggregates
 
+    @staticmethod
+    def pick_aggregate_to_draw(
+        aggregates_list: list[ifcopenshell.entity_instance],
+        editing_aggregate: Union[ifcopenshell.entity_instance, None],
+    ) -> Union[ifcopenshell.entity_instance, None]:
+        """Return the aggregate the decorator should highlight, or None.
+
+        In aggregate mode, returns the predecessor of ``editing_aggregate`` in the
+        ancestor chain so the user sees the level above the one being edited.
+        Outside aggregate mode, returns the deepest ancestor aggregate.
+        Returns None when no choice is possible (empty list, editing aggregate
+        not in the chain, or editing aggregate is already the deepest).
+        """
+        if editing_aggregate is not None:
+            if editing_aggregate not in aggregates_list:
+                return None
+            index = aggregates_list.index(editing_aggregate)
+            if index == 0:
+                return None
+            return aggregates_list[index - 1]
+        if not aggregates_list:
+            return None
+        return aggregates_list[-1]
+
     @classmethod
     def get_parts_recursively(cls, element: ifcopenshell.entity_instance) -> set[ifcopenshell.entity_instance]:
         """Get elements parts recursively, resulting set includes `element`."""

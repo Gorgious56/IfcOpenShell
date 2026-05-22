@@ -138,7 +138,6 @@ classes = (
     gizmos.GizmoArrow2D,
     gizmos.GizmoCone,
     gizmos.GizmoDimension,
-    gizmos.GizmoLock,
     gizmos.GizmoLockOpen,
     gizmos.GizmoLockClosed,
     gizmos.GizmoArc,

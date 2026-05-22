@@ -46,6 +46,12 @@ if TYPE_CHECKING:
 
 
 VTX_PRECISION = 1.0e-5
+# Tolerance for merging coincident vertices after bmesh-based modifier regeneration.
+# Looser than VTX_PRECISION because regen-time numeric drift exceeds CAD snap precision.
+# Magnitude is in Blender units, which Bonsai standardises to SI metres at the
+# IFC boundary; pre-multiply by si_conversion if you need IFC-project-unit semantics
+# (see tool/cad.py:mep.py:VTX_PRECISION usage for the conversion pattern).
+WELD_TOLERANCE = 1.0e-4
 
 
 class Cad:
