@@ -36,7 +36,8 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
     bl_description = (
         "Apply opening objects to an Element.\n\n"
         "The Element and the openings to be applied should be selected. The order of selection is not important.\n"
-        "Opening can be just a Blender mesh object."
+        "Opening can be just a Blender mesh object.\n"
+        "SHIFT+CLICK to align other selected objects' Z rotation to the active before applying."
     )
 
     @classmethod
@@ -45,6 +46,24 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
             cls.poll_message_set("Select openings and a target element")
             return False
         return True
+
+    def invoke(self, context, event):
+        # SHIFT+click: orient the non-active selection to match the active's
+        # Z rotation first, so a fill (door/window) clicked onto a rotated
+        # wall lands flush with the wall before the opening is cut. Poll-
+        # guard the chained op: AddOpening.poll allows no active_object but
+        # CopyZRotationToSelected.poll requires one — skip silently rather
+        # than crash if we're in that gap.
+        #
+        # The chained op commits its own IFC transaction before this one,
+        # so SHIFT+click lands as TWO undo steps (opening, then rotation).
+        # Each step is independently meaningful, so the granularity is a
+        # feature, not a defect — Ctrl+Z reverts only the cut, not the
+        # alignment.
+        if event.type == "LEFTMOUSE" and event.shift:
+            if bpy.ops.bim.copy_z_rotation_to_selected.poll():  # ty: ignore[missing-argument]
+                bpy.ops.bim.copy_z_rotation_to_selected()
+        return self.execute(context)
 
     def _execute(self, context):
         selected_objects = context.selected_objects

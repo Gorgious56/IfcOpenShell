@@ -19,6 +19,7 @@
 # pyright: reportUnnecessaryTypeIgnoreComment=error
 
 import json
+import math
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import bmesh
@@ -45,6 +46,8 @@ import bonsai.core.type
 import bonsai.tool as tool
 from bonsai.bim.helper import get_enum_items
 from bonsai.bim.ifc import IfcStore
+from bonsai.bim.module.drawing import gizmos as gizmo
+from bonsai.bim.module.drawing.gizmos import IconActionConfig
 from bonsai.bim.module.model.data import AuthoringData
 from bonsai.bim.module.model.decorator import PolylineDecorator, ProductDecorator
 from bonsai.bim.module.model.polyline import PolylineOperator
@@ -676,6 +679,197 @@ class MirrorElements(bpy.types.Operator, tool.Ifc.Operator):
             newmat.translation = Vector(newmat.translation) - (newmat.to_quaternion() @ centroid)
 
             obj.matrix_world = newmat
+
+
+def _z_rotation_diff(target_z: float, source_z: float) -> float:
+    """Signed Z-Euler difference wrapped to ``[-π, π]``.
+
+    Detects "already aligned" targets in :class:`CopyZRotationToSelected`
+    without false negatives on the ±π boundary — e.g. ``target_z = -π`` and
+    ``source_z = +π`` represent the same rotation, so the diff is 0, not
+    2π. A naive ``abs(target - source)`` would fail to detect this case
+    and trigger a redundant ``edit_object_placement`` call.
+
+    Module-level rather than a method so it can be unit-tested in
+    isolation (see ``test_copy_z_rotation.py``).
+    """
+    return (target_z - source_z + math.pi) % (2 * math.pi) - math.pi
+
+
+class CopyZRotationToSelected(bpy.types.Operator, tool.Ifc.Operator):
+    """Apply the active object's Z rotation to all other selected objects.
+
+    "One-click alignment" for rows of openings: select a door/window row,
+    make one of them active, fire this operator (or click the matching
+    icon-action gizmo), and the rest snap their Z-axis to the active's.
+    X and Y Euler axes of each target are preserved — only Z changes.
+
+    For IFC elements among the targets, the placement is synced via
+    :func:`bonsai.core.geometry.edit_object_placement` so the
+    ``IfcLocalPlacement`` matches the new ``matrix_world``. Non-IFC
+    Blender objects in the selection still get the matrix update but no
+    IFC sync (harmless — they have no IFC placement).
+
+    Caveat: "Z rotation" here means the ``.z`` component of the XYZ-order
+    Euler decomposition of the world matrix's quaternion. For objects
+    whose only non-trivial rotation is around world-Z (the architectural
+    norm — doors, windows, beams plumb on Z) this is exactly the world-Z
+    rotation. For objects tilted around X or Y, ``euler.z`` is the
+    *third* rotation applied in XYZ order, not the world-Z rotation —
+    aligning that across a mixed-tilt selection produces unintended
+    results. A proper world-Z extraction (project local +X onto the
+    world XY plane, ``atan2``) is a future improvement.
+
+    Shift-click semantics: the ``flip`` property is set from ``event.shift``
+    inside ``invoke()``. This means the Shift modifier is only honoured
+    along the INVOKE_DEFAULT dispatch path (gizmo click, hotkey). Callers
+    using ``EXEC_DEFAULT`` (e.g. ``bpy.ops.bim.copy_z_rotation_to_selected()``
+    invoked programmatically) bypass ``invoke()`` and must pass
+    ``flip=True`` explicitly to opt in.
+    """
+
+    bl_idname = "bim.copy_z_rotation_to_selected"
+    bl_label = "Copy Z Rotation to Selected"
+    bl_description = "Align other selected objects' Z rotation to the active object's — hold Shift to flip 180°"
+    bl_options = {"REGISTER", "UNDO"}
+
+    flip: bpy.props.BoolProperty(
+        name="Flip 180°",
+        description="Add 180° (π) to the source Z rotation before applying — produces an opposite-facing alignment",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and len(context.selected_objects) >= 2
+
+    def invoke(self, context, event):
+        # Translate the SHIFT modifier into the ``flip`` operator property so
+        # ``_execute`` (and the REGISTER+UNDO redo panel) treats shift-click
+        # as a first-class alignment mode instead of an event-time side
+        # channel. ``tool.Ifc.Operator`` already wires the IFC transaction
+        # around ``execute``; we delegate there.
+        self.flip = bool(event.shift)
+        return self.execute(context)
+
+    def _execute(self, context):
+        active = context.active_object
+        if active is None:
+            return {"CANCELLED"}
+
+        _, source_rot, _ = active.matrix_world.decompose()
+        source_z = source_rot.to_euler().z
+        if self.flip:
+            source_z += math.pi
+
+        targets = [obj for obj in context.selected_objects if obj is not active]
+        if not targets:
+            return {"CANCELLED"}
+
+        aligned = 0
+        for obj in targets:
+            loc, rot, scale = obj.matrix_world.decompose()
+            euler = rot.to_euler()
+            # Skip already-aligned targets so we don't write no-op IFC
+            # placements — these are still expensive on large selections.
+            # ``_z_rotation_diff`` wraps the difference to [-π, π] so the
+            # ±π boundary doesn't produce false negatives.
+            if abs(_z_rotation_diff(euler.z, source_z)) < 1e-9:
+                continue
+            euler.z = source_z
+            obj.matrix_world = Matrix.Translation(loc) @ euler.to_matrix().to_4x4() @ Matrix.Diagonal(scale).to_4x4()
+            if tool.Ifc.get_entity(obj) is not None:
+                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+                aligned += 1
+
+        suffix = " (flipped 180°)" if self.flip else ""
+        if aligned:
+            self.report({"INFO"}, f"Aligned Z rotation of {aligned} object(s) to active{suffix}.")
+        else:
+            self.report({"INFO"}, f"All selected objects already aligned with active{suffix}.")
+        return {"FINISHED"}
+
+
+class GizmoCopyZRotation(bpy.types.GizmoGroup, gizmo.BaseIconActionGroup):
+    """First member of the IconActionGizmo family.
+
+    Polls in when exactly two objects are selected and the active is an
+    IfcWall. Renders a single icon anchored on the *non-active* object's
+    world origin — i.e. the one that will be rotated; clicking it aligns
+    that object's Z rotation to the active wall's. Restricting the gate
+    to walls keeps the action's intent legible: align rotation to *the
+    wall* the user just clicked as active, rather than to any IFC pair.
+    """
+
+    bl_idname = "OBJECT_GGT_bim_copy_z_rotation"
+    bl_label = "Copy Z Rotation Gizmo"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_options = {"3D", "PERSISTENT"}
+
+    action_configs = [
+        IconActionConfig(
+            name="copy_z_rotation",
+            # The revolving-arrows icon. Bonsai re-uses it elsewhere for
+            # rotation-flavoured actions (wall RotateWall90) — re-using the
+            # same icon here keeps the visual language consistent.
+            icon="VIEW3D_GT_cycle",
+            operator="bim.copy_z_rotation_to_selected",
+        ),
+    ]
+
+    @classmethod
+    def is_eligible_object(cls, obj):
+        # Require exactly 2 selected — "align rotation to the other object"
+        # has a single unambiguous referent only when N == 2. The active
+        # must also be an IfcWall: in practice Z-rotation alignment is only
+        # meaningful when the active is a wall (the rotation axis matches
+        # the wall's vertical), and offering it for arbitrary IFC pairs is
+        # noise. Subtypes like IfcWallStandardCase pass via ``is_a``.
+        if len(tool.Blender.get_selected_objects()) != 2:
+            return False
+        element = tool.Ifc.get_entity(obj)
+        return element is not None and element.is_a("IfcWall")
+
+    def position_gizmos(self, context):
+        """Anchor the icon on the non-active object's world origin.
+
+        Conceptually the action mutates the non-active selection; placing
+        the icon over that object reads as "click to rotate this one to
+        match the active". With exactly-2 eligibility there is exactly one
+        non-active object — the gizmo follows its origin as it moves.
+
+        The ``active is None`` / ``target is None`` guards cover the brief
+        window between a selection change and the next ``poll()``
+        re-evaluation: Blender may call ``position_gizmos`` once more with
+        the previous group still alive while ``context.active_object`` /
+        ``selected_objects`` already reflect the new state. Returning
+        early keeps the icon in place for that frame instead of indexing
+        into an empty target list.
+        """
+        active = context.active_object
+        if active is None:
+            return
+        target = next(
+            (obj for obj in tool.Blender.get_selected_objects() if obj is not active),
+            None,
+        )
+        if target is None:
+            return
+
+        billboard_rot = gizmo.get_billboard_rotation(context)
+        anchor = target.matrix_world.translation.copy()
+
+        for i, config in enumerate(self.action_configs):
+            gz = getattr(self, f"action_{config.name}_gizmo", None)
+            if gz is None:
+                continue
+            if config.visibility_condition is not None and not config.visibility_condition(active):
+                gz.hide = True
+                continue
+            gz.hide = False
+            pos = anchor + Vector((i * self.ICON_SPACING_X, 0.0, 0.0))
+            gz.matrix_basis = gizmo.billboarded_at(pos, billboard_rot, scale=self.ICON_SCALE)
 
 
 def generate_box(usecase_path: str, ifc_file: ifcopenshell.file, settings: dict[str, Any]) -> None:
