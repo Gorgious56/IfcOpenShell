@@ -24,6 +24,7 @@ from typing_extensions import assert_never
 
 import ifcopenshell.util.unit
 from ifcopenshell.util.shape_builder import (
+    PRECISION,
     SequenceOfVectors,
     ShapeBuilder,
     V,
@@ -157,7 +158,7 @@ class Usecase:
 
         # util functions
         def collinear(d0: np.ndarray, d1: np.ndarray) -> bool:
-            return is_x(np_angle(d0, d1), 0)
+            return bool(np.linalg.norm(np.cross(d0, d1)) < PRECISION)
 
         np_Z = 2
         np_XY = slice(2)
