@@ -116,6 +116,172 @@ class TestProjectAxisIntersection:
         assert result[2] == pytest.approx(2.0)
 
 
+class TestWallJoinPreviewLines:
+    """Each preview line connects the wall's nearer axis endpoint to the
+    caller-supplied XY intersection, held at that wall's own axis Z. The
+    caller passes the precomputed intersection (rather than the function
+    recomputing it) so the same math can be shared with whichever upstream
+    step also needed it. The parallel-axis case is the caller's
+    responsibility — invalid inputs (no real intersection) yield garbage,
+    so callers must gate the call on a real intersection existing first.
+
+    Returns two lines in input order (``[floor_a, floor_b]``) so callers can
+    map a line index back to the originating segment."""
+
+    def test_perpendicular_walls_lines_meet_at_corner(self):
+        # Wall A endpoint (5,0) is the nearest to the intersection (5,0); wall B's
+        # nearest endpoint is also (5,0). Both lines collapse to a point but are
+        # still well-defined and stay in selection order.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((5.0, 0.0, 0.0), (5.0, 3.0, 0.0))
+        result = subject.wall_join_preview_lines(seg_a, seg_b, intersection=(5.0, 0.0, 0.0))
+        assert len(result) == 2
+        (sa, ea), (sb, eb) = result
+        assert sa == pytest.approx((5.0, 0.0, 0.0))
+        assert ea == pytest.approx((5.0, 0.0, 0.0))
+        assert sb == pytest.approx((5.0, 0.0, 0.0))
+        assert eb == pytest.approx((5.0, 0.0, 0.0))
+
+    def test_far_apart_walls_draw_long_preview_lines(self):
+        # Two 1m walls whose axes meet ~50m away — the "bridge distant walls"
+        # case. Each line spans from the wall's nearest endpoint to the
+        # (50, 0) corner.
+        seg_a = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        seg_b = ((50.0, 50.0, 0.0), (50.0, 51.0, 0.0))
+        result = subject.wall_join_preview_lines(seg_a, seg_b, intersection=(50.0, 0.0, 0.0))
+        assert len(result) == 2
+        (sa, ea), (sb, eb) = result
+        # Wall A's endpoint at x=1 is closer to (50, 0) than x=0.
+        assert sa == pytest.approx((1.0, 0.0, 0.0))
+        assert ea == pytest.approx((50.0, 0.0, 0.0))
+        # Wall B's endpoint at y=50 is closer to (50, 0) than y=51.
+        assert sb == pytest.approx((50.0, 50.0, 0.0))
+        assert eb == pytest.approx((50.0, 0.0, 0.0))
+
+    def test_walls_at_different_elevations_lines_stay_at_own_z(self):
+        # Wall A on the floor (Z=0), wall B on a slab (Z=3). Each line stays
+        # horizontal at its own wall's Z; the upper-wall line does NOT descend
+        # to the lower wall's floor. Pins the "per-wall-axis Z" semantic — the
+        # Z component of the supplied intersection tuple is ignored in favour
+        # of each wall's own axis Z.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))  # floor at Z=0
+        seg_b = ((5.0, 0.0, 3.0), (5.0, 3.0, 3.0))  # floor at Z=3
+        result = subject.wall_join_preview_lines(seg_a, seg_b, intersection=(5.0, 0.0, 1.5))
+        (sa, ea), (sb, eb) = result
+        assert ea[2] == pytest.approx(0.0)
+        assert eb[2] == pytest.approx(3.0)
+
+
+class TestClassifyWallJoinState:
+    """Pin the four branches of the wall-pair state classifier. The classifier
+    is the single source of truth for what state a wall pair is in, called
+    from multiple independent consumers; a regression in one branch would
+    silently desync them — these tests are the contract that keeps them
+    aligned."""
+
+    PARALLEL_THRESHOLD = 0.9994
+    COLLINEAR_TOLERANCE = 0.05
+
+    def test_joined_wins_over_geometric_state(self):
+        # Even when the geometry looks like a clean intersection, the IFC-graph
+        # join flag takes priority. No intersection is returned for
+        # non-``intersect`` states; that's the contract.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((5.0, 0.0, 0.0), (5.0, 3.0, 0.0))
+        state, intersection = subject.classify_wall_join_state(
+            seg_a,
+            seg_b,
+            are_joined=True,
+            parallel_threshold=self.PARALLEL_THRESHOLD,
+            collinear_tolerance=self.COLLINEAR_TOLERANCE,
+        )
+        assert state == "joined"
+        assert intersection is None
+
+    def test_collinear_when_axes_share_infinite_line(self):
+        # Two segments on y=0 with a gap between them — same axis line.
+        seg_a = ((0.0, 0.0, 0.0), (2.0, 0.0, 0.0))
+        seg_b = ((3.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        state, intersection = subject.classify_wall_join_state(
+            seg_a,
+            seg_b,
+            are_joined=False,
+            parallel_threshold=self.PARALLEL_THRESHOLD,
+            collinear_tolerance=self.COLLINEAR_TOLERANCE,
+        )
+        assert state == "collinear"
+        assert intersection is None
+
+    def test_intersect_returns_state_and_intersection_xy(self):
+        # Two perpendicular axes — the canonical "Join + Extend" case. The
+        # classifier returns the intersection so the caller doesn't have to
+        # re-run project_axis_intersection. Pinning this is what closes the
+        # double-compute hazard the API restructure was meant to eliminate.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((10.0, 0.0, 0.0), (10.0, 5.0, 0.0))
+        state, intersection = subject.classify_wall_join_state(
+            seg_a,
+            seg_b,
+            are_joined=False,
+            parallel_threshold=self.PARALLEL_THRESHOLD,
+            collinear_tolerance=self.COLLINEAR_TOLERANCE,
+        )
+        assert state == "intersect"
+        assert intersection is not None
+        assert intersection[0] == pytest.approx(10.0)
+        assert intersection[1] == pytest.approx(0.0)
+
+    def test_none_for_parallel_but_not_collinear(self):
+        # Parallel offset walls — no meaningful intersection, no shared line.
+        # Consumers gate visibility off the ``"none"`` return.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((0.0, 1.0, 0.0), (5.0, 1.0, 0.0))
+        state, intersection = subject.classify_wall_join_state(
+            seg_a,
+            seg_b,
+            are_joined=False,
+            parallel_threshold=self.PARALLEL_THRESHOLD,
+            collinear_tolerance=self.COLLINEAR_TOLERANCE,
+        )
+        assert state == "none"
+        assert intersection is None
+
+
+class TestResolveExtendWallsTarget:
+    """Pin the target/other swap with the reverse flag. Default direction
+    extends ``objs`` to meet ``target_obj``; reversed direction swaps the
+    roles. Only the 1+1 case has a well-defined inverse — for ``n>1`` the
+    swap would be ambiguous and the default direction is preserved instead."""
+
+    def test_default_direction_passes_through_unchanged(self):
+        target = object()
+        other = object()
+        assert subject.resolve_extend_walls_target(target, [other], reverse=False) == (target, [other])
+
+    def test_reverse_swaps_in_one_plus_one_case(self):
+        target = object()
+        other = object()
+        assert subject.resolve_extend_walls_target(target, [other], reverse=True) == (other, [target])
+
+    def test_reverse_is_noop_when_target_is_none(self):
+        # Operator early-errors on missing target anyway; the helper just
+        # passes the bogus state through so the caller can report it.
+        other = object()
+        assert subject.resolve_extend_walls_target(None, [other], reverse=True) == (None, [other])
+
+    def test_reverse_is_noop_when_multiple_others(self):
+        # Shift+click on a multi-select has no single well-defined inverse —
+        # keep the default direction so a Shift modifier on a many-walls
+        # selection doesn't silently shuffle which wall is the target.
+        target = object()
+        others = [object(), object()]
+        assert subject.resolve_extend_walls_target(target, others, reverse=True) == (target, others)
+
+    def test_reverse_is_noop_when_no_others(self):
+        target = object()
+        assert subject.resolve_extend_walls_target(target, [], reverse=True) == (target, [])
+
+
 class TestSlopeRoundTrip:
     def test_zero_angle_zero_displacement(self):
         assert subject.displacement_from_x_angle(3.0, 0.0) == pytest.approx(0.0)
@@ -241,6 +407,89 @@ class TestVerticalHeightFromExtrusionDepth:
         positive = subject.vertical_height_from_extrusion_depth(3.0, math.radians(30))
         negative = subject.vertical_height_from_extrusion_depth(3.0, math.radians(-30))
         assert positive == pytest.approx(negative)
+
+
+class TestExtrusionDepthFromVerticalHeight:
+    """Inverse of the vertical-height helper. Callers placing markers in
+    wall-local space need the slanted extrusion depth, not the vertical
+    height — feeding the vertical value as a local Z lands below the
+    slanted top edge on sloped walls."""
+
+    def test_vertical_wall_returns_height_unchanged(self):
+        assert subject.extrusion_depth_from_vertical_height(3.0, 0.0) == pytest.approx(3.0)
+
+    def test_30_degree_slope(self):
+        # cos(30°) ≈ 0.866 → slanted depth of a 3m vertical wall ≈ 3 / 0.866 ≈ 3.464m.
+        result = subject.extrusion_depth_from_vertical_height(3.0, math.radians(30))
+        assert result == pytest.approx(3.0 / math.cos(math.radians(30)))
+
+    def test_negative_angle_yields_same_magnitude(self):
+        positive = subject.extrusion_depth_from_vertical_height(3.0, math.radians(30))
+        negative = subject.extrusion_depth_from_vertical_height(3.0, math.radians(-30))
+        assert positive == pytest.approx(negative)
+
+    @pytest.mark.parametrize("angle_deg", [0, 15, 30, 45, 60, -15, -30, -45, -60])
+    def test_roundtrip_with_vertical_height_from_extrusion_depth(self, angle_deg):
+        # Round-trip vertical_height → extrusion_depth → vertical_height should
+        # return the input across the slope range Bonsai supports
+        # (soft_min/max ±π/3 per prop.py; covers typical authoring slopes).
+        vertical = 3.0
+        angle = math.radians(angle_deg)
+        depth = subject.extrusion_depth_from_vertical_height(vertical, angle)
+        roundtrip = subject.vertical_height_from_extrusion_depth(depth, angle)
+        assert roundtrip == pytest.approx(vertical)
+
+    def test_horizontal_extrusion_does_not_blow_up(self):
+        # At ±π/2 cos is zero; helper clamps to avoid division-by-zero so
+        # callers never see inf / nan even if a wall is momentarily edited
+        # toward the degenerate slope limit during a slider drag.
+        result = subject.extrusion_depth_from_vertical_height(3.0, math.pi / 2)
+        assert math.isfinite(result)
+
+
+class TestLengthAndHeightFromExtrusion:
+    """Composition of the unit-scale and slanted-depth steps. The composition
+    exists so callers can pass any LAYER2 wall's four primitives (slanted
+    depth, x_angle, reference-line X extent, file unit scale) and get SI
+    length + vertical height back in one step, without re-deriving the
+    unit conversions or slope correction at each call site."""
+
+    def test_vertical_meter_wall_returns_extent_and_depth_unchanged(self):
+        length, height = subject.length_and_height_from_extrusion(
+            extrusion_depth=3.0, x_angle=0.0, reference_line_x_extent=5.0, unit_scale=1.0
+        )
+        assert length == pytest.approx(5.0)
+        assert height == pytest.approx(3.0)
+
+    def test_unit_scale_converts_millimeter_inputs_to_si(self):
+        # A wall stored in millimetres reports its Body Depth and reference line
+        # in IFC units; the helper rescales both to SI in one step so the gizmo
+        # never sees mixed units.
+        length, height = subject.length_and_height_from_extrusion(
+            extrusion_depth=3000.0, x_angle=0.0, reference_line_x_extent=5000.0, unit_scale=0.001
+        )
+        assert length == pytest.approx(5.0)
+        assert height == pytest.approx(3.0)
+
+    def test_slanted_wall_height_is_vertical_not_slanted(self):
+        # Sloped extrusion: the wall's vertical height is depth*cos(angle), not
+        # the slanted depth itself. Pinned at the composition level so a
+        # regression here can't be masked by the lower-level helper still
+        # passing on its own.
+        angle = math.radians(30)
+        length, height = subject.length_and_height_from_extrusion(
+            extrusion_depth=3.0, x_angle=angle, reference_line_x_extent=5.0, unit_scale=1.0
+        )
+        assert length == pytest.approx(5.0)
+        assert height == pytest.approx(3.0 * math.cos(angle))
+
+    def test_negative_reference_extent_preserved(self):
+        # A reverse-direction wall (p2.x < p1.x) yields a negative extent; the
+        # helper does not abs() it so callers can detect orientation.
+        length, _ = subject.length_and_height_from_extrusion(
+            extrusion_depth=3.0, x_angle=0.0, reference_line_x_extent=-5.0, unit_scale=1.0
+        )
+        assert length == pytest.approx(-5.0)
 
 
 class TestComputePathConnectionLocation:

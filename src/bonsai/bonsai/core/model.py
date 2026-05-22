@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
     import bpy
@@ -233,6 +233,94 @@ def project_axis_intersection(
     return (ix, iy, iz)
 
 
+WallJoinState = Literal["joined", "collinear", "intersect", "none"]
+
+
+def classify_wall_join_state(
+    seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
+    seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
+    are_joined: bool,
+    parallel_threshold: float,
+    collinear_tolerance: float,
+) -> tuple[WallJoinState, Optional[tuple[float, float, float]]]:
+    """Classify the geometric state of a wall pair as one of four mutually
+    exclusive outcomes. Centralising the decision in one function keeps
+    independent callers in lockstep — adding a state or re-ordering priority
+    cannot be forgotten in one branch.
+
+    Returns ``(state, intersection)``. The intersection point is non-None
+    only for the ``"intersect"`` branch; callers that need it can read it
+    here without recomputing the axis intersection.
+
+    Branches, in priority order:
+
+    - ``("joined", None)`` — caller-supplied flag asserting an
+      ``IfcRelConnectsPathElements`` exists between the two walls. The IFC
+      inverse-graph query is bim-layer code; this function stays pure.
+    - ``("collinear", None)`` — the two axes are parallel within
+      ``parallel_threshold`` AND lie on the same infinite line within
+      ``collinear_tolerance``.
+    - ``("intersect", (x, y, z))`` — the two axes meet at a non-parallel angle
+      and the projected intersection is the second element.
+    - ``("none", None)`` — the axes are parallel but not collinear (no
+      meaningful intersection to anchor a join on)."""
+    if are_joined:
+        return "joined", None
+    if are_axes_collinear(seg_a, seg_b, parallel_threshold, collinear_tolerance):
+        return "collinear", None
+    intersection = project_axis_intersection(seg_a, seg_b, parallel_threshold)
+    if intersection is None:
+        return "none", None
+    return "intersect", intersection
+
+
+def wall_join_preview_lines(
+    seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
+    seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
+    intersection: tuple[float, float, float],
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Two line segments showing how each wall axis would extend to reach a
+    precomputed XY intersection.
+
+    Each segment goes from the input axis endpoint nearest the intersection
+    to the intersection itself, held at the originating axis's own Z so the
+    segment stays horizontal at that wall's floor level — even when the two
+    walls sit at different elevations.
+
+    Returned in input order ``[floor_a, floor_b]`` so callers can map line
+    index back to the two input segments. The caller supplies the
+    intersection (rather than this function recomputing it) so the math can
+    be shared with whichever upstream step also needed it."""
+    ix, iy, _ = intersection
+
+    def _nearest(seg: tuple[tuple[float, float, float], tuple[float, float, float]]) -> tuple[float, float, float]:
+        return min(seg, key=lambda p: (p[0] - ix) ** 2 + (p[1] - iy) ** 2)
+
+    near_a = _nearest(seg_a)
+    near_b = _nearest(seg_b)
+    return [
+        (near_a, (ix, iy, near_a[2])),
+        (near_b, (ix, iy, near_b[2])),
+    ]
+
+
+def resolve_extend_walls_target(
+    target_obj: Any,
+    objs: list[Any],
+    reverse: bool,
+) -> tuple[Any, list[Any]]:
+    """Pick which object is the extend-target and which are extended.
+
+    Default direction: ``objs`` are extended to meet ``target_obj``.
+    Reversed direction (``reverse=True``) swaps the pair — equivalent to
+    having passed them in the opposite order. The swap is well-defined only
+    for the 1+1 case (one target + one other); for ``n>1`` it would be
+    ambiguous, so the default direction is preserved instead."""
+    if reverse and target_obj is not None and len(objs) == 1:
+        return objs[0], [target_obj]
+    return target_obj, objs
+
+
 def displacement_from_x_angle(height: float, x_angle: float) -> float:
     """Top-edge horizontal displacement for a wall of given vertical ``height`` and
     slope ``x_angle`` (radians). Drives the slope dimension gizmo's display value.
@@ -258,6 +346,38 @@ def vertical_height_from_extrusion_depth(extrusion_depth: float, x_angle: float)
     direction. The vertical height the user thinks of is ``depth * cos(x_angle)``.
     Unit-agnostic: the result is in the same units as ``extrusion_depth``."""
     return extrusion_depth * abs(math.cos(x_angle))
+
+
+def extrusion_depth_from_vertical_height(vertical_height: float, x_angle: float) -> float:
+    """Slanted extrusion depth for a wall of given vertical height and slope.
+
+    The extrusion runs along a direction tilted by ``x_angle`` from vertical,
+    so the slanted depth is ``vertical_height / cos(x_angle)``. ``cos(x_angle)``
+    is clamped to ``1e-6`` to keep the result finite as ``x_angle`` approaches
+    ``±π/2`` (a wall extruded fully horizontally has no meaningful vertical
+    height to convert from).
+
+    Unit-agnostic: the result is in the same units as ``vertical_height``."""
+    return vertical_height / max(abs(math.cos(x_angle)), 1e-6)
+
+
+def length_and_height_from_extrusion(
+    extrusion_depth: float,
+    x_angle: float,
+    reference_line_x_extent: float,
+    unit_scale: float,
+) -> tuple[float, float]:
+    """SI length and vertical height of a LAYER2 wall from its IFC primitives.
+
+    Caller has already pulled the four primitives off the wall's Body
+    ``IfcExtrudedAreaSolid``: the slanted ``Depth``, the extrusion ``x_angle``,
+    the X-extent of the wall's reference-line polyline, and the file's unit
+    scale. Length is the reference-line extent scaled to SI; height is the
+    *vertical* projection of the slanted depth (``depth * cos(x_angle)``),
+    not the slanted depth itself."""
+    length = reference_line_x_extent * unit_scale
+    height = vertical_height_from_extrusion_depth(extrusion_depth * unit_scale, x_angle)
+    return length, height
 
 
 def are_axes_collinear(
