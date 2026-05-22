@@ -1212,6 +1212,11 @@ class Voider:
 
 
 @interface
+class Slab:
+    def read_geometry(cls, obj): pass
+
+
+@interface
 class Wall:
     def get_axis_local_extent(cls, wall): pass
     def get_length_and_height(cls, wall): pass
