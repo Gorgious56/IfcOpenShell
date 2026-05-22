@@ -1211,5 +1211,12 @@ class Voider:
 
 
 @interface
+class Wall:
+    def get_axis_local_extent(cls, wall): pass
+    def get_length_and_height(cls, wall): pass
+    def get_x_angle(cls, wall): pass
+
+
+@interface
 class Web:
     pass
