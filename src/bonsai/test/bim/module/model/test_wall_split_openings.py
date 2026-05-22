@@ -172,78 +172,13 @@ def test_opening_axis_extent_offset_cursor_inside_extent_returns_straddling_rang
     ), f"opening [t={min_t}, t={max_t}] must straddle off-centre cursor at t={cut_percentage}"
 
 
-def test_straddling_opening_is_kept_on_both_sides():
-    """The pruning logic must keep an opening whose extent straddles the cut
-    on *both* element1 and element2.
-
-    Before the fix, an opening with centre at t=0.5 and cut_percentage=0.6
-    would be removed from element2 (centre < cut) but kept on element1; the
-    opening's right half — which physically overlaps element2 — would be
-    silently dropped. After the fix, the opening overlaps both portions of
-    the axis (min_t=0.3 < 0.6 < max_t=0.7) so both walls keep it.
-
-    Replays the boolean comparisons that ``DumbWallJoiner.split`` performs on
-    the helper's return value; does not call the helper itself."""
-    min_t, max_t = 0.3, 0.7  # straddles any cut_percentage in (0.3, 0.7)
-    cut_percentage = 0.6
-
-    removed_from_element1 = min_t > cut_percentage
-    removed_from_element2 = max_t < cut_percentage
-
-    assert removed_from_element1 is False, "straddling opening must remain on element1"
-    assert removed_from_element2 is False, "straddling opening must remain on element2"
-
-
-def test_opening_entirely_past_cut_is_removed_from_element1_only():
-    """Opening lies wholly on element2's side (min_t > cut_percentage).
-    Pre-fix and post-fix both remove it from element1; post-fix additionally
-    guarantees it stays on element2 because max_t > cut_percentage."""
-    min_t, max_t = 0.7, 0.9
-    cut_percentage = 0.5
-
-    assert (min_t > cut_percentage) is True  # removed from element1
-    assert (max_t < cut_percentage) is False  # kept on element2
-
-
-def test_opening_entirely_before_cut_is_removed_from_element2_only():
-    """Mirror of the above: opening wholly on element1's side."""
-    min_t, max_t = 0.1, 0.3
-    cut_percentage = 0.5
-
-    assert (min_t > cut_percentage) is False  # kept on element1
-    assert (max_t < cut_percentage) is True  # removed from element2
-
-
-def test_opening_touching_cut_at_boundary_stays_on_both_walls():
-    """Boundary touch: an opening's ``max_t`` lands exactly on the cut. Strict
-    inequalities keep the opening on both walls — the safer default. (Non-
-    strict ``<=`` would have removed from element2 instead.)"""
-    min_t, max_t = 0.2, 0.5
-    cut_percentage = 0.5
-
-    assert (min_t > cut_percentage) is False  # kept on element1
-    assert (max_t < cut_percentage) is False  # kept on element2 (boundary == cut)
-
-
-def test_degenerate_range_at_cut_keeps_opening_on_both_walls():
-    """Regression guard for the **post-fix-v1 regression**: when the helper
-    falls back to a degenerate range ``(t, t)`` (geometry kernel failed, or
-    the pre-create_shape fix attempts that produced only the placement
-    centre), placing the 3D cursor *on* the opening's centre makes
-    ``cut_percentage == t``.
-
-    With non-strict ``>=`` / ``<=`` tests, the degenerate range matched both
-    removal conditions and both walls dropped the opening — leaving the user
-    with two walls and no hole anywhere. Strict ``>`` / ``<`` tests keep the
-    opening on both walls in this case, which matches the visible geometry."""
-    min_t, max_t = 0.5, 0.5  # degenerate range — both bounds at the centre
-    cut_percentage = 0.5  # cursor placed exactly on the opening centre
-
-    removed_from_element1 = min_t > cut_percentage
-    removed_from_element2 = max_t < cut_percentage
-
-    assert removed_from_element1 is False, "must not remove from element1 when cursor sits on opening centre"
-    assert removed_from_element2 is False, "must not remove from element2 when cursor sits on opening centre"
+# The three cut-decision predicates ``opening_is_past_cut`` /
+# ``opening_is_before_cut`` / ``opening_straddles_cut`` are pure floats-in,
+# bool-out functions in ``bonsai.core.model`` and are tested in
+# ``test/core/test_model.py``'s ``TestOpeningSplitPredicates`` /
+# ``TestOpeningPredicateNaNHandling``. The forward-compat guard that
+# production calls them (rather than re-inlining the inequalities) lives
+# alongside the other wall.py structural AST guards.
 
 
 # ---------------------------------------------------------------------------
@@ -336,42 +271,3 @@ def test_add_void_copy_handles_source_with_no_fillings():
     ifc_file.remove.assert_not_called()
 
 
-def test_filled_opening_void_straddle_decision_keeps_void_on_neighbour():
-    """Replays the decision logic in ``DumbWallJoiner.split``'s filled-opening
-    loop for the case ``filling_position <= cut_percentage and void_straddles``:
-    filling stays on element1 (its centre is before the cut), but the void
-    extent crosses the cut, so the neighbour wall (element2) must receive a
-    pure-void copy via ``_add_void_copy``.
-
-    Mirrors the unfilled-opening decision tests — exercises the boolean
-    branching rather than full ``split()`` integration."""
-    cut_percentage = 0.5
-    filling_position = 0.4  # filling centre on element1's side
-    min_t, max_t = 0.3, 0.7  # void extent straddles cut at 0.5
-
-    void_straddles = min_t < cut_percentage < max_t
-    filling_on_element2 = filling_position > cut_percentage
-
-    # Expected branch: filling stays, but void straddles → add copy to element2.
-    assert void_straddles is True
-    assert filling_on_element2 is False
-    # Equivalent to the ``elif void_straddles:`` path adding a void copy to element2.
-
-
-def test_filled_opening_void_straddle_with_filling_on_far_side_keeps_void_on_origin():
-    """The symmetric case: ``filling_position > cut_percentage and void_straddles``.
-    Filling moves to element2 with the original void; element1 needs a
-    pure-void copy back (the void's element1 portion would otherwise be
-    orphaned). Documents the boolean state of the inner branch."""
-    cut_percentage = 0.5
-    filling_position = 0.6  # filling centre on element2's side
-    min_t, max_t = 0.3, 0.7
-
-    void_straddles = min_t < cut_percentage < max_t
-    filling_on_element2 = filling_position > cut_percentage
-
-    assert void_straddles is True
-    assert filling_on_element2 is True
-    # Equivalent to the outer ``if filling_position > cut_percentage`` path
-    # taking its inner ``if void_straddles`` branch and adding a void copy
-    # back to element1.

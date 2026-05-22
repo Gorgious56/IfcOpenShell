@@ -233,6 +233,35 @@ def project_axis_intersection(
     return (ix, iy, iz)
 
 
+def opening_is_past_cut(min_t: float, cut_percentage: float) -> bool:
+    """True when the opening's near edge sits past the cut on the t axis —
+    the lower-t wall (element1) must drop the opening; the high-t side keeps it.
+
+    Strict inequality is load-bearing: a boundary-only touch
+    (``min_t == cut_percentage``) keeps the opening on element1. A degenerate
+    extent sitting exactly on the cut must NOT be removed from both walls —
+    that would leave the user with two walls and no hole anywhere. NaN inputs
+    compare False and so leave the opening on both walls — the safe default
+    when the upstream extent helper cannot resolve a true bounding range."""
+    return min_t > cut_percentage
+
+
+def opening_is_before_cut(max_t: float, cut_percentage: float) -> bool:
+    """Mirror of ``opening_is_past_cut`` for the high-t side — the wall on
+    the higher-t side (element2) drops the opening when its far edge sits
+    before the cut. Strict inequality carries the same boundary invariant;
+    NaN inputs leave the opening on both walls."""
+    return max_t < cut_percentage
+
+
+def opening_straddles_cut(min_t: float, max_t: float, cut_percentage: float) -> bool:
+    """True when the opening's extent crosses the cut on the t axis — both
+    walls' bodies need cutting, so the neighbour wall gets a pure-void copy.
+    Strict inequalities: a boundary touch is not a straddle (handled by the
+    two single-sided predicates above). NaN inputs return False."""
+    return min_t < cut_percentage < max_t
+
+
 WallJoinState = Literal["joined", "collinear", "intersect", "none"]
 
 

@@ -22,8 +22,19 @@
 
 import copy
 import math
+import weakref
+from collections.abc import Iterable
 from math import atan2, cos, degrees, pi, sin
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Optional, Union, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    Optional,
+    Union,
+    get_args,
+)
 
 import bmesh
 import bpy
@@ -60,15 +71,16 @@ if TYPE_CHECKING:
     from bonsai.bim.module.model.prop import BIMWallProperties
 
 
+_MIN_WALL_DIMENSION = 0.001  # Floor on length/height/thickness to avoid degenerate preview geometry.
+
+
 def regenerate_wall_mesh_from_props(obj: bpy.types.Object) -> None:
     """Rebuild ``obj.data`` as a preview box from ``BIMWallProperties`` without touching IFC.
-
-    The preview omits openings, layer materials, and connection joins; those are
-    resolved on commit by ``recreate_wall`` / ``recalculate_walls``."""
+    Openings, layer materials, and connection joins are resolved later on commit."""
     props = tool.Model.get_wall_props(obj)
-    length = max(props.length, 0.001)
-    height = max(props.height, 0.001)
-    thickness = max(props.thickness, 0.001)
+    length = max(props.length, _MIN_WALL_DIMENSION)
+    height = max(props.height, _MIN_WALL_DIMENSION)
+    thickness = max(props.thickness, _MIN_WALL_DIMENSION)
     offset = props.offset
     x_angle = props.x_angle
     x0 = props.anchor_x
@@ -122,33 +134,11 @@ def _restore_wall_mesh_if_dirty(obj: bpy.types.Object) -> None:
     props.mesh_dirty = False
 
 
-def _validate_wall_for_parametric_edit(obj: bpy.types.Object) -> str | None:
-    """Return ``None`` if the wall is parametrically editable, else a user-facing reason
-    string explaining what's missing. Reports the *specific* gap rather than a generic
-    'not parametric' so the user knows whether to fix the material layer set, swap the
-    body representation, or pick a different object."""
-    element = tool.Ifc.get_entity(obj)
-    if not element:
-        return "Object is not an IFC element."
-    if not element.is_a("IfcWall"):
-        return f"Object is an {element.is_a()}, not an IfcWall."
-    if tool.Model.get_usage_type(element) != "LAYER2":
-        return "Wall has no IfcMaterialLayerSetUsage with LayerSetDirection AXIS2 (required for parametric editing)."
-    representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
-    if not representation:
-        return "Wall has no Model/Body/MODEL_VIEW representation to drive parametric dimensions."
-    if not tool.Model.get_extrusion(representation):
-        return (
-            "Wall body is not an IfcExtrudedAreaSolid " "(e.g. a brep mesh or boolean result without a base extrusion)."
-        )
-    return None
-
-
 def _read_wall_state_into_props(obj: bpy.types.Object, props: "BIMWallProperties") -> None:
     """Populate the draft props from current IFC state. Caller must have validated the
-    wall via ``_validate_wall_for_parametric_edit`` first — this function assumes the
-    wall has a LAYER2 usage and an extruded MODEL_VIEW body."""
-    geom = _read_wall_geometry(obj)
+    wall via ``tool.Wall.validate_for_parametric_edit`` first — this function assumes
+    the wall has a LAYER2 usage and an extruded MODEL_VIEW body."""
+    geom = tool.Wall.read_geometry(obj)
     assert geom
 
     props.anchor_x = geom["anchor_x"]
@@ -167,7 +157,53 @@ def _read_wall_state_into_props(obj: bpy.types.Object, props: "BIMWallProperties
     props.snap_offset_baseline = props.desired_offset_baseline
 
 
-class UnjoinWalls(bpy.types.Operator, tool.Ifc.Operator):
+def _maybe_resync_wall_props_from_ifc(obj: "bpy.types.Object | None") -> None:
+    """Re-prime ``BIMWallProperties`` from current IFC after an IFC mutation, so non-edit-mode
+    handles read post-mutation coordinates. Must be called from an operator's ``_execute``
+    (ID writes from ``GizmoGroup.refresh`` raise ``AttributeError: Writing to ID classes in
+    this context is not allowed``). No-op during a draft session — the draft is then the
+    source of truth."""
+    if obj is None:
+        return
+    if tool.Wall.validate_for_parametric_edit(obj) is not None:
+        return
+    props = tool.Model.get_wall_props(obj)
+    if props.is_editing:
+        return
+    _read_wall_state_into_props(obj, props)
+
+
+def _resync_walls_after_mutation(objs: Iterable[bpy.types.Object | None]) -> None:
+    """Re-prime each wall's draft props after a one-shot IFC mutation so the
+    always-visible gizmos read fresh coordinates. Safe to call from operator
+    ``_execute``: ID writes are allowed there, unlike gizmo refresh."""
+    for obj in objs:
+        _maybe_resync_wall_props_from_ifc(obj)
+
+
+class _CommitWallDraftsFirstMixin:
+    """Operator mixin: flushes any in-progress wall parametric drafts in the
+    current selection before delegating to the subclass's ``_perform``.
+
+    Why: every multi-wall operator (split / join / merge / unjoin /
+    extend-to-wall …) must run against committed IFC state — running it
+    with a wall whose draft hasn't been flushed leaves stale gizmos
+    pointing at obsolete IFC numbers. Centralising the guard here means
+    a future multi-wall operator cannot forget the commit step.
+
+    Place this BEFORE ``bpy.types.Operator`` in the bases tuple so this
+    ``_execute`` resolves first in the MRO; subclasses implement
+    ``_perform`` instead of ``_execute``."""
+
+    def _execute(self, context: bpy.types.Context):
+        tool.Parametric.commit_pending_edits_for_selection(names=("wall",))
+        return self._perform(context)
+
+    def _perform(self, context: bpy.types.Context):
+        raise NotImplementedError("Subclasses of _CommitWallDraftsFirstMixin must implement _perform.")
+
+
+class UnjoinWalls(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.unjoin_walls"
     bl_label = "Unjoin Walls"
     bl_description = "Unjoin the selected walls"
@@ -180,12 +216,93 @@ class UnjoinWalls(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
-    def _execute(self, context):
-        _commit_pending_wall_edits_for_selection(context)
+    def _perform(self, context):
         core.unjoin_walls(tool.Ifc, tool.Blender, tool.Geometry, DumbWallJoiner(), tool.Model)
+        _resync_walls_after_mutation(tool.Blender.get_selected_objects())
 
 
-class ExtendWallsToUnderside(bpy.types.Operator, tool.Ifc.Operator):
+class UnjoinWallPathConnection(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
+    """Surgical counterpart to `UnjoinWalls`: disconnect the active wall from one
+    specific partner wall, leaving the active wall's other connections intact. The
+    partner is identified by IFC GlobalId — invariant under Blender-object renames,
+    file save/reload, and the undo stack — set on the operator properties by the
+    single-wall unjoin gizmo at click time."""
+
+    bl_idname = "bim.unjoin_wall_path_connection"
+    bl_label = "Unjoin Wall Connection"
+    bl_description = "Disconnect the active wall from a single specific partner wall"
+    bl_options = {"REGISTER", "UNDO"}
+
+    other_wall_guid: bpy.props.StringProperty(name="Other Wall GlobalId")
+
+    @classmethod
+    def poll(cls, context):
+        if not tool.Model.has_selected_ifc_objects():
+            cls.poll_message_set("No IFC objects selected.")
+            return False
+        return True
+
+    def _perform(self, context):
+        active = tool.Blender.get_active_object(is_selected=True)
+        if not active:
+            self.report({"ERROR"}, "Could not resolve walls for surgical unjoin.")
+            return
+        elem_active = tool.Ifc.get_entity(active)
+        if not elem_active:
+            self.report({"ERROR"}, "Active object is not bound to an IFC entity.")
+            return
+        elem_other = None
+        if self.other_wall_guid:
+            try:
+                elem_other = tool.Ifc.get().by_guid(self.other_wall_guid)
+            except RuntimeError:
+                elem_other = None
+        other = tool.Ifc.get_object(elem_other) if elem_other else None
+        if not elem_other or not other:
+            self.report({"ERROR"}, "Could not resolve walls for surgical unjoin.")
+            return
+        # Walk the inverse graph for the specific ``IfcRelConnectsPathElements``
+        # joining these two walls and remove only that one — matches the surgical
+        # pattern used by ``DumbWallJoiner.split`` and avoids ``disconnect_path``'s
+        # direction-sensitivity (its (relating, related) mode only inspects
+        # ``relating.ConnectedTo``, so a one-shot call misses the rel whenever it
+        # was authored with the opposite orientation).
+        rels = [
+            rel
+            for rel in getattr(elem_active, "ConnectedTo", [])
+            if rel.is_a("IfcRelConnectsPathElements") and rel.RelatedElement == elem_other
+        ] + [
+            rel
+            for rel in getattr(elem_active, "ConnectedFrom", [])
+            if rel.is_a("IfcRelConnectsPathElements") and rel.RelatingElement == elem_other
+        ]
+        for rel in rels:
+            bonsai.core.geometry.remove_connection(tool.Geometry, connection=rel)
+        # Mirror DumbWallJoiner.unjoin — recreate body+axis on both walls so the
+        # mesh state matches the IFC mutation (the joiner's clean re-extrusion is
+        # what removes the now-stale miter cuts on the formerly-joined ends).
+        #
+        # The IFC rel removal above is already captured by
+        # ``IfcStore.execute_ifc_operator``'s active transaction. If
+        # ``recreate_wall`` raises, the IFC state is committed to transaction
+        # history (rel is gone) but the Blender mesh stays stale on one or both
+        # walls. Surface the partial-state diagnostic so the user knows what to
+        # do, then re-raise so the exception lands in Blender's normal operator
+        # error flow.
+        try:
+            tool.Model.recreate_wall(elem_active, active)
+            tool.Model.recreate_wall(elem_other, other)
+        except Exception:
+            self.report(
+                {"ERROR"},
+                "Mesh rebuild failed after unjoin. IFC connection was removed but wall "
+                "meshes may be stale — press Ctrl+Z to undo and restore the previous state.",
+            )
+            raise
+        _resync_walls_after_mutation([active, other])
+
+
+class ExtendWallsToUnderside(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.extend_walls_to_underside"
     bl_label = "Extend Walls To Underside"
     bl_description = "Extend and clip selected walls at the bottom faces of an object"
@@ -198,11 +315,7 @@ class ExtendWallsToUnderside(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
-    def _execute(self, context):
-        # Match the sibling ops (UnjoinWalls / MergeWall / ExtendWallsToWall): if any
-        # of the selected walls has an in-progress parametric draft, commit it before
-        # extending, so the slab clip operates on the just-finalised IFC state.
-        _commit_pending_wall_edits_for_selection(context)
+    def _perform(self, context):
         slab = None
         walls: list[bpy.types.Object] = []
         if (obj := tool.Blender.get_active_object(is_selected=True)) and (element := tool.Ifc.get_entity(obj)):
@@ -212,18 +325,34 @@ class ExtendWallsToUnderside(bpy.types.Operator, tool.Ifc.Operator):
                 walls.append(obj)
         if slab and walls:
             core.extend_wall_to_slab(tool.Ifc, tool.Geometry, tool.Model, slab, walls)
+            _resync_walls_after_mutation(walls)
         else:
             self.report({"ERROR"}, "Please select at least one LAYER2 element and an active element")
 
 
-class ExtendWallsToWall(bpy.types.Operator, tool.Ifc.Operator):
+class ExtendWallsToWall(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.extend_walls_to_wall"
     bl_label = "Extend Walls To Wall"
-    bl_description = "Extend and trim selected walls to another wall"
+    bl_description = (
+        "Extend and trim non-active selected walls to the active wall. "
+        "Shift+click to reverse: extend the active wall to meet the other instead"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
-    def _execute(self, context):
-        _commit_pending_wall_edits_for_selection(context)
+    reverse: bpy.props.BoolProperty(
+        name="Reverse",
+        description=(
+            "Swap target / extended roles — extend the active wall to meet the " "other selected wall instead"
+        ),
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        self.reverse = bool(event.shift)
+        return self.execute(context)
+
+    def _perform(self, context):
         target_obj = None
         objs = []
         if (
@@ -239,6 +368,11 @@ class ExtendWallsToWall(bpy.types.Operator, tool.Ifc.Operator):
                 and tool.Model.get_usage_type(element) == "LAYER2"
             ):
                 objs.append(obj)
+        # Shift+click semantic: behave as if the user had selected the walls in
+        # reversed order. Logic kept in :func:`core.resolve_extend_walls_target`
+        # so the swap (and its "no-op for n>1" fallback) is unit-testable in
+        # the core lane without bim-layer fixtures.
+        target_obj, objs = core.resolve_extend_walls_target(target_obj, objs, self.reverse)
         if target_obj and objs:
             if tool.Ifc.is_moved(target_obj):
                 bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=target_obj)
@@ -253,6 +387,17 @@ class ExtendWallsToWall(bpy.types.Operator, tool.Ifc.Operator):
                 )
                 tool.Model.recreate_wall(element, obj)
             tool.Model.recreate_wall(target_element, target_obj)
+            _resync_walls_after_mutation([target_obj, *objs])
+            # Surface the direction in the info log — the only post-action cue
+            # for a feature whose visible side-effect (a wall extending) doesn't
+            # by itself tell the user *which* wall extended. Especially useful
+            # for Shift+click, where the absence of a breadcrumb makes the
+            # reversal effectively invisible until the user notices the geometry
+            # changed unexpectedly.
+            extended_name = next(iter(objs)).name
+            target_name = target_obj.name
+            prefix = "Reversed: " if self.reverse else ""
+            self.report({"INFO"}, f"{prefix}Extended {extended_name} to meet {target_name}")
         else:
             self.report({"ERROR"}, "Please select at least one LAYER2 element and one active LAYER2 element")
 
@@ -361,6 +506,7 @@ class ExtendWallsToPolylinePoint(bpy.types.Operator, PolylineOperator, tool.Ifc.
                     Vector((point.x, point.y, point.z)),
                     self.connection,
                 )
+                _resync_walls_after_mutation(tool.Blender.get_selected_objects())
 
             tool.Polyline.clear_polyline()
             context.workspace.status_text_set(text=None)
@@ -411,6 +557,8 @@ class AlignWall(bpy.types.Operator):
             core.align_walls(tool.Ifc, tool.Blender, tool.Model, DumbWallAligner(), self.align_type)
         except core.RequireAtLeastTwoLayeredElements as e:
             self.report({"ERROR"}, str(e))
+            return {"FINISHED"}
+        _resync_walls_after_mutation(tool.Blender.get_selected_objects())
         return {"FINISHED"}
 
 
@@ -432,10 +580,11 @@ class FlipWall(bpy.types.Operator, tool.Ifc.Operator):
         joiner = DumbWallJoiner()
         for obj in selected_objs:
             joiner.flip(obj)
+        _resync_walls_after_mutation(selected_objs)
         return {"FINISHED"}
 
 
-class SplitWall(bpy.types.Operator, tool.Ifc.Operator):
+class SplitWall(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.split_wall"
     bl_label = "Split Wall"
     bl_options = {"REGISTER", "UNDO"}
@@ -450,15 +599,15 @@ class SplitWall(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
-    def _execute(self, context):
-        _commit_pending_wall_edits_for_selection(context)
+    def _perform(self, context):
         selected_objs = tool.Model.get_selected_mesh_objects()
         for obj in selected_objs:
             DumbWallJoiner().split(obj, context.scene.cursor.location)
+        _resync_walls_after_mutation(selected_objs)
         return {"FINISHED"}
 
 
-class MergeWall(bpy.types.Operator, tool.Ifc.Operator):
+class MergeWall(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.merge_wall"
     bl_label = "Merge Wall"
     bl_description = "Merge selected walls into one object"
@@ -478,12 +627,12 @@ class MergeWall(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
-    def _execute(self, context):
-        _commit_pending_wall_edits_for_selection(context)
+    def _perform(self, context):
         active_obj = context.active_object
         assert active_obj
         selected_objs = tool.Model.get_selected_mesh_objects()
         DumbWallJoiner().merge(next(o for o in selected_objs if o != active_obj), active_obj)
+        _maybe_resync_wall_props_from_ifc(active_obj)
         return {"FINISHED"}
 
 
@@ -502,6 +651,7 @@ class RecalculateWall(bpy.types.Operator, tool.Ifc.Operator):
     def _execute(self, context):
         objects = tool.Model.get_selected_mesh_ifc_objects()
         tool.Model.recalculate_walls(objects)
+        _resync_walls_after_mutation(objects)
         return {"FINISHED"}
 
 
@@ -550,6 +700,7 @@ class ChangeExtrusionDepth(bpy.types.Operator, tool.Ifc.Operator):
 
         if layer2_objs:
             tool.Model.recalculate_walls(layer2_objs)
+            _resync_walls_after_mutation(layer2_objs)
         return {"FINISHED"}
 
 
@@ -665,6 +816,7 @@ class ChangeExtrusionXAngle(bpy.types.Operator, tool.Ifc.Operator):
 
         if layer2_objs:
             tool.Model.recalculate_walls(layer2_objs)
+            _resync_walls_after_mutation(layer2_objs)
         return {"FINISHED"}
 
 
@@ -687,6 +839,8 @@ class ChangeLayerLength(bpy.types.Operator, tool.Ifc.Operator):
         selected_objs = tool.Model.get_selected_mesh_ifc_objects()
         for obj in selected_objs:
             joiner.set_length(obj, self.length)
+        _resync_walls_after_mutation(selected_objs)
+        return {"FINISHED"}
 
 
 class OffsetWalls(bpy.types.Operator, tool.Ifc.Operator):
@@ -705,6 +859,8 @@ class OffsetWalls(bpy.types.Operator, tool.Ifc.Operator):
     def _execute(self, context):
         props = tool.Model.get_model_props()
         core.offset_walls(tool.Ifc, tool.Blender, tool.Model, props.offset_type_vertical)
+        _resync_walls_after_mutation(tool.Blender.get_selected_objects())
+        return {"FINISHED"}
 
 
 class AddWallsFromSlab(bpy.types.Operator, tool.Ifc.Operator):
@@ -1324,7 +1480,7 @@ class DumbWallJoiner:
             r.RelatedOpeningElement for r in element1.HasOpenings if not r.RelatedOpeningElement.HasFillings
         ]:
             min_t, _ = _opening_axis_extent(opening, axis1["reference"], unit_scale)
-            if min_t > cut_percentage:
+            if core.opening_is_past_cut(min_t, cut_percentage):
                 # Opening lies entirely past the cut — only element2 should keep it.
                 ifcopenshell.api.feature.remove_feature(tool.Ifc.get(), feature=opening)
 
@@ -1332,7 +1488,7 @@ class DumbWallJoiner:
             r.RelatedOpeningElement for r in element2.HasOpenings if not r.RelatedOpeningElement.HasFillings
         ]:
             _, max_t = _opening_axis_extent(opening, axis1["reference"], unit_scale)
-            if max_t < cut_percentage:
+            if core.opening_is_before_cut(max_t, cut_percentage):
                 # Opening lies entirely before the cut — only element1 should keep it.
                 ifcopenshell.api.feature.remove_feature(tool.Ifc.get(), feature=opening)
 
@@ -1350,7 +1506,7 @@ class DumbWallJoiner:
             filling_location = filling_obj.matrix_world.translation
             _, filling_position = mathutils.geometry.intersect_point_line(filling_location.to_2d(), *axis1["reference"])
             min_t, max_t = _opening_axis_extent(opening, axis1["reference"], unit_scale)
-            void_straddles = min_t < cut_percentage < max_t
+            void_straddles = core.opening_straddles_cut(min_t, max_t, cut_percentage)
             if filling_position > cut_percentage:
                 # The filling should be moved from element1 to element2.
                 new_opening = ifcopenshell.api.root.copy_class(tool.Ifc.get(), product=opening)
@@ -1474,6 +1630,12 @@ class DumbWallJoiner:
         for collection in wall1.users_collection:
             collection.objects.link(wall2)
         bonsai.core.root.copy_class(tool.Ifc, tool.Collector, tool.Geometry, tool.Root, obj=wall2)
+        element2 = tool.Ifc.get_entity(wall2)
+        if element2 is not None:
+            # The split-off wall must not participate in the source's array:
+            # without this scrub, root.copy_class copies the source's BBIM_Array
+            # pset verbatim and the new wall poses as an array child of the source.
+            tool.Model.handle_array_on_copied_element(element2, array_data=None)
         return wall2
 
     def set_axis(self, wall, p1, p2):
@@ -1624,7 +1786,7 @@ class EnableEditingWall(bpy.types.Operator, tool.Ifc.Operator):
         obj = context.active_object
         if not obj:
             return {"CANCELLED"}
-        reason = _validate_wall_for_parametric_edit(obj)
+        reason = tool.Wall.validate_for_parametric_edit(obj)
         if reason:
             self.report({"WARNING"}, f"Cannot edit wall parametrically: {reason}")
             return {"CANCELLED"}
@@ -1717,6 +1879,12 @@ class FinishEditingWall(bpy.types.Operator, tool.Ifc.Operator):
             _restore_wall_mesh_if_dirty(obj)
         # Set only on success: if any sub-op above raised, the draft survives for retry.
         props.is_editing = False
+        # Sub-ops above ran with is_editing=True, so their internal resync calls
+        # were guarded no-ops. Pull post-mutation IFC state back into the draft
+        # now that is_editing=False, so the always-visible gizmos read the values
+        # the wall joiner / recalculate actually committed (length and anchor_x
+        # may differ from the draft when neighbors clipped the wall).
+        _maybe_resync_wall_props_from_ifc(obj)
         return {"FINISHED"}
 
 
@@ -1769,9 +1937,8 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_wall"
     finish_editing_operator = "bim.finish_editing_wall"
     cancel_editing_operator = "bim.cancel_editing_wall"
-    # Empty disables the base class's auto-created cycle_gizmo at ICON_CYCLE_X.
-    # We render three state-specific baseline icons at that slot instead — see
-    # ``setup_element_specific_gizmos`` / ``_update_icon_row_extras``.
+    # Empty disables the inherited cycle_gizmo; three state-specific baseline icons
+    # are rendered at that slot instead.
     cycle_type_operator = ""
 
     # Threshold (SI meters) above which a second height gizmo is drawn at the far end of
@@ -1779,11 +1946,9 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     LONG_WALL_THRESHOLD = 5.0
 
     dimension_gizmo_props = [
-        # length / height / height_end positions are recomputed per frame in
-        # ``_update_dimension_gizmo_positions`` so they flip to the camera-facing
-        # side of the wall as the viewport is orbited. No static ``matrix_position``
-        # here means the base class falls back to Identity, which the override
-        # then replaces with the view-dependent coordinates.
+        # length / height / height_end positions are recomputed per frame so they
+        # flip to the camera-facing side of the wall as the viewport is orbited.
+        # No static matrix_position; positions are written from the per-frame update.
         DimensionGizmoConfig(
             attr_name="length",
             axis=(1, 0, 0),
@@ -1821,7 +1986,6 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
                 p, "x_angle", core.x_angle_from_displacement(p.height, displacement)
             ),
             color="GREEN",
-            min_value=-1e6,  # apply_value clamps via atan2; allow negative displacement
             text_formatter=lambda p, displacement: (
                 f"{'-' if displacement < 0 else ''}{tool.Unit.format_distance(abs(displacement))} "
                 f"({math.degrees(p.x_angle):.1f}°)"
@@ -1884,15 +2048,14 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
             (0, 0, 1),
         )
 
-    # X offsets in the editing icon row, additive from ICON_VALIDATE_X (0.0).
-    # Matches the cadence used by the base class (0.0 / 0.5 / 0.87 = step ≈ 0.37).
-    # The baseline icons (EXT / CEN / INT) all share ICON_CYCLE_X — only one is
-    # ever visible at a time so they don't overlap.
+    # Wall-specific rotate icon X position. Sits past the existing icon row so the
+    # exterior/center/interior baseline icons (mutually exclusive) and the rotate
+    # icon don't overlap. ARRAY shares the same outer position.
     ICON_ROTATE_X = 1.24
-
-    # Shifts the base class's ARRAY button outward past the rotate icon —
-    # otherwise the array glyph stacks on top of the rotate gizmo at 1.24.
     FEATURE_ICON_MAX_X = ICON_ROTATE_X
+    # The rotate icon is visually denser than the validate/cancel glyphs, so it
+    # is drawn at a smaller scale to keep apparent weight balanced in the row.
+    ROTATE_ICON_SCALE = 0.30
 
     # Mapping from BIMWallProperties.desired_offset_baseline value to the
     # attribute on `self` that holds the corresponding state icon.
@@ -1905,7 +2068,9 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     def setup_element_specific_gizmos(self, context: bpy.types.Context) -> None:
         """Wall-specific gizmos.
 
-        Cursor-anchored (always visible during edit mode, conditional position):
+        Cursor-anchored, always visible when the wall is parametrically editable
+        (regardless of edit mode — these are one-shot operators that go straight
+        to IFC, so they don't need a draft session):
 
         - ``split_gizmo`` — at the 3D cursor's exact world position when cursor is
           within the wall's X range. Clicking splits the wall there.
@@ -1915,22 +2080,27 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
           wall top (Z=height in wall-local). Clicking extends the wall's height to
           the cursor's Z.
 
-        Icon-row (always visible during edit mode, fixed position):
+        Icon-row, edit-mode-only (state-bearing, tied to the draft session):
 
         - ``offset_{exterior,center,interior}_gizmo`` — three state-specific icons,
           only one visible at a time. Reflects ``props.desired_offset_baseline``.
           Clicking any of them cycles the baseline (the operator is the same).
-        - ``rotate_gizmo`` — rotates the wall 90° around Z (Shift+R). Uses the
-          revolving-arrows icon now that the cycle slot is occupied by the
-          stateful baseline icons.
+
+        Icon-row, always visible when the wall is parametrically editable:
+
+        - ``rotate_gizmo`` — rotates the wall 90° around Z (Shift+R). One-shot IFC
+          mutation, joins the click-to-act set alongside the cursor-anchored
+          gizmos above.
         - ``toggle_openings_gizmo`` — toggles opening fill visibility (Alt+O).
+          Hidden during edit mode because its slot is reused by the cancel icon.
         """
         default_color, highlight_color = self.get_decoration_colors()
+        warning_highlight_color = gizmo.get_warning_color_from_prefs(self.get_addon_prefs())
         self.split_gizmo = self._setup_icon_gizmo(
             "VIEW3D_GT_split",
             default_color,
             "bim.split_wall_at_cursor",
-            highlight_color,
+            warning_highlight_color,
         )
         self.extend_x_gizmo = self._setup_icon_gizmo(
             "VIEW3D_GT_extend",
@@ -1970,6 +2140,20 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
             "bim.toggle_wall_openings",
             highlight_color,
         )
+        if context.region is not None:
+            type(self)._active_instances[context.region.as_pointer()] = weakref.ref(self)
+
+    # Per-region weakref map. Blender instantiates one ``GizmoGroup`` per
+    # 3D viewport region, so a single class-level slot would let the last
+    # ``setup()`` overwrite earlier regions' refs and the cursor-extend
+    # preview line in viewport A would read hover state from viewport B.
+    # Keying by ``context.region.as_pointer()`` keeps each viewport's
+    # hover state isolated. The wall-join preview decorator looks up the
+    # ref for the region it's currently drawing in. Dead refs (regions
+    # whose viewport has closed) stay in the dict but resolve to ``None``
+    # at lookup; that's a bounded leak (regions are <100 across a session)
+    # so explicit reaping isn't worth the complexity.
+    _active_instances: "dict[int, weakref.ReferenceType[GizmoWallEdition]]" = {}
 
     def _refresh_element_specific(self, context: bpy.types.Context, mw: Matrix, props: "BIMWallProperties") -> None:
         """Position cursor-anchored gizmos and the wall-specific icon-row extras."""
@@ -1984,33 +2168,38 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         """Position the cursor-anchored icons (extend-X / extend-Z / split) on the wall
         axis at the cursor's projected X, each at the Z its action would land at.
 
+        Visible whenever the wall is parametrically editable, regardless of
+        ``props.is_editing``. The backing operators are one-shot IFC mutations
+        that go straight through ``ifcopenshell.api`` — there's no draft state
+        to require an explicit edit mode, and exposing them at all times lets
+        the user click-to-act without first entering edit mode.
+
         When two icons want the same Z (within ``CURSOR_STACK_OFFSET``), bump the
         lower-priority one upward so both stay clickable. Priority low → high:
         extend-X, extend-Z, split. Bumps cascade — bumping extend-Z up can in turn
         collide with split, so extend-Z gets bumped further to clear it."""
         if not hasattr(self, "split_gizmo"):
             return
-        gizmo_prefs = self.get_gizmo_prefs()
         all_gizmos = (self.extend_x_gizmo, self.extend_z_gizmo, self.split_gizmo)
-        if not props.is_editing:
-            for gz in all_gizmos:
-                gz.hide = True
-            return
         cursor_world = context.scene.cursor.location
         cursor_local = mw.inverted() @ cursor_world
         in_range = props.anchor_x < cursor_local.x < props.anchor_x + props.length
         billboard_rot = self._frame_billboard_rot
+        top_down = tool.Blender.is_view_top_down(context)
 
         # Candidates ordered by priority (lowest first). Each is (gizmo, local_z).
         # The local X and Y are common: at the cursor's projected X on the axis.
-        # Only "active" gizmos (enabled + applicable) participate in placement.
-        candidates: list[tuple[bpy.types.Gizmo, float]] = []
-        if gizmo_prefs.extend:
-            candidates.append((self.extend_x_gizmo, 0.0))
-        if gizmo_prefs.extend_height:
+        # extend-Z is skipped in plan view — a vertical-intent gizmo has no
+        # readable cue when the camera is looking along world Z, and clicking
+        # one would mutate the wall in a direction the user can't see change.
+        candidates: list[tuple[bpy.types.Gizmo, float]] = [(self.extend_x_gizmo, 0.0)]
+        if not top_down:
             candidates.append((self.extend_z_gizmo, cursor_local.z))
-        if in_range and gizmo_prefs.scissors:
-            candidates.append((self.split_gizmo, props.height))
+        if in_range:
+            # props.height is the vertical (world-Z) height; convert to wall-local Z so
+            # the icon lands on the slanted top edge for sloped walls (x_angle != 0).
+            split_local_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle)
+            candidates.append((self.split_gizmo, split_local_z))
 
         # Resolve collisions: walk in priority order and ensure each gizmo's
         # final Z is at least CURSOR_STACK_OFFSET above the previous one (when
@@ -2026,19 +2215,38 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
 
         for gz in all_gizmos:
             gz.hide = True
-        for gz, local_z in resolved:
-            gz.hide = self.is_gizmo_hidden_by_modal(gz)
-            world_pos = mw @ Vector((cursor_local.x, 0.0, local_z))
-            gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+        # In plan / top-down views every world-Z slot projects to the same
+        # on-screen point — the remaining cursor gizmos would sit on top of
+        # each other at the projected cursor X. Swap world-Z stacking for
+        # screen-up stacking so each icon stays individually clickable;
+        # preserve the resolved priority order so the visual order matches 3D.
+        if top_down:
+            screen_up = tool.Blender.get_screen_up_world(context)
+            base_world = mw @ Vector((cursor_local.x, 0.0, 0.0))
+            for index, (gz, _local_z) in enumerate(resolved):
+                gz.hide = self.is_gizmo_hidden_by_modal(gz)
+                world_pos = base_world + screen_up * (index * self.CURSOR_STACK_OFFSET)
+                gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+        else:
+            for gz, local_z in resolved:
+                gz.hide = self.is_gizmo_hidden_by_modal(gz)
+                world_pos = mw @ Vector((cursor_local.x, 0.0, local_z))
+                gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
 
     def _update_icon_row_extras(self, context: bpy.types.Context, mw: Matrix, props: "BIMWallProperties") -> None:
         """Position the wall-specific icons in the icon row.
 
-        Edit-mode icons (visible only when ``props.is_editing``):
+        Edit-mode-only icons (visible only when ``props.is_editing``):
 
         - Three baseline icons (Exterior / Centreline / Interior) share the cycle
           slot — only the one matching ``props.desired_offset_baseline`` shows.
-        - Rotate-90 icon at ``ICON_ROTATE_X``.
+          State-bearing: the visible icon tells the user the current baseline.
+
+        Always-visible icons (whenever the wall is parametrically editable):
+
+        - Rotate-90 icon at ``ICON_ROTATE_X``. One-shot IFC mutation, no draft
+          state required, so it joins the click-to-act set alongside the
+          cursor-anchored extend / split gizmos.
 
         Non-edit-mode icons (visible alongside the pen icon, hidden during edit):
 
@@ -2051,40 +2259,37 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         toggle for opening-visibility) that the helper does not model."""
         if not hasattr(self, "rotate_gizmo"):
             return
-        gizmo_prefs = self.get_gizmo_prefs()
-        icon_z = self.get_element_height(props) + self.ICON_Z_OFFSET
+        # props.height is the vertical (world-Z) height; convert to wall-local Z so
+        # the icon row sits above the slanted top edge for sloped walls (x_angle != 0).
+        icon_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle) + self.ICON_Z_OFFSET
         icon_y = self.get_icon_y_offset(context, mw)
         billboard_rot = self._frame_billboard_rot
 
-        # --- Edit-mode icons (baseline indicator + rotate-90) ---
+        # --- Edit-mode-only icons (baseline indicator) ---
         if props.is_editing:
             # Stateful baseline indicator at the cycle slot. Show exactly one of the
             # three icons (the one matching the current baseline), hide the others.
             for baseline, attr in self._BASELINE_GIZMO_ATTRS.items():
                 gz = getattr(self, attr)
-                if gizmo_prefs.cycle and baseline == props.desired_offset_baseline:
+                if baseline == props.desired_offset_baseline:
                     gz.hide = self.is_gizmo_hidden_by_modal(gz)
                     world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_CYCLE_X, icon_y, icon_z))
                     gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
                 else:
                     gz.hide = True
-            if gizmo_prefs.rotate:
-                self.rotate_gizmo.hide = self.is_gizmo_hidden_by_modal(self.rotate_gizmo)
-                world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_ROTATE_X, icon_y, icon_z))
-                # VIEW3D_GT_cycle is authored for the base class's 0.30 scale; at 0.5
-                # it looks roughly 2x too big next to the validate / cancel icons.
-                self.rotate_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot, scale=0.30)
-            else:
-                self.rotate_gizmo.hide = True
         else:
             for attr in self._BASELINE_GIZMO_ATTRS.values():
                 getattr(self, attr).hide = True
-            self.rotate_gizmo.hide = True
+
+        # --- Always-visible (when wall is editable): rotate-90 ---
+        self.rotate_gizmo.hide = self.is_gizmo_hidden_by_modal(self.rotate_gizmo)
+        world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_ROTATE_X, icon_y, icon_z))
+        # Smaller scale to match the visual weight of the surrounding validate / cancel icons.
+        self.rotate_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot, scale=self.ROTATE_ICON_SCALE)
 
         # --- Non-edit-mode icons (toggle openings) ---
-        # Sits at the slot the cancel icon occupies during editing — that way the
-        # pen + openings pair is compact and visually grouped.
-        if not props.is_editing and gizmo_prefs.toggle_openings:
+        # Reuse the cancel-icon slot so the pen + openings pair stays compact.
+        if not props.is_editing:
             self.toggle_openings_gizmo.hide = self.is_gizmo_hidden_by_modal(self.toggle_openings_gizmo)
             world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_CANCEL_X, icon_y, icon_z))
             self.toggle_openings_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
@@ -2107,15 +2312,6 @@ def _commit_active_wall_edit_if_any(context: bpy.types.Context) -> bpy.types.Obj
     return obj
 
 
-def _commit_pending_wall_edits_for_selection(context: bpy.types.Context) -> None:  # noqa: ARG001
-    """Thin wall-scoped alias for `tool.Parametric.commit_pending_edits_for_selection`.
-
-    Kept as a named helper because every multi-wall operator (split / join / merge /
-    unjoin / extend-to-wall …) calls it at the top of ``_execute``; centralising the
-    ``names=("wall",)`` filter here means the registry name is touched in one place."""
-    tool.Parametric.commit_pending_edits_for_selection(names=("wall",))
-
-
 class SplitWallAtCursor(bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.split_wall_at_cursor"
     bl_label = "Split Wall at Cursor"
@@ -2132,9 +2328,11 @@ class SplitWallAtCursor(bpy.types.Operator, tool.Ifc.Operator):
     def _execute(self, context: bpy.types.Context) -> set[str]:
         # Applies any pending wall edit first so the split operates on the committed
         # geometry rather than the draft preview box.
-        if _commit_active_wall_edit_if_any(context) is None:
+        obj = _commit_active_wall_edit_if_any(context)
+        if obj is None:
             return {"CANCELLED"}
         bpy.ops.bim.split_wall()
+        _maybe_resync_wall_props_from_ifc(obj)
         return {"FINISHED"}
 
 
@@ -2162,6 +2360,7 @@ class ExtendWallToCursor(bpy.types.Operator, tool.Ifc.Operator):
             tool.Model,
             context.scene.cursor.location,
         )
+        _resync_walls_after_mutation(tool.Blender.get_selected_objects())
         return {"FINISHED"}
 
 
@@ -2193,14 +2392,19 @@ class ExtendWallHeightToCursor(bpy.types.Operator, tool.Ifc.Operator):
             return {"CANCELLED"}
         with bpy.context.temp_override(active_object=obj, selected_objects=[obj]):
             bpy.ops.bim.change_extrusion_depth(depth=new_height)
+        _maybe_resync_wall_props_from_ifc(obj)
         return {"FINISHED"}
 
 
 class RotateWall90(bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.rotate_wall_90"
     bl_label = "Rotate Wall 90°"
-    bl_description = "Rotate wall 90° around Z axis"
+    bl_description = (
+        "Rotate wall 90° counter-clockwise around Z axis. Shift+click rotates clockwise. Ctrl+click rotates 180°"
+    )
     bl_options = {"REGISTER", "UNDO"}
+
+    angle: bpy.props.FloatProperty(default=pi / 2, options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -2209,12 +2413,22 @@ class RotateWall90(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        if event.ctrl:
+            self.angle = pi
+        elif event.shift:
+            self.angle = -pi / 2
+        else:
+            self.angle = pi / 2
+        return self.execute(context)
+
     def _execute(self, context: bpy.types.Context) -> set[str]:
         obj = _commit_active_wall_edit_if_any(context)
         if obj is None:
             return {"CANCELLED"}
         with bpy.context.temp_override(active_object=obj, selected_objects=[obj]):
-            bpy.ops.bim.rotate_90(axis="Z")
+            bpy.ops.bim.rotate_90(axis="Z", angle=self.angle)
+        _maybe_resync_wall_props_from_ifc(obj)
         return {"FINISHED"}
 
 
@@ -2241,83 +2455,74 @@ class ToggleWallOpenings(bpy.types.Operator, tool.Ifc.Operator):
         return {"FINISHED"}
 
 
-def _read_wall_geometry(obj: bpy.types.Object) -> dict | None:
-    """Live-read wall geometry from IFC. Returns ``None`` if the wall is not a LAYER2 extruded wall."""
-    element = tool.Ifc.get_entity(obj)
-    if not element or not tool.Blender.Modifier.is_wall(element):
-        return None
-    representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
-    if not representation:
-        return None
-    extrusion = tool.Model.get_extrusion(representation)
-    if not extrusion:
-        return None
-    unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
-    p1, p2 = ifcopenshell.util.representation.get_reference_line(element)
-    layer_params = tool.Model.get_material_layer_parameters(element)
-    x_angle = tool.Model.get_existing_x_angle(extrusion)
-    return {
-        "anchor_x": p1[0] * unit_scale,
-        "length": (p2[0] - p1[0]) * unit_scale,
-        "height": core.vertical_height_from_extrusion_depth(extrusion.Depth * unit_scale, x_angle),
-        "x_angle": x_angle,
-        "thickness": layer_params["thickness"],
-        "offset": layer_params["offset"],
-    }
-
-
 def _wall_axis_world_segment_from_geom(obj: bpy.types.Object, geom: dict) -> tuple[Vector, Vector]:
     """Compose the world-space axis segment from an already-read ``geom`` dict.
     Used by the billboarding gizmo groups so a single cached IFC read drives both
-    ``_read_wall_geometry`` *and* the segment, avoiding two reads per wall per frame."""
+    ``tool.Wall.read_geometry`` *and* the segment, avoiding two reads per wall per frame."""
     p1_local = Vector((geom["anchor_x"], 0.0, 0.0))
     p2_local = Vector((geom["anchor_x"] + geom["length"], 0.0, 0.0))
     return obj.matrix_world @ p1_local, obj.matrix_world @ p2_local
 
 
-class _WallGeomCachedBillboardingMixin(gizmo.BillboardingGizmoGroupMixin):
+class _IconColors(NamedTuple):
+    """Per-frame icon colour palette extracted from addon prefs once and
+    passed through to every ``setup_icon_gizmo`` call. Named fields keep
+    call-sites self-documenting (``colors.default`` vs ``colors[0]``)."""
+
+    default: tuple[float, float, float]
+    highlight: tuple[float, float, float]
+    warning: tuple[float, float, float]
+
+
+class WallGeomCachedBillboardingMixin(gizmo.BillboardingGizmoGroupMixin):
     """Adds IFC-read caching to `BillboardingGizmoGroupMixin` for wall-driven
     gizmo groups. ``refresh()`` is Blender's "something state-relevant changed"
     signal — that's when we drop the cache. ``draw_prepare()`` (every redraw) reuses
-    whatever ``_get_wall_geom_cached`` populated, so plain camera orbits don't re-hit
-    IFC. ``_get_wall_geom_cached`` also drops entries on its own when
+    whatever ``get_wall_geom_cached`` populated, so plain camera orbits don't re-hit
+    IFC. ``get_wall_geom_cached`` also drops entries on its own when
     `tool.Parametric.get_geom_generation` advances (any ``tool.Ifc.Operator``
     commit) so external ``bpy.ops`` mutations on the same selection don't leave
     stale geometry behind."""
 
     def refresh(self, context: bpy.types.Context) -> None:
-        self._wall_geom_cache = None
+        if cache := getattr(self, "_wall_geom_cache", None):
+            cache.clear()
         self.position_gizmos(context)
 
+    @classmethod
+    def _icon_colors(cls) -> _IconColors:
+        """Centralises the addon-prefs read every wall gizmo group's
+        ``setup()`` does. One prefs lookup, three named fields out."""
+        prefs = tool.Blender.get_addon_preferences()
+        return _IconColors(
+            default=prefs.decorations_colour[:3],
+            highlight=prefs.decorator_color_selected[:3],
+            warning=gizmo.get_warning_color_from_prefs(prefs),
+        )
 
-def _get_wall_geom_cached(group: "bpy.types.GizmoGroup", obj: bpy.types.Object) -> dict | None:
-    """Per-gizmo-group memoised ``_read_wall_geometry``. Without this, a
+
+def get_wall_geom_cached(group: "bpy.types.GizmoGroup", obj: bpy.types.Object) -> dict | None:
+    """Per-gizmo-group memoised ``tool.Wall.read_geometry``. Without this, a
     billboarding gizmo group re-runs the IFC read on every camera orbit frame —
     ~120 IFC queries per second per wall, which is unwieldy on dense models.
 
     Two invalidation paths:
 
     - ``GizmoGroup.refresh()`` (Blender's state-change hook — selection,
-      gizmo modal exit, …) clears ``_wall_geom_cache`` directly.
-    - ``tool.Parametric.refresh_post_commit()`` bumps a generation counter on
-      every IFC operator commit; the cache stores the generation it was filled
-      at and drops on mismatch. This catches ``bpy.ops.bim.*`` mutations that
-      edit the wall while the same selection is held (the case Blender's
-      ``refresh()`` doesn't fire on)."""
-    current_gen = tool.Parametric.get_geom_generation()
-    cache_gen = getattr(group, "_wall_geom_cache_gen", None)
+      gizmo modal exit, …) drops ``_wall_geom_cache`` directly.
+    - The shared `tool.Parametric.GenerationKeyedCache` drops its entries when
+      the parametric generation counter bumps (every ``tool.Ifc.Operator``
+      commit), catching ``bpy.ops.bim.*`` mutations that edit the wall while
+      the same selection is held (the case Blender's ``refresh()`` doesn't
+      fire on)."""
     cache = getattr(group, "_wall_geom_cache", None)
-    if cache is None or cache_gen != current_gen:
-        cache = {}
+    if cache is None:
+        cache = tool.Parametric.GenerationKeyedCache()
         group._wall_geom_cache = cache
-        group._wall_geom_cache_gen = current_gen
-    key = obj.name
-    if key not in cache:
-        cache[key] = _read_wall_geometry(obj)
-    return cache[key]
+    return cache.get_or_compute(obj.name, lambda: tool.Wall.read_geometry(obj))
 
 
-def _wall_camera_facing_icon_y(context: bpy.types.Context, mw: Matrix, geom: dict) -> float:
+def wall_camera_facing_icon_y(context: bpy.types.Context, mw: Matrix, geom: dict) -> float:
     """Wall-local Y for an icon that should sit just outside the camera-facing face.
     Centralised so the billboarding wall gizmos (add-opening, extend-vertically, …)
     share one source of truth for "where does the icon go on the visible side"."""
@@ -2346,6 +2551,32 @@ def _are_walls_joined(elem_a: ifcopenshell.entity_instance, elem_b: ifcopenshell
     return False
 
 
+def _classify_wall_join_state(
+    elem_a: ifcopenshell.entity_instance,
+    elem_b: ifcopenshell.entity_instance,
+    seg_a: tuple[Vector, Vector],
+    seg_b: tuple[Vector, Vector],
+    parallel_threshold: float,
+    collinear_tolerance: float,
+) -> "tuple[core.WallJoinState, Optional[tuple[float, float, float]]]":
+    """Bim-layer wrapper: pre-compute the IFC-graph join check then forward to
+    the pure :func:`core.classify_wall_join_state` classifier. Single entry
+    point shared by :meth:`GizmoWallJoinIntersection.position_gizmos` and the
+    wall-join preview decorator — neither caller branches on the state
+    machine on its own, so adding a new state requires one edit, not two.
+
+    Returns ``(state, intersection)``: the intersection tuple is non-``None``
+    only on the ``"intersect"`` branch, and callers should destructure both
+    rather than re-call :func:`core.project_axis_intersection` themselves."""
+    return core.classify_wall_join_state(
+        (tuple(seg_a[0]), tuple(seg_a[1])),
+        (tuple(seg_b[0]), tuple(seg_b[1])),
+        are_joined=_are_walls_joined(elem_a, elem_b),
+        parallel_threshold=parallel_threshold,
+        collinear_tolerance=collinear_tolerance,
+    )
+
+
 def _are_walls_collinear(
     seg_a: tuple[Vector, Vector],
     seg_b: tuple[Vector, Vector],
@@ -2360,38 +2591,6 @@ def _are_walls_collinear(
         (tuple(seg_b[0]), tuple(seg_b[1])),
         parallel_threshold,
         line_tolerance,
-    )
-
-
-def _collinear_boundary_world(seg_a: tuple[Vector, Vector], seg_b: tuple[Vector, Vector]) -> Vector:
-    """Vector wrapper around `core.closest_endpoint_midpoint`."""
-    return Vector(
-        core.closest_endpoint_midpoint(
-            (tuple(seg_a[0]), tuple(seg_a[1])),
-            (tuple(seg_b[0]), tuple(seg_b[1])),
-        )
-    )
-
-
-def _path_connection_location_world(
-    seg_self: tuple[Vector, Vector],
-    self_conn_type: str,
-    seg_other: tuple[Vector, Vector],
-    other_conn_type: str,
-    parallel_threshold: float = 0.9994,
-) -> Vector:
-    """Vector wrapper around `core.compute_path_connection_location`. Used by the
-    single-wall unjoin gizmo group to place one icon per ``IfcRelConnectsPathElements``
-    at its physical join point (an endpoint of the end-connected wall, or the
-    axis intersection for an ATPATH/ATPATH cross junction)."""
-    return Vector(
-        core.compute_path_connection_location(
-            (tuple(seg_self[0]), tuple(seg_self[1])),
-            self_conn_type,
-            (tuple(seg_other[0]), tuple(seg_other[1])),
-            other_conn_type,
-            parallel_threshold,
-        )
     )
 
 
@@ -2427,75 +2626,7 @@ def _iter_path_connections(
     return out
 
 
-class GizmoWallAddOpening(bpy.types.GizmoGroup, _WallGeomCachedBillboardingMixin):
-    """Activates when a wall (active) and one non-wall blender object are co-selected.
-
-    Renders a single icon above the wall at the wall-local X corresponding to the other
-    object's projected origin. Clicking dispatches `bim.add_opening`, which lets the
-    existing FilledOpeningGenerator decide how the opening is applied.
-
-    Per-frame positioning via `BillboardingGizmoGroupMixin` ensures the icon
-    keeps facing the camera as the viewport is orbited."""
-
-    bl_idname = "OBJECT_GGT_bim_wall_add_opening"
-    bl_label = "Wall Add Opening Gizmo"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "WINDOW"
-    bl_options = {"3D", "PERSISTENT"}
-
-    @classmethod
-    def poll(cls, context: bpy.types.Context) -> bool:
-        prefs = tool.Blender.get_addon_preferences()
-        if not prefs.gizmos.draw_gizmos_in_3d_viewport:
-            return False
-        selected = tool.Blender.get_selected_objects()
-        if len(selected) != 2:
-            return False
-        active = context.active_object
-        if active is None or active not in selected:
-            return False
-        element = tool.Ifc.get_entity(active)
-        if not element or not tool.Blender.Modifier.is_wall(element):
-            return False
-        other = next(o for o in selected if o is not active)
-        # If the other object is also a wall, the wall-join gizmo handles it instead.
-        other_element = tool.Ifc.get_entity(other)
-        if other_element and tool.Blender.Modifier.is_wall(other_element):
-            return False
-        return True
-
-    def setup(self, context: bpy.types.Context) -> None:
-        prefs = tool.Blender.get_addon_preferences()
-        default_color = prefs.decorations_colour[:3]
-        highlight_color = prefs.decorator_color_selected[:3]
-        self.add_opening_icon = self.setup_icon_gizmo(
-            "VIEW3D_GT_add_opening", default_color, highlight_color, "bim.add_opening"
-        )
-
-    def position_gizmos(self, context: bpy.types.Context) -> None:
-        wall_obj = context.active_object
-        if not wall_obj:
-            return
-        selected = tool.Blender.get_selected_objects()
-        other = next((o for o in selected if o is not wall_obj), None)
-        if not other:
-            return
-        geom = _get_wall_geom_cached(self, wall_obj)
-        if not geom:
-            return
-        mw = wall_obj.matrix_world
-        wall_local = mw.inverted() @ other.matrix_world.translation
-        local_x = max(geom["anchor_x"], min(wall_local.x, geom["anchor_x"] + geom["length"]))
-        # Place the icon on the camera-facing side of the wall, like the pen icon
-        # does for parametric edits — orbit the camera past the wall and the icon
-        # jumps to the visible face instead of being stranded behind it.
-        icon_y = _wall_camera_facing_icon_y(context, mw, geom)
-        icon_z = geom["height"] + gizmo.BaseParametricGizmoGroup.ICON_Z_OFFSET
-        world_pos = mw @ Vector((local_x, icon_y, icon_z))
-        self.add_opening_icon.matrix_basis = gizmo.billboarded_at(world_pos, gizmo.get_billboard_rotation(context))
-
-
-class GizmoWallExtendVertically(bpy.types.GizmoGroup, _WallGeomCachedBillboardingMixin):
+class GizmoWallExtendVertically(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin):
     """Activates when a LAYER3 element (typically a slab) is active and a LAYER2
     wall is co-selected. Mirrors the N-panel ``Extend To Underside`` button (which
     shows under the same active-LAYER3 + LAYER2-in-selection rule). Clicking
@@ -2514,8 +2645,12 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        prefs = tool.Blender.get_addon_preferences()
-        if not prefs.gizmos.draw_gizmos_in_3d_viewport:
+        if not tool.Blender.are_viewport_gizmos_enabled():
+            return False
+        # Plan / top-down view has no meaningful "vertical" — the elevation cue
+        # that motivates the gizmo (icon at the target slab's Z) collapses to
+        # zero on-screen. Hide the gizmo entirely; the N-panel button remains.
+        if tool.Blender.is_view_top_down(context):
             return False
         selected = tool.Blender.get_selected_objects()
         if len(selected) != 2:
@@ -2533,13 +2668,11 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         return True
 
     def setup(self, context: bpy.types.Context) -> None:
-        prefs = tool.Blender.get_addon_preferences()
-        default_color = prefs.decorations_colour[:3]
-        highlight_color = prefs.decorator_color_selected[:3]
+        colors = self._icon_colors()
         self.extend_vertical_icon = self.setup_icon_gizmo(
             "VIEW3D_GT_extend_vertical",
-            default_color,
-            highlight_color,
+            colors.default,
+            colors.highlight,
             "bim.extend_walls_to_underside",
         )
 
@@ -2550,11 +2683,11 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         wall_obj = next((o for o in tool.Blender.get_selected_objects() if o is not active), None)
         if wall_obj is None:
             return
-        geom = _get_wall_geom_cached(self, wall_obj)
+        geom = get_wall_geom_cached(self, wall_obj)
         if not geom:
             return
         mw = wall_obj.matrix_world
-        icon_y = _wall_camera_facing_icon_y(context, mw, geom)
+        icon_y = wall_camera_facing_icon_y(context, mw, geom)
         # X = 0 in wall-local, Y on the camera-facing outer side, world Z lifted to
         # the active object's elevation — the height the wall is about to reach.
         world_pos = mw @ Vector((0.0, icon_y, 0.0))
@@ -2562,7 +2695,7 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         self.extend_vertical_icon.matrix_basis = gizmo.billboarded_at(world_pos, gizmo.get_billboard_rotation(context))
 
 
-class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardingMixin):
+class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin):
     """Activates when exactly two LAYER2 walls are selected. Dispatches between four
     state-specific icons based on the geometric + IFC relationship of the walls:
 
@@ -2572,11 +2705,14 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
     - **Collinear** (axes on the same infinite line, not joined):
       ``merge_icon`` (``VIEW3D_GT_merge``, inward arrows) at the midpoint of the
       closest endpoint pair. Clicking dispatches ``bim.merge_wall``.
-    - **Joinable corner** (non-parallel, axes meet near endpoints, not joined):
+    - **Joinable corner** (non-parallel, non-collinear, not joined):
       ``join_icon`` (``VIEW3D_GT_merge``) at the projected intersection on the
       floor, PLUS ``extend_to_wall_icon`` (``VIEW3D_GT_extend``) at the
       intersection at the active wall's Z=height. The Z difference disambiguates
-      "join the corner" vs "extend this wall into the other."
+      "join the corner" vs "extend this wall into the other." The intersection
+      may sit far from either wall's endpoints — selecting two distant walls is
+      itself the user's request to bridge them, and the gizmos appear wherever
+      the axes meet so the user can act on or dismiss the operation.
     - **None of the above**: all icons hidden.
 
     Per-frame positioning via `BillboardingGizmoGroupMixin` ensures the icons
@@ -2591,19 +2727,19 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
     # Hide the gizmo when walls are nearly parallel (intersection would be unreasonably far).
     # cos(2°) ≈ 0.9994 → walls within ~2° of parallel are treated as parallel for this purpose.
     PARALLEL_DOT_THRESHOLD = 0.9994
-    # The intersection must be within this many *wall-lengths* of the NEAREST endpoint
-    # of each wall. This filters out the case where two walls are offset from world
-    # origin and their extrapolated axes happen to cross at a point that isn't near
-    # either wall's actual endpoints (which previously caused the icon to land at
-    # world origin for walls whose axes coincidentally converged there).
-    MAX_DISTANCE_TO_ENDPOINT_FACTOR = 0.75
     # Perpendicular tolerance (m) for treating two parallel wall axes as collinear.
     COLLINEAR_LINE_TOLERANCE = 0.05
 
+    # Per-region weakref map (see GizmoWallEdition for the rationale). The
+    # wall-join preview decorator dereferences this each draw to read live
+    # ``is_highlight`` state off the join / extend-to-wall icons in the same
+    # region it's currently drawing in, so the preview lines can switch to
+    # ``decorator_color_selected`` while the user hovers a target.
+    _active_instances: "dict[int, weakref.ReferenceType[GizmoWallJoinIntersection]]" = {}
+
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        prefs = tool.Blender.get_addon_preferences()
-        if not prefs.gizmos.draw_gizmos_in_3d_viewport:
+        if not tool.Blender.are_viewport_gizmos_enabled():
             return False
         selected = tool.Blender.get_selected_objects()
         if len(selected) != 2:
@@ -2615,17 +2751,17 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         return True
 
     def setup(self, context: bpy.types.Context) -> None:
-        prefs = tool.Blender.get_addon_preferences()
-        default_color = prefs.decorations_colour[:3]
-        highlight_color = prefs.decorator_color_selected[:3]
-        self.unjoin_icon = self.setup_icon_gizmo("VIEW3D_GT_split", default_color, highlight_color, "bim.unjoin_walls")
-        self.merge_icon = self.setup_icon_gizmo("VIEW3D_GT_merge", default_color, highlight_color, "bim.merge_wall")
+        colors = self._icon_colors()
+        self.unjoin_icon = self.setup_icon_gizmo("VIEW3D_GT_split", colors.default, colors.warning, "bim.unjoin_walls")
+        self.merge_icon = self.setup_icon_gizmo("VIEW3D_GT_merge", colors.default, colors.highlight, "bim.merge_wall")
         self.join_icon = self.setup_icon_gizmo(
-            "VIEW3D_GT_merge", default_color, highlight_color, "bim.join_walls_intersection"
+            "VIEW3D_GT_merge", colors.default, colors.highlight, "bim.join_walls_intersection"
         )
         self.extend_to_wall_icon = self.setup_icon_gizmo(
-            "VIEW3D_GT_extend", default_color, highlight_color, "bim.extend_walls_to_wall"
+            "VIEW3D_GT_extend", colors.default, colors.highlight, "bim.extend_walls_to_wall"
         )
+        if context.region is not None:
+            type(self)._active_instances[context.region.as_pointer()] = weakref.ref(self)
 
     def _all_icons(self) -> tuple[bpy.types.Gizmo, ...]:
         return (self.unjoin_icon, self.merge_icon, self.join_icon, self.extend_to_wall_icon)
@@ -2641,20 +2777,23 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
             return
         elem_a = tool.Ifc.get_entity(selected[0])
         elem_b = tool.Ifc.get_entity(selected[1])
-        geom_a = _get_wall_geom_cached(self, selected[0])
-        geom_b = _get_wall_geom_cached(self, selected[1])
+        geom_a = get_wall_geom_cached(self, selected[0])
+        geom_b = get_wall_geom_cached(self, selected[1])
         if elem_a is None or elem_b is None or geom_a is None or geom_b is None:
             self._hide_all()
             return
         seg_a = _wall_axis_world_segment_from_geom(selected[0], geom_a)
         seg_b = _wall_axis_world_segment_from_geom(selected[1], geom_b)
         billboard_rot = gizmo.get_billboard_rotation(context)
+        state, intersection_tuple = _classify_wall_join_state(
+            elem_a, elem_b, seg_a, seg_b, self.PARALLEL_DOT_THRESHOLD, self.COLLINEAR_LINE_TOLERANCE
+        )
 
         # State 1: walls are already joined → show Unjoin only, at the shared
         # corner's floor Z (no visibility lift — user expects the icon to sit
         # exactly at the corner, not floating above it).
-        if _are_walls_joined(elem_a, elem_b):
-            corner = _collinear_boundary_world(seg_a, seg_b)
+        if state == "joined":
+            corner = tool.Wall.collinear_boundary_world(seg_a, seg_b)
             self.unjoin_icon.matrix_basis = gizmo.billboarded_at(corner, billboard_rot)
             self.unjoin_icon.hide = False
             self.merge_icon.hide = True
@@ -2664,8 +2803,8 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
 
         # State 2: walls are collinear (parallel axes on the same line) → show Merge
         # at the boundary midpoint between them, at floor Z (no visibility lift).
-        if _are_walls_collinear(seg_a, seg_b, self.PARALLEL_DOT_THRESHOLD, self.COLLINEAR_LINE_TOLERANCE):
-            boundary = _collinear_boundary_world(seg_a, seg_b)
+        if state == "collinear":
+            boundary = tool.Wall.collinear_boundary_world(seg_a, seg_b)
             self.merge_icon.matrix_basis = gizmo.billboarded_at(boundary, billboard_rot)
             self.merge_icon.hide = False
             self.unjoin_icon.hide = True
@@ -2673,27 +2812,18 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
             self.extend_to_wall_icon.hide = True
             return
 
-        # State 3: non-parallel walls whose axes meet near each wall's endpoint
-        # → show Join at the floor + Extend-to-Wall at the active wall's top.
-        intersection_tuple = core.project_axis_intersection(
-            (tuple(seg_a[0]), tuple(seg_a[1])),
-            (tuple(seg_b[0]), tuple(seg_b[1])),
-            self.PARALLEL_DOT_THRESHOLD,
-        )
-        if intersection_tuple is None:
+        if state == "none":
+            # Parallel-but-not-collinear axes have no meaningful intersection.
             self._hide_all()
             return
+
+        # State 3 (state == "intersect"): non-parallel walls → show Join at the
+        # floor + Extend-to-Wall at the active wall's top, anchored at the
+        # projected axis intersection returned by the classifier. The classifier
+        # guarantees ``intersection_tuple is not None`` for this state by its
+        # return contract, so no redundant ``project_axis_intersection`` call.
+        assert intersection_tuple is not None  # tightened by the "intersect" branch
         intersection = Vector(intersection_tuple)
-        len_a = (seg_a[1] - seg_a[0]).length
-        len_b = (seg_b[1] - seg_b[0]).length
-        near_a = min((intersection - seg_a[0]).length, (intersection - seg_a[1]).length)
-        near_b = min((intersection - seg_b[0]).length, (intersection - seg_b[1]).length)
-        if (
-            near_a > len_a * self.MAX_DISTANCE_TO_ENDPOINT_FACTOR
-            or near_b > len_b * self.MAX_DISTANCE_TO_ENDPOINT_FACTOR
-        ):
-            self._hide_all()
-            return
 
         # Join sits on the floor (lowest endpoint Z across both wall axes), exactly
         # where the corner meets the ground — no visibility lift.
@@ -2705,12 +2835,13 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         # Extend-to-Wall sits at the active wall's top, same XY as the join icon —
         # the Z gap is what differentiates "join at corner" from "extend into other".
         active = context.active_object if context.active_object in selected else None
-        geom = _read_wall_geometry(active) if active else None
+        geom = tool.Wall.read_geometry(active) if active else None
         if geom is None:
             self.extend_to_wall_icon.hide = True
         else:
             active_top_z = active.matrix_world.translation.z + geom["height"]
-            extend_world = Vector((intersection.x, intersection.y, active_top_z))
+            top_world = Vector((intersection.x, intersection.y, active_top_z))
+            extend_world = gizmo.BaseParametricGizmoGroup.pick_visible_anchor(context, join_world, top_world)
             self.extend_to_wall_icon.matrix_basis = gizmo.billboarded_at(extend_world, billboard_rot)
             self.extend_to_wall_icon.hide = False
 
@@ -2718,7 +2849,120 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, _WallGeomCachedBillboardin
         self.merge_icon.hide = True
 
 
-class JoinWallsIntersection(bpy.types.Operator, tool.Ifc.Operator):
+class GizmoWallUnjoinSingle(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin):
+    """Activates when exactly one LAYER2 wall is selected. Surfaces an unjoin icon at
+    every join location inferred from the wall's ``IfcRelConnectsPathElements`` inverse
+    graph — the single-selection mirror of `GizmoWallJoinIntersection`'s two-wall
+    unjoin state. A wall may participate in many such rels (up to 1 ATSTART + 1 ATEND
+    by end, plus unlimited ATPATH T-junctions), so a pool of icons is preallocated and
+    hidden on a per-frame basis based on the live connection set.
+
+    Each visible icon dispatches `bim.unjoin_wall_path_connection` with the partner
+    wall's object name set on the bound operator properties, so a click removes only
+    the single rel under that icon — the other connections on the same wall survive.
+
+    Mutually exclusive with `GizmoWallJoinIntersection` via `poll()` (that group
+    requires len(selected) == 2; this one requires 1)."""
+
+    bl_idname = "OBJECT_GGT_bim_wall_unjoin_single"
+    bl_label = "Wall Unjoin (single selection) Gizmo"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_options = {"3D", "PERSISTENT"}
+
+    # Preallocated pool size. ATSTART + ATEND + ATPATH connections are rarely more
+    # than a handful on real models; 16 is generous enough that excess is exceptional.
+    # Excess connections beyond this drop a one-time warning to the Blender console
+    # (the wall's remaining joins are still visible and clickable). The cap is
+    # bounded by design so ``setup()`` allocates a deterministic number of gizmos.
+    POOL_SIZE = 16
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        if not tool.Blender.are_viewport_gizmos_enabled():
+            return False
+        selected = tool.Blender.get_selected_objects()
+        if len(selected) != 1:
+            return False
+        # `get_selected_objects` returns a set — use iter() rather than indexing,
+        # which raises TypeError on a set and would silently disable the gizmo group.
+        element = tool.Ifc.get_entity(next(iter(selected)))
+        # `Modifier.is_wall` already requires LAYER2 usage, so no separate check needed.
+        if not element or not tool.Blender.Modifier.is_wall(element):
+            return False
+        return True
+
+    def setup(self, context: bpy.types.Context) -> None:
+        colors = self._icon_colors()
+        # Bind the operator on each pool icon ONCE at setup time and keep the
+        # returned ``OperatorProperties`` handles. ``target_set_operator`` allocates
+        # a fresh handle on every call, so calling it from ``position_gizmos`` (which
+        # fires every redraw frame via ``draw_prepare``) would discard and re-allocate
+        # ~60Hz per visible icon. Stashing the handles lets the per-frame work be a
+        # plain property write on a long-lived object.
+        self.unjoin_icons = []
+        self.unjoin_op_props = []
+        for _ in range(self.POOL_SIZE):
+            icon = self.setup_icon_gizmo(
+                "VIEW3D_GT_split", colors.default, colors.warning, "bim.unjoin_wall_path_connection"
+            )
+            icon.hide = True
+            self.unjoin_icons.append(icon)
+            self.unjoin_op_props.append(icon.target_set_operator("bim.unjoin_wall_path_connection"))
+
+    def position_gizmos(self, context: bpy.types.Context) -> None:
+        # Default: hide every pool slot. The visible-set is rebuilt from the live
+        # connection list each frame so disconnects/reconnects elsewhere in the
+        # session don't leave ghost icons behind.
+        for icon in self.unjoin_icons:
+            icon.hide = True
+
+        selected = list(tool.Blender.get_selected_objects())
+        if len(selected) != 1:
+            return
+        wall_obj = selected[0]
+        elem = tool.Ifc.get_entity(wall_obj)
+        geom = get_wall_geom_cached(self, wall_obj)
+        if elem is None or geom is None:
+            return
+        seg_self = _wall_axis_world_segment_from_geom(wall_obj, geom)
+        billboard_rot = gizmo.get_billboard_rotation(context)
+
+        connections = _iter_path_connections(elem)
+        # Surface a one-shot console warning the first frame the cap is hit for
+        # this gizmo-group instance. Console output is the established Bonsai
+        # channel for "the addon clamped something silently" feedback — Blender
+        # has no first-class toast for gizmo-side warnings.
+        if len(connections) > self.POOL_SIZE and not getattr(self, "_pool_cap_warned", False):
+            print(
+                f"[bonsai] GizmoWallUnjoinSingle: wall has {len(connections)} path connections; "
+                f"only the first {self.POOL_SIZE} unjoin gizmos are shown."
+            )
+            self._pool_cap_warned = True
+
+        for slot_idx, (other_elem, self_ct, other_ct) in enumerate(connections):
+            if slot_idx >= self.POOL_SIZE:
+                break
+            other_obj = tool.Ifc.get_object(other_elem)
+            if other_obj is None:
+                continue
+            other_geom = get_wall_geom_cached(self, other_obj)
+            if other_geom is None:
+                continue
+            seg_other = _wall_axis_world_segment_from_geom(other_obj, other_geom)
+            location = tool.Wall.path_connection_location_world(seg_self, self_ct, seg_other, other_ct)
+            icon = self.unjoin_icons[slot_idx]
+            icon.matrix_basis = gizmo.billboarded_at(location, billboard_rot)
+            icon.hide = False
+            # Only the partner-GlobalId property is rewritten per frame; the operator
+            # binding itself is the long-lived handle set up at ``setup()`` time.
+            # GlobalId (not Blender object name) keeps the binding stable across
+            # renames, file save/reload, and any sit-in-the-undo-stack interlude
+            # between dispatch and execute.
+            self.unjoin_op_props[slot_idx].other_wall_guid = other_elem.GlobalId
+
+
+class JoinWallsIntersection(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):
     bl_idname = "bim.join_walls_intersection"
     bl_label = "Join Walls at Corner"
     bl_description = "Join two walls at their corner"
@@ -2731,8 +2975,7 @@ class JoinWallsIntersection(bpy.types.Operator, tool.Ifc.Operator):
             return False
         return True
 
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        _commit_pending_wall_edits_for_selection(context)
+    def _perform(self, context: bpy.types.Context) -> set[str]:
         try:
             core.join_walls_LV(tool.Ifc, tool.Blender, tool.Geometry, DumbWallJoiner(), tool.Model)
         except core.RequireTwoWallsError as e:

@@ -41,9 +41,17 @@ pytestmark = pytest.mark.wall
 
 
 @pytest.fixture(autouse=True)
-def _require_real_bpy():
-    if not isinstance(bpy, types.ModuleType) or hasattr(bpy, "_mock_name"):
-        pytest.skip("requires real Blender (bpy is mocked or absent)")
+def _restore_geom_generation():
+    """Snap-and-restore the module-level generation counter so an in-test
+    ``+= 1`` (or a ``refresh_post_commit`` call) cannot leak into the next
+    test. Same isolation pattern as ``test_array_selection_decorator_cache``'s
+    ``_reset_cache_token`` — keeps test independence visible at fixture scope
+    instead of relying on collection order."""
+    from bonsai import tool
+
+    before = tool.Parametric._geom_generation
+    yield
+    tool.Parametric._geom_generation = before
 
 
 def test_refresh_post_commit_bumps_generation_and_resyncs_header():
@@ -60,7 +68,7 @@ def test_refresh_post_commit_bumps_generation_and_resyncs_header():
 
 
 def test_geom_generation_invalidates_wall_geom_cache():
-    """Bumping the generation must cause ``_get_wall_geom_cached`` to drop its
+    """Bumping the generation must cause ``get_wall_geom_cached`` to drop its
     stored entries on the next read, even when the same gizmo group instance
     and the same wall object are reused (the case Blender's
     ``GizmoGroup.refresh()`` does not cover)."""
@@ -75,13 +83,13 @@ def test_geom_generation_invalidates_wall_geom_cache():
     sentinel_a = {"length": 1.0, "height": 2.0, "x_angle": 0.0}
     sentinel_b = {"length": 1.5, "height": 2.5, "x_angle": 0.0}
 
-    with patch.object(wall_mod, "_read_wall_geometry", side_effect=[sentinel_a, sentinel_b]):
-        first = wall_mod._get_wall_geom_cached(group, fake_obj)
+    with patch.object(tool.Wall, "read_geometry", side_effect=[sentinel_a, sentinel_b]):
+        first = wall_mod.get_wall_geom_cached(group, fake_obj)
         assert first is sentinel_a
         # Same call without a generation bump must hit the cache (no extra read).
-        assert wall_mod._get_wall_geom_cached(group, fake_obj) is sentinel_a
+        assert wall_mod.get_wall_geom_cached(group, fake_obj) is sentinel_a
         # Simulate an IFC commit: generation advances, cache must drop.
         tool.Parametric._geom_generation += 1
-        second = wall_mod._get_wall_geom_cached(group, fake_obj)
+        second = wall_mod.get_wall_geom_cached(group, fake_obj)
         assert second is sentinel_b
         assert second is not first
