@@ -1258,6 +1258,47 @@ class Blender(bonsai.core.tool.Blender):
             return parent_guid is not None and parent_guid != element.GlobalId
 
         @classmethod
+        def count_implicit_array_children_in_selection(cls, selected_objects: set[bpy.types.Object]) -> int:
+            """Children of selected array parents that aren't themselves in the selection.
+
+            For each array parent in ``selected_objects``, count children across every
+            stacked layer that the user didn't also select. Set dedups across layers
+            so children referenced by multiple layers count once."""
+            implicit_children: set[bpy.types.Object] = set()
+            for obj in selected_objects:
+                element = tool.Ifc.get_entity(obj)
+                if not element or not cls.is_array(element):
+                    continue
+                for child_obj in cls.Array.get_all_children_objects(element):
+                    if child_obj not in selected_objects:
+                        implicit_children.add(child_obj)
+            return len(implicit_children)
+
+        @classmethod
+        def has_blocked_array_child_in_selection(cls, selected_objects: set[bpy.types.Object]) -> bool:
+            """True if any array child in the selection has its parent *outside* the selection.
+
+            Such children get silently skipped by the IFC delete pipeline; a consumer
+            can use this predicate to surface the constraint in a modal popup before
+            the destructive operation runs. Orphan or unresolvable parent GUIDs are
+            tolerated (caught at by_guid)."""
+            for obj in selected_objects:
+                element = tool.Ifc.get_entity(obj)
+                if not element or not cls.is_array_child(element):
+                    continue
+                pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+                if not pset:
+                    continue
+                try:
+                    parent_element = tool.Ifc.get().by_guid(pset["Parent"])
+                except RuntimeError:
+                    continue
+                parent_obj = tool.Ifc.get_object(parent_element)
+                if parent_obj not in selected_objects:
+                    return True
+            return False
+
+        @classmethod
         def is_railing(cls, element: entity_instance) -> bool:
             return tool.Pset.get_element_pset(element, "BBIM_Railing")
 
