@@ -496,6 +496,24 @@ class GizmoPreferencesRailing(bpy.types.PropertyGroup):
         support_spacing: bool
 
 
+class GizmoPreferencesPipeSegment(bpy.types.PropertyGroup):
+    """Property group for pipe-segment gizmo visibility settings."""
+
+    length: BoolProperty(name="Length", default=True)
+
+    if TYPE_CHECKING:
+        length: bool
+
+
+class GizmoPreferencesDuctSegment(bpy.types.PropertyGroup):
+    """Property group for duct-segment gizmo visibility settings."""
+
+    length: BoolProperty(name="Length", default=True)
+
+    if TYPE_CHECKING:
+        length: bool
+
+
 class GizmoPreferences(bpy.types.PropertyGroup):
     """Property group for all gizmo visibility settings."""
 
@@ -510,6 +528,8 @@ class GizmoPreferences(bpy.types.PropertyGroup):
     wall: bpy.props.PointerProperty(type=GizmoPreferencesWall)
     roof: bpy.props.PointerProperty(type=GizmoPreferencesRoof)
     railing: bpy.props.PointerProperty(type=GizmoPreferencesRailing)
+    pipe_segment: bpy.props.PointerProperty(type=GizmoPreferencesPipeSegment)
+    duct_segment: bpy.props.PointerProperty(type=GizmoPreferencesDuctSegment)
 
     if TYPE_CHECKING:
         draw_gizmos_in_3d_viewport: bool
@@ -519,6 +539,8 @@ class GizmoPreferences(bpy.types.PropertyGroup):
         wall: GizmoPreferencesWall
         roof: GizmoPreferencesRoof
         railing: GizmoPreferencesRailing
+        pipe_segment: GizmoPreferencesPipeSegment
+        duct_segment: GizmoPreferencesDuctSegment
 
 
 class DocPreferences(bpy.types.PropertyGroup):

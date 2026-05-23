@@ -171,6 +171,10 @@ classes = (
     prop.ProductPreviewItem,
     prop.BIMModelProperties,
     prop.BIMArrayProperties,
+    prop.BIMBendPreviewProperties,
+    prop.BIMPreviewProperties,
+    prop.BIMDuctSegmentProperties,
+    prop.BIMPipeSegmentProperties,
     prop.BIMStairProperties,
     prop.BIMSverchokProperties,
     prop.BIMWindowProperties,
@@ -256,8 +260,30 @@ classes = (
     roof.RemoveRoof,
     roof.SetGableRoofEdgeAngle,
     mep.MEPAddObstruction,
+    mep.MEPUnjoinAtPort,
+    mep.MEPRemoveTerminalFitting,
+    mep.MEPUnjoinPair,
+    mep.SelectMEPPathMembers,
     mep.MEPAddTransition,
     mep.MEPAddBend,
+    mep.MEPJoinSegments,
+    mep.EnableBendPreview,
+    mep.FinishBendPreview,
+    mep.CancelBendPreview,
+    mep.GizmoBendPreview,
+    mep.GizmoMEPActions,
+    mep.EnableEditingPipeSegment,
+    mep.FinishEditingPipeSegment,
+    mep.CancelEditingPipeSegment,
+    mep.ExtendPipeSegmentToCursor,
+    mep.SplitPipeSegmentAtCursor,
+    mep.GizmoPipeSegmentEdition,
+    mep.EnableEditingDuctSegment,
+    mep.FinishEditingDuctSegment,
+    mep.CancelEditingDuctSegment,
+    mep.ExtendDuctSegmentToCursor,
+    mep.SplitDuctSegmentAtCursor,
+    mep.GizmoDuctSegmentEdition,
     external.ApplyExternalParametricGeometry,
 )
 
@@ -308,6 +334,7 @@ def register():
 
     bpy.types.Scene.BIMModelProperties = bpy.props.PointerProperty(type=prop.BIMModelProperties)
     bpy.types.Scene.BIMPolylineProperties = bpy.props.PointerProperty(type=prop.BIMPolylineProperties)
+    bpy.types.Scene.BIMPreviewProperties = bpy.props.PointerProperty(type=prop.BIMPreviewProperties)
     bpy.types.Object.BIMArrayProperties = bpy.props.PointerProperty(type=prop.BIMArrayProperties)
     bpy.types.Object.BIMSverchokProperties = bpy.props.PointerProperty(type=prop.BIMSverchokProperties)
     # Per-parametric-type ``BIM<Name>Properties`` PointerProperties — driven by
@@ -330,6 +357,7 @@ def unregister():
 
     del bpy.types.Scene.BIMModelProperties
     del bpy.types.Scene.BIMPolylineProperties
+    del bpy.types.Scene.BIMPreviewProperties
     del bpy.types.Object.BIMArrayProperties
     del bpy.types.Object.BIMSverchokProperties
     tool.Parametric.unregister_object_properties()

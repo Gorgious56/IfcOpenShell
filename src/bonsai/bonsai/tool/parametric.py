@@ -277,6 +277,8 @@ class Parametric(bonsai.core.tool.Parametric):
         ParametricObject("railing"),
         ParametricObject("roof"),
         ParametricObject("wall"),
+        ParametricObject("pipe_segment", has_non_editable_path=True),
+        ParametricObject("duct_segment", has_non_editable_path=True),
     ]
 
     _geom_generation: int = 0

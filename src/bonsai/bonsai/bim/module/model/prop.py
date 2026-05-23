@@ -238,6 +238,20 @@ def update_roof(self: "BIMRoofProperties", context: bpy.types.Context) -> None:
         _get_updater("roof", "update_roof_modifier_bmesh")(obj)
 
 
+def update_pipe_segment(self: "BIMPipeSegmentProperties", context: bpy.types.Context) -> None:
+    """Regenerate pipe-segment preview mesh from props during edit. Does NOT touch IFC."""
+    obj = context.active_object
+    if obj and self.is_editing:
+        _get_updater("mep", "regenerate_pipe_segment_mesh_from_props")(obj)
+
+
+def update_duct_segment(self: "BIMDuctSegmentProperties", context: bpy.types.Context) -> None:
+    """Regenerate duct-segment preview mesh from props during edit. Does NOT touch IFC."""
+    obj = context.active_object
+    if obj and self.is_editing:
+        _get_updater("mep", "regenerate_duct_segment_mesh_from_props")(obj)
+
+
 class BIMModelProperties(PropertyGroup):
     ifc_class: bpy.props.EnumProperty(items=get_ifc_class, name="Construction Class", update=update_ifc_class)
     relating_type_id: bpy.props.EnumProperty(
@@ -1769,6 +1783,136 @@ class BIMWallProperties(PropertyGroup):
         snap_offset: float
         snap_x_angle: float
         snap_offset_baseline: str
+
+
+class BIMPipeSegmentProperties(PropertyGroup):
+    """Transient draft state for parametric pipe-segment gizmo editing."""
+
+    is_editing: bpy.props.BoolProperty(
+        default=False,
+        description="True while pipe-segment parametric edit mode is active.",
+    )
+    mesh_dirty: bpy.props.BoolProperty(
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+        description="True while the visible mesh is the preview shape.",
+    )
+    length: bpy.props.FloatProperty(
+        name="Length",
+        default=1.0,
+        min=0.01,
+        subtype="DISTANCE",
+        update=update_pipe_segment,
+        description="Pipe-segment extrusion length (preview value; committed on finish).",
+    )
+    snap_length: bpy.props.FloatProperty(
+        description="Snapshot of length at edit-enable; commit skips no-op writes.",
+    )
+    snap_object_scale_z: bpy.props.FloatProperty(
+        default=1.0,
+        description="Snapshot of obj.scale.z at edit-enable; cancel / no-op-finish restore exactly.",
+    )
+
+    if TYPE_CHECKING:
+        is_editing: bool
+        mesh_dirty: bool
+        length: float
+        snap_length: float
+        snap_object_scale_z: float
+
+
+class BIMDuctSegmentProperties(PropertyGroup):
+    """Transient draft state for parametric duct-segment gizmo editing (mirror of pipe)."""
+
+    is_editing: bpy.props.BoolProperty(
+        default=False,
+        description="True while duct-segment parametric edit mode is active.",
+    )
+    mesh_dirty: bpy.props.BoolProperty(
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+        description="True while the visible mesh is the preview shape.",
+    )
+    length: bpy.props.FloatProperty(
+        name="Length",
+        default=1.0,
+        min=0.01,
+        subtype="DISTANCE",
+        update=update_duct_segment,
+        description="Duct-segment extrusion length (preview value; committed on finish).",
+    )
+    snap_length: bpy.props.FloatProperty(
+        description="Snapshot of length at edit-enable; commit skips no-op writes.",
+    )
+    snap_object_scale_z: bpy.props.FloatProperty(
+        default=1.0,
+        description="Snapshot of obj.scale.z at edit-enable; cancel / no-op-finish restore exactly.",
+    )
+
+    if TYPE_CHECKING:
+        is_editing: bool
+        mesh_dirty: bool
+        length: float
+        snap_length: float
+        snap_object_scale_z: float
+
+
+class BIMBendPreviewProperties(PropertyGroup):
+    """Scene-level pending state for the bend-creation preview flow."""
+
+    is_active: bpy.props.BoolProperty(
+        default=False,
+        options={"SKIP_SAVE"},
+        description="True while the bend-creation preview flow is active.",
+    )
+    start_segment_id: bpy.props.IntProperty(
+        default=0,
+        options={"SKIP_SAVE"},
+        description="IFC element id of the start (active) segment.",
+    )
+    end_segment_id: bpy.props.IntProperty(
+        default=0,
+        options={"SKIP_SAVE"},
+        description="IFC element id of the end (other selected) segment.",
+    )
+    start_length: bpy.props.FloatProperty(
+        name="Start Length",
+        default=0.1,
+        min=0.001,
+        subtype="DISTANCE",
+        description="Length of the bend fitting's tangent leg on the start (active) segment side",
+    )
+    end_length: bpy.props.FloatProperty(
+        name="End Length",
+        default=0.1,
+        min=0.001,
+        subtype="DISTANCE",
+        description="Length of the bend fitting's tangent leg on the end (other) segment side",
+    )
+    radius: bpy.props.FloatProperty(
+        name="Radius",
+        default=0.2,
+        min=0.001,
+        subtype="DISTANCE",
+        description="Inner radius of the bend curve",
+    )
+
+    if TYPE_CHECKING:
+        is_active: bool
+        start_segment_id: int
+        end_segment_id: int
+        start_length: float
+        end_length: float
+        radius: float
+
+
+class BIMPreviewProperties(PropertyGroup):
+    """Umbrella container for parametric-edit preview drafts attached to ``Scene``."""
+
+    bend: bpy.props.PointerProperty(type=BIMBendPreviewProperties)
+
+    if TYPE_CHECKING:
+        bend: BIMBendPreviewProperties
 
 
 class SnapMousePoint(PropertyGroup):
