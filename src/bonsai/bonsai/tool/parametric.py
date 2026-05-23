@@ -449,14 +449,7 @@ class Parametric(bonsai.core.tool.Parametric):
 
     @classmethod
     def iter_gizmo_preference_classes(cls, ui_module) -> list[type]:
-        """``GizmoPreferences<Name>`` classes that exist on ``ui_module`` for
-        every registry entry. Order matches `EDIT_TYPES`. Used by
-        ``bim/__init__.py`` to inject the per-type ``GizmoPreferences<X>``
-        classes at the correct point — before ``ui.GizmoPreferences``, which
-        references them via ``PointerProperty``."""
-        out: list[type] = []
-        for feature in cls.EDIT_TYPES:
-            gpref = getattr(ui_module, f"GizmoPreferences{feature.name.capitalize()}", None)
-            if gpref is not None:
-                out.append(gpref)
-        return out
+        """Shared ``GizmoPreferencesFeature`` class as a one-element list, or
+        empty if absent. Must register before ``GizmoPreferences``."""
+        shared = getattr(ui_module, "GizmoPreferencesFeature", None)
+        return [shared] if shared is not None else []
