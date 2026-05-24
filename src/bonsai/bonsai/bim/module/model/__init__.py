@@ -23,10 +23,12 @@ from typing import NamedTuple
 import bpy
 
 import bonsai.tool as tool
+from bonsai.bim import decorator_cache
 
 from . import (
     array,
     covering,
+    decorator,
     door,
     external,
     grid,
@@ -354,6 +356,15 @@ def unregister():
     if not bpy.app.background:
         for tool_data in reversed(tools):
             bpy.utils.unregister_tool(tool_data.tool)
+
+    decorator.WallGizmoPreviewDecorator.uninstall()
+    decorator.ArrayPreviewDecorator.uninstall()
+    decorator.ArraySelectionHighlightDecorator.uninstall()
+    decorator.MEPSegmentExtendPreviewDecorator.uninstall()
+    decorator.BendPreviewDecorator.uninstall()
+    decorator.WallFilletPreviewDecorator.uninstall()
+    decorator.MEPSystemPathDecorator.uninstall()
+    decorator_cache.uninstall_decorator_cache_handlers()
 
     del bpy.types.Scene.BIMModelProperties
     del bpy.types.Scene.BIMPolylineProperties

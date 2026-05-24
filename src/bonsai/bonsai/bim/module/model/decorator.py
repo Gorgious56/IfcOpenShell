@@ -44,7 +44,9 @@ from mathutils import Matrix, Quaternion, Vector
 
 import bonsai.core.geometry
 import bonsai.tool as tool
+from bonsai.bim.decorator_cache import get_decorator_cache_token
 from bonsai.bim.module.drawing.helper import format_distance
+from bonsai.bim.module.model import preview_base
 
 
 def transparent_color(color, alpha=0.1):
@@ -56,6 +58,42 @@ def transparent_color(color, alpha=0.1):
 def highlight_color(color, alpha=0.1):
     color = [i + (1 - i) * 0.5 for i in color]
     return color
+
+
+class BaseViewportDecorator:
+    """Boilerplate for a single-handler ``SpaceView3D.draw_handler_add`` lifecycle.
+
+    Subclasses bind one method via ``draw_method`` at ``draw_phase``. Multi-handler
+    or pre-install-stateful decorators (ProfileDecorator, PolylineDecorator,
+    ProductDecorator, BoundingBoxDecorator) keep their own install/uninstall."""
+
+    draw_method: str = "draw"
+    draw_phase: str = "POST_VIEW"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.handlers = []
+        cls.is_installed = False
+
+    @classmethod
+    def install(cls, context: bpy.types.Context) -> None:
+        if cls.is_installed:
+            cls.uninstall()
+        handler = cls()
+        cls.handlers.append(
+            SpaceView3D.draw_handler_add(getattr(handler, cls.draw_method), (context,), "WINDOW", cls.draw_phase)
+        )
+        cls.is_installed = True
+
+    @classmethod
+    def uninstall(cls) -> None:
+        for h in cls.handlers:
+            try:
+                SpaceView3D.draw_handler_remove(h, "WINDOW")
+            except ValueError:
+                pass
+        cls.handlers.clear()
+        cls.is_installed = False
 
 
 def _stroke_lines_alpha(
@@ -135,11 +173,7 @@ class ProfileDecorator:
 
     def __call__(self, context, get_custom_bmesh=None, draw_faces=False, exit_edit_mode_callback=None):
         self.addon_prefs = tool.Blender.get_addon_preferences()
-        selected_elements_color = self.addon_prefs.decorator_color_selected
-        unselected_elements_color = self.addon_prefs.decorator_color_unselected
-        special_elements_color = self.addon_prefs.decorator_color_special
-        error_elements_color = self.addon_prefs.decorator_color_error
-        background_elements_color = self.addon_prefs.decorator_color_background
+        colors = tool.Blender.get_decorator_colors()
 
         obj = context.active_object
 
@@ -254,16 +288,16 @@ class ProfileDecorator:
         if draw_faces:
             self.draw_faces(bm, all_vertices)
 
-        self.draw_batch("LINES", all_vertices, background_elements_color, arc_edges)
-        self.draw_batch("LINES", all_vertices, special_elements_color, preview_edges)
-        self.draw_batch("LINES", all_vertices, special_elements_color, roof_angle_edges)
-        self.draw_batch("LINES", all_vertices, unselected_elements_color, unselected_edges)
-        self.draw_batch("LINES", all_vertices, selected_elements_color, selected_edges)
+        self.draw_batch("LINES", all_vertices, colors.background, arc_edges)
+        self.draw_batch("LINES", all_vertices, colors.special, preview_edges)
+        self.draw_batch("LINES", all_vertices, colors.special, roof_angle_edges)
+        self.draw_batch("LINES", all_vertices, colors.unselected, unselected_edges)
+        self.draw_batch("LINES", all_vertices, colors.selected, selected_edges)
 
-        self.draw_batch("POINTS", unselected_vertices, transparent_color(unselected_elements_color, 0.5))
-        self.draw_batch("POINTS", error_vertices, error_elements_color)
-        self.draw_batch("POINTS", special_vertices, special_elements_color)
-        self.draw_batch("POINTS", selected_vertices, selected_elements_color)
+        self.draw_batch("POINTS", unselected_vertices, transparent_color(colors.unselected, 0.5))
+        self.draw_batch("POINTS", error_vertices, colors.error)
+        self.draw_batch("POINTS", special_vertices, colors.special)
+        self.draw_batch("POINTS", selected_vertices, colors.selected)
 
         # Draw arcs
         arc_centroids = []
@@ -288,9 +322,9 @@ class ProfileDecorator:
                 arc_centroids.append(tuple(centroid))
             arc_segments.append(tool.Cad.create_arc_segments(pts=points, num_verts=17, make_edges=True))
 
-        self.draw_batch("POINTS", arc_centroids, background_elements_color)
+        self.draw_batch("POINTS", arc_centroids, colors.background)
         for verts, edges in arc_segments:
-            self.draw_batch("LINES", verts, special_elements_color, edges)
+            self.draw_batch("LINES", verts, colors.special, edges)
 
         # Draw circles
         circle_centroids = []
@@ -309,9 +343,9 @@ class ProfileDecorator:
             segments = [[list(matrix @ Vector(v)) for v in segments[0]], segments[1]]
             circle_segments.append(segments)
 
-        self.draw_batch("POINTS", circle_centroids, background_elements_color)
+        self.draw_batch("POINTS", circle_centroids, colors.background)
         for verts, edges in circle_segments:
-            self.draw_batch("LINES", verts, special_elements_color, edges)
+            self.draw_batch("LINES", verts, colors.special, edges)
 
     def create_matrix(self, p, x, y, z):
         return Matrix([x, y, z, p]).to_4x4().transposed()
@@ -1614,26 +1648,8 @@ class ProductDecorator:
         return data
 
 
-class WallAxisDecorator:
-    is_installed = False
-    handlers = []
-
-    @classmethod
-    def install(cls, context):
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw_wall_axis, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls):
-        for handler in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(handler, "WINDOW")
-            except ValueError:
-                pass
-        cls.is_installed = False
+class WallAxisDecorator(BaseViewportDecorator):
+    draw_method = "draw_wall_axis"
 
     def draw_batch(self, shader_type, content_pos, color, indices=None):
         if not tool.Blender.validate_shader_batch_data(content_pos, indices):
@@ -1644,11 +1660,7 @@ class WallAxisDecorator:
         batch.draw(shader)
 
     def draw_wall_axis(self, context):
-        self.addon_prefs = tool.Blender.get_addon_preferences()
-        selected_elements_color = self.addon_prefs.decorator_color_selected
-        unselected_elements_color = self.addon_prefs.decorator_color_unselected
-        special_elements_color = self.addon_prefs.decorator_color_special
-        decorator_color_background = self.addon_prefs.decorator_color_background
+        colors = tool.Blender.get_decorator_colors()
 
         gpu.state.point_size_set(6)
         gpu.state.blend_set("ALPHA")
@@ -1664,11 +1676,11 @@ class WallAxisDecorator:
                 layers = tool.Model.get_material_layer_parameters(element)
                 axis = tool.Model.get_wall_axis(obj, layers)
                 side = [tuple(list(v) + [obj.location.z]) for v in axis["side"]]
-                self.draw_batch("LINES", side, unselected_elements_color, [(0, 1)])
+                self.draw_batch("LINES", side, colors.unselected, [(0, 1)])
                 base = [tuple(list(v) + [obj.location.z]) for v in axis["base"]]
-                self.draw_batch("LINES", base, special_elements_color, [(0, 1)])
+                self.draw_batch("LINES", base, colors.special, [(0, 1)])
                 reference = [tuple(list(v) + [obj.location.z]) for v in axis["reference"]]
-                self.draw_batch("LINES", reference, selected_elements_color, [(0, 1)])
+                self.draw_batch("LINES", reference, colors.selected, [(0, 1)])
 
                 direction = Vector(base[0]) - Vector(side[0])
                 perpendicular = Vector((direction.y, -direction.x, 0))
@@ -1677,29 +1689,11 @@ class WallAxisDecorator:
                 v3 = arrow_base + perpendicular
                 v4 = arrow_base - perpendicular
                 arrow = [base[0], side[0], v3, v4]
-                self.draw_batch("LINES", arrow, unselected_elements_color, [(0, 1), (1, 2), (1, 3)])
+                self.draw_batch("LINES", arrow, colors.unselected, [(0, 1), (1, 2), (1, 3)])
 
 
-class SlabDirectionDecorator:
-    is_installed = False
-    handlers = []
-
-    @classmethod
-    def install(cls, context):
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw_wall_axis, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls):
-        for handler in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(handler, "WINDOW")
-            except ValueError:
-                pass
-        cls.is_installed = False
+class SlabDirectionDecorator(BaseViewportDecorator):
+    draw_method = "draw_wall_axis"
 
     def draw_batch(self, shader_type, content_pos, color, indices=None):
         if not tool.Blender.validate_shader_batch_data(content_pos, indices):
@@ -1710,11 +1704,7 @@ class SlabDirectionDecorator:
         batch.draw(shader)
 
     def draw_wall_axis(self, context):
-        self.addon_prefs = tool.Blender.get_addon_preferences()
-        selected_elements_color = self.addon_prefs.decorator_color_selected
-        unselected_elements_color = self.addon_prefs.decorator_color_unselected
-        special_elements_color = self.addon_prefs.decorator_color_special
-        decorator_color_background = self.addon_prefs.decorator_color_background
+        colors = tool.Blender.get_decorator_colors()
 
         gpu.state.point_size_set(6)
         gpu.state.blend_set("ALPHA")
@@ -1733,30 +1723,12 @@ class SlabDirectionDecorator:
         if element and (element.is_a("IfcSlab") or element.is_a("IfcRoof")):
             dir = [obj.matrix_world @ Vector(d) for d in dir]
             base = [obj.matrix_world @ Vector(d) for d in base]
-            self.draw_batch("LINES", dir, selected_elements_color, [(0, 1), (1, 2), (1, 3)])
-            self.draw_batch("LINES", base, selected_elements_color, [(0, 1)])
+            self.draw_batch("LINES", dir, colors.selected, [(0, 1), (1, 2), (1, 3)])
+            self.draw_batch("LINES", base, colors.selected, [(0, 1)])
 
 
-class FaceAreaDecorator:
-    is_installed = False
-    handlers = []
-
-    @classmethod
-    def install(cls, context):
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw_face_area, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls):
-        for handler in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(handler, "WINDOW")
-            except ValueError:
-                pass
-        cls.is_installed = False
+class FaceAreaDecorator(BaseViewportDecorator):
+    draw_method = "draw_face_area"
 
     def draw_batch(self, shader_type, content_pos, color, indices=None):
         if not tool.Blender.validate_shader_batch_data(content_pos, indices):
@@ -2182,36 +2154,15 @@ def draw_array_layer_children_bbox(
     )
 
 
-class ArrayPreviewDecorator:
+class ArrayPreviewDecorator(BaseViewportDecorator):
     """Faint bbox wireframe at each future array instance during the edit triad.
     Pure GPU preview gated on the array's draft props — no IFC mutation."""
-
-    is_installed = False
-    handlers: list[Any] = []
 
     LINE_WIDTH = 1.2
     LINE_ALPHA = 0.45
     # Skip rendering above this many instances — past ~200 the viewport gets
     # noisy and the user can read the count from the xN label instead.
     MAX_PREVIEW_INSTANCES = 200
-
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
 
     def draw(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2271,7 +2222,7 @@ class ArrayPreviewDecorator:
         return segments
 
 
-class ArraySelectionHighlightDecorator:
+class ArraySelectionHighlightDecorator(BaseViewportDecorator):
     """Bounding-box overlay surfacing the array family of the selected object.
 
     Two activation modes:
@@ -2290,10 +2241,14 @@ class ArraySelectionHighlightDecorator:
     currently selected. ``context.active_object`` persists across selection
     clears (e.g. clicking empty viewport space deselects but leaves the
     last-active object set) — drawing the family bbox for an object that
-    isn't visually selected reads as a phantom highlight."""
+    isn't visually selected reads as a phantom highlight.
 
-    is_installed = False
-    handlers: list[Any] = []
+    The resolved ``(parent_obj, siblings)`` family is cached per draw-handler
+    instance and only re-resolved when the active object's identity changes
+    or the shared decorator cache token bumps (see ``decorator_cache``). The
+    cached value holds ``bpy.types.Object`` references, so the shared
+    invalidation handler must clear the cache via the token bump before the
+    next redraw can dereference a freed object."""
 
     LINE_WIDTH = 1.5
     PARENT_ALPHA = 0.7
@@ -2302,23 +2257,11 @@ class ArraySelectionHighlightDecorator:
     # and the highlight stops being useful. Cap mirrors ArrayPreviewDecorator.
     MAX_SIBLINGS = 200
 
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
+    def __init__(self) -> None:
+        self._cache_key: tuple | None = None
+        # None / empty sentinels are cached so unresolvable families don't
+        # re-query the IFC graph every redraw.
+        self._cache_value: tuple[bpy.types.Object, list[bpy.types.Object]] | list[bpy.types.Object] | None = None
 
     def draw(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2350,7 +2293,7 @@ class ArraySelectionHighlightDecorator:
         element: ifcopenshell.entity_instance,
         obj: bpy.types.Object,
     ) -> None:
-        family = self._collect_family_from_child(element, obj)
+        family = self._resolve_family_for_child(obj, element)
         if family is None:
             return
         parent_obj, sibling_objs = family
@@ -2373,8 +2316,36 @@ class ArraySelectionHighlightDecorator:
         element: ifcopenshell.entity_instance,
         obj: bpy.types.Object,
     ) -> None:
-        child_objs = self._collect_children(element, exclude=obj)
+        child_objs = self._resolve_children_for_parent(obj, element)
         self._draw_siblings(context, prefs, child_objs)
+
+    def _resolve_family_for_child(
+        self,
+        obj: bpy.types.Object,
+        element: ifcopenshell.entity_instance,
+    ) -> tuple[bpy.types.Object, list[bpy.types.Object]] | None:
+        """Cached ``(parent_obj, siblings)`` for ``element``; re-resolve on miss."""
+        key = ("child", obj.session_uid, element.id(), get_decorator_cache_token())
+        if self._cache_key == key:
+            return self._cache_value
+        family = self._collect_family_from_child(element, obj)
+        self._cache_key = key
+        self._cache_value = family
+        return family
+
+    def _resolve_children_for_parent(
+        self,
+        obj: bpy.types.Object,
+        element: ifcopenshell.entity_instance,
+    ) -> list[bpy.types.Object]:
+        """Cached child list for an array parent; re-resolve on miss."""
+        key = ("parent", obj.session_uid, element.id(), get_decorator_cache_token())
+        if self._cache_key == key:
+            return self._cache_value or []
+        children = self._collect_children(element, exclude=obj)
+        self._cache_key = key
+        self._cache_value = children
+        return children
 
     def _draw_siblings(
         self,
@@ -2456,7 +2427,7 @@ class ArraySelectionHighlightDecorator:
         return children
 
 
-class WallGizmoPreviewDecorator:
+class WallGizmoPreviewDecorator(BaseViewportDecorator):
     """Faint floor-plane preview lines that visualise where a click-to-act wall
     gizmo's operator would move the wall geometry. Two state machines:
 
@@ -2476,29 +2447,10 @@ class WallGizmoPreviewDecorator:
     succeed — it is purely a visual cue, and is hidden by the same gizmo-
     preferences toggle that hides the icons themselves."""
 
-    is_installed = False
-    handlers: list[Any] = []
+    draw_method = "draw_lines"
 
     LINE_WIDTH = 1.5
     LINE_ALPHA = 0.4
-
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw_lines, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
 
     def draw_lines(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2515,9 +2467,6 @@ class WallGizmoPreviewDecorator:
         segments: list[tuple[tuple[float, float, float], tuple[float, float, float]]],
         color_rgb: tuple[float, float, float],
     ) -> None:
-        """Thin wrapper around the module-level :func:`_stroke_lines_alpha`
-        helper, binding this decorator's class-level ``LINE_WIDTH`` and
-        ``LINE_ALPHA`` constants."""
         _stroke_lines_alpha(context, segments, color_rgb, self.LINE_WIDTH, self.LINE_ALPHA)
 
     def _draw_join_preview(self, context: bpy.types.Context, prefs: Any) -> None:
@@ -2525,12 +2474,9 @@ class WallGizmoPreviewDecorator:
         intersection.
 
         Each wall contributes one line from its nearer axis endpoint to the
-        projected XY intersection, held at the wall's own axis Z. State-
-        detection mirrors ``GizmoWallJoinIntersection`` (two walls, both
-        LAYER2, not joined, not collinear, non-parallel axes). The pure
-        geometry — nearest endpoints + per-wall floor Z — is computed by
-        :func:`bonsai.core.model.wall_join_preview_lines` and shared with the
-        core-lane tests.
+        projected XY intersection, held at the wall's own axis Z. Polls in
+        for a selection of two LAYER2 walls that are not joined, not
+        collinear, and have non-parallel axes.
 
         Hover colour:
         - **Join hover** → both lines light up (Join is symmetric: both walls
@@ -2615,10 +2561,7 @@ class WallGizmoPreviewDecorator:
 
     @staticmethod
     def _extended_wall_index(context: bpy.types.Context, selected: list[bpy.types.Object]) -> Optional[int]:
-        """Return the index into the ``[floor_a, floor_b]`` preview list for
-        the wall :class:`ExtendWallsToWall` would extend in default direction
-        — i.e. the non-active wall. Returns ``None`` when the active object
-        isn't one of the two selected walls (no well-defined "extended wall")."""
+        """Index of the non-active wall in ``selected``, or ``None``."""
         active = context.active_object
         if active is selected[0]:
             return 1
@@ -2665,13 +2608,13 @@ class WallGizmoPreviewDecorator:
 
         State-detection mirrors ``GizmoWallEdition._update_cursor_gizmos``:
         the wall is the active selected object, is a LAYER2 wall, and the
-        per-wall ``extend`` gizmo pref is enabled. The line itself runs from
-        the wall's nearer axis endpoint (in wall-local X) to the cursor's
-        projected X on the wall axis, both at the wall's own axis Y=0 and
-        Z=0 in wall-local — so the line stays glued to the wall's floor
-        edge regardless of where the cursor's Z sits."""
+        wall feature's gizmos are enabled in preferences. The line itself
+        runs from the wall's nearer axis endpoint (in wall-local X) to the
+        cursor's projected X on the wall axis, both at the wall's own axis
+        Y=0 and Z=0 in wall-local — so the line stays glued to the wall's
+        floor edge regardless of where the cursor's Z sits."""
         gizmo_prefs = getattr(prefs.gizmos, "wall", None)
-        if gizmo_prefs is None or not getattr(gizmo_prefs, "extend", False):
+        if gizmo_prefs is None or not getattr(gizmo_prefs, "enabled", True):
             return
         active = context.active_object
         if active is None:
@@ -2710,9 +2653,7 @@ class WallGizmoPreviewDecorator:
 
     def _cursor_extend_icon_hovered(self, gizmo_cls: type, context: bpy.types.Context) -> bool:
         """True iff the ``GizmoWallEdition`` instance in the current region
-        reports the cursor-extend icon (``extend_x_gizmo``) as highlighted.
-        Same per-region lookup + exception-swallowing contract as
-        :meth:`_join_group_hover_state`."""
+        reports the cursor-extend icon (``extend_x_gizmo``) as highlighted."""
         inst = self._lookup_active_instance(gizmo_cls, context)
         if inst is None:
             return False
@@ -2755,7 +2696,7 @@ def compute_mep_join_location() -> Optional[Vector]:
     return (closest[0] + closest[1]) * 0.5
 
 
-class MEPSegmentExtendPreviewDecorator:
+class MEPSegmentExtendPreviewDecorator(BaseViewportDecorator):
     """Faint preview line for the MEP segment extend-to-cursor gizmo.
 
     When a single pipe/duct segment is active and the per-feature ``extend``
@@ -2770,8 +2711,7 @@ class MEPSegmentExtendPreviewDecorator:
     every draw, so disabling either suppresses the line at no cost.
     """
 
-    is_installed = False
-    handlers: list[Any] = []
+    draw_method = "draw_line"
 
     LINE_WIDTH = 1.5
     LINE_ALPHA = 0.4
@@ -2779,24 +2719,6 @@ class MEPSegmentExtendPreviewDecorator:
     # clamp in ``bim.extend_pipe_segment_to_cursor`` / ``..._duct_..._cursor``
     # so the preview line lands exactly where the operator commits.
     MIN_PROJECTED_LENGTH = 0.01
-
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw_line, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
 
     def draw_line(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2814,16 +2736,15 @@ class MEPSegmentExtendPreviewDecorator:
         if element is None:
             return
 
-        # Pick the matching per-feature gizmo pref. Mirrors
-        # GizmoPipeSegmentEdition.gizmo_pref_name / GizmoDuctSegmentEdition.gizmo_pref_name
-        # so the preview line tracks the same on/off toggle as the icon itself.
+        # Pick the matching per-feature gizmo pref so the preview line
+        # tracks the same on/off toggle as the icon itself.
         if tool.Blender.Modifier.is_pipe_segment(element):
             gizmo_prefs = getattr(prefs.gizmos, "pipe_segment", None)
         elif tool.Blender.Modifier.is_duct_segment(element):
             gizmo_prefs = getattr(prefs.gizmos, "duct_segment", None)
         else:
             return
-        if gizmo_prefs is None or not getattr(gizmo_prefs, "extend", False):
+        if gizmo_prefs is None or not getattr(gizmo_prefs, "enabled", True):
             return
 
         current_length = max(c[2] for c in active.bound_box) if active.bound_box else 0.0
@@ -2869,49 +2790,29 @@ class MEPSegmentExtendPreviewDecorator:
         return current_end_world, target_end_world
 
 
-class BendPreviewDecorator:
+class BendPreviewDecorator(preview_base.BasePreviewDecorator):
     """GPU preview lines for the bend-creation flow.
 
-    Polls on ``scene.BIMBendPreviewProperties.is_active`` and renders the
+    Polls on ``scene.BIMPreviewProperties.bend.is_active`` and renders the
     centerline + leg projections returned by ``mep.compute_bend_preview_polylines``.
     The two leg lines (segment → tangent point) show how each segment will
     be shortened; the arc polyline approximates the bend curve.
 
-    Installed once per Blender session from ``bim/handler.py:load_post`` and
-    uninstalled in ``bim/module/model/__init__.py:unregister`` — same lifecycle
-    as ``MEPSegmentExtendPreviewDecorator``. Cheap to leave running because
-    the first thing the draw callback does is check ``is_active`` and return
-    when False.
+    Inherits ``install`` / ``uninstall`` from ``preview_base.BasePreviewDecorator``;
+    installed once per Blender session from ``bim/handler.py:load_post`` and
+    uninstalled in ``bim/module/model/__init__.py:unregister``. Cheap to
+    leave running because the first thing ``draw`` does is check
+    ``is_active`` and return when False.
     """
-
-    is_installed = False
-    handlers: list[Any] = []
 
     LINE_WIDTH_LEG = 1.5
     LINE_WIDTH_ARC = 2.5  # Slightly thicker so the curve reads as the focal element.
     LINE_ALPHA = 0.7
 
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
-
     def draw(self, context: bpy.types.Context) -> None:
         scene = context.scene
-        props = getattr(scene, "BIMBendPreviewProperties", None)
+        preview = getattr(scene, "BIMPreviewProperties", None)
+        props = preview.bend if preview is not None else None
         if props is None or not props.is_active:
             return
         ifc_file = tool.Ifc.get()
@@ -2967,7 +2868,119 @@ class BendPreviewDecorator:
             _stroke_lines_alpha(context, arc_segments, arc_color, self.LINE_WIDTH_ARC, self.LINE_ALPHA)
 
 
-class MEPSystemPathDecorator:
+class WallFilletPreviewDecorator(preview_base.BasePreviewDecorator):
+    """GPU preview lines for the wall-fillet flow.
+
+    Polls on ``scene.BIMPreviewProperties.wall_fillet.is_active`` and renders
+    the leg projections + arc + radial construction lines returned by
+    ``tool.Wall.compute_wall_fillet_geometry``. The two leg lines show how
+    each wall will be shortened to its tangent point; the arc approximates
+    the rounded corner; the two construction lines (arc center to each
+    tangent point) visually pin the radius.
+
+    Inherits ``install`` / ``uninstall`` from ``preview_base.BasePreviewDecorator``;
+    installed once per Blender session from ``bim/handler.py:load_post`` and
+    uninstalled in ``bim/module/model/__init__.py:unregister``."""
+
+    LINE_WIDTH_LEG = 1.5
+    LINE_WIDTH_ARC = 2.5
+    LINE_WIDTH_CONSTRUCTION = 1.0
+    LINE_ALPHA = 0.7
+    CONSTRUCTION_ALPHA = 0.4
+
+    def draw(self, context: bpy.types.Context) -> None:
+        scene = context.scene
+        preview_props = getattr(scene, "BIMPreviewProperties", None)
+        props = preview_props.wall_fillet if preview_props is not None else None
+        if props is None or not props.is_active:
+            return
+        ifc_file = tool.Ifc.get()
+        if ifc_file is None:
+            return
+        try:
+            wall_a = ifc_file.by_id(props.wall_a_id)
+            wall_b = ifc_file.by_id(props.wall_b_id)
+        except Exception:
+            return
+        wall_a_obj = tool.Ifc.get_object(wall_a) if wall_a else None
+        wall_b_obj = tool.Ifc.get_object(wall_b) if wall_b else None
+        if wall_a_obj is None or wall_b_obj is None:
+            return
+
+        geom = tool.Wall.compute_wall_fillet_geometry(wall_a_obj, wall_b_obj, props.radius)
+        if geom is None:
+            return
+
+        prefs = tool.Blender.get_addon_preferences()
+        warning_color = tuple(prefs.decorator_color_error[:3])
+
+        if not geom["valid"]:
+            # Degenerate geometry paints red: invalid_radius shows legs+arc
+            # past the wall ends; invalid_axes shows the parallel/collinear axes.
+            if geom.get("invalid_radius"):
+                tangent_a = geom.get("tangent_a")
+                tangent_b = geom.get("tangent_b")
+                ref_a = tool.Wall.get_world_reference_line(wall_a_obj)
+                ref_b = tool.Wall.get_world_reference_line(wall_b_obj)
+                if tangent_a is not None and tangent_b is not None and ref_a is not None and ref_b is not None:
+                    far_a = self._far_endpoint(ref_a, geom["intersection"])
+                    far_b = self._far_endpoint(ref_b, geom["intersection"])
+                    legs = [
+                        (tuple(far_a), tuple(tangent_a)),
+                        (tuple(far_b), tuple(tangent_b)),
+                    ]
+                    _stroke_lines_alpha(context, legs, warning_color, self.LINE_WIDTH_LEG, self.LINE_ALPHA)
+                arc = geom.get("arc") or []
+                if len(arc) >= 2:
+                    arc_segments = [(tuple(arc[i]), tuple(arc[i + 1])) for i in range(len(arc) - 1)]
+                    _stroke_lines_alpha(context, arc_segments, warning_color, self.LINE_WIDTH_ARC, self.LINE_ALPHA)
+            elif geom.get("invalid_axes"):
+                axes = geom["invalid_axes"]
+                segments = [(tuple(a), tuple(b)) for a, b in axes]
+                _stroke_lines_alpha(context, segments, warning_color, self.LINE_WIDTH_ARC, self.LINE_ALPHA)
+            return
+
+        leg_color = tuple(prefs.decorations_colour[:3])
+        arc_color = tuple(prefs.decorator_color_selected[:3])
+
+        # Resolved against the IFC reference line, not mesh bounds, so trimmed
+        # walls and openings don't shift the leg endpoints.
+        ref_a = tool.Wall.get_world_reference_line(wall_a_obj)
+        ref_b = tool.Wall.get_world_reference_line(wall_b_obj)
+        if ref_a is not None and ref_b is not None and geom["intersection"] is not None:
+            far_a = self._far_endpoint(ref_a, geom["intersection"])
+            far_b = self._far_endpoint(ref_b, geom["intersection"])
+            legs = [
+                (tuple(far_a), tuple(geom["tangent_a"])),
+                (tuple(far_b), tuple(geom["tangent_b"])),
+            ]
+            _stroke_lines_alpha(context, legs, leg_color, self.LINE_WIDTH_LEG, self.LINE_ALPHA)
+
+        arc = geom["arc"]
+        if len(arc) >= 2:
+            arc_segments = [(tuple(arc[i]), tuple(arc[i + 1])) for i in range(len(arc) - 1)]
+            _stroke_lines_alpha(context, arc_segments, arc_color, self.LINE_WIDTH_ARC, self.LINE_ALPHA)
+
+        # Dim construction lines from arc_center to each tangent point so the
+        # radius reads as concrete during drag.
+        arc_center = geom.get("arc_center")
+        if arc_center is not None:
+            construction = [
+                (tuple(arc_center), tuple(geom["tangent_a"])),
+                (tuple(arc_center), tuple(geom["tangent_b"])),
+            ]
+            _stroke_lines_alpha(context, construction, arc_color, self.LINE_WIDTH_CONSTRUCTION, self.CONSTRUCTION_ALPHA)
+
+    @staticmethod
+    def _far_endpoint(reference_line, intersection):
+        """Endpoint of ``reference_line`` furthest from ``intersection``."""
+        p1, p2 = reference_line
+        d1 = (p1.x - intersection[0]) ** 2 + (p1.y - intersection[1]) ** 2 + (p1.z - intersection[2]) ** 2
+        d2 = (p2.x - intersection[0]) ** 2 + (p2.y - intersection[1]) ** 2 + (p2.z - intersection[2]) ** 2
+        return p2 if d2 >= d1 else p1
+
+
+class MEPSystemPathDecorator(BaseViewportDecorator):
     """Faint axis-line overlay tracing the schematic path of the selected
     MEP element's connected distribution system.
 
@@ -2997,9 +3010,6 @@ class MEPSystemPathDecorator:
     selection, costs one ``is_mep_element`` check per selected object.
     """
 
-    is_installed = False
-    handlers: list[Any] = []
-
     # Color + line width chosen to match ``WallAxisDecorator``'s primary
     # reference-axis line — the MEP path overlay represents "what the user
     # is currently inspecting", which is exactly what
@@ -3016,34 +3026,17 @@ class MEPSystemPathDecorator:
     PORT_DOT_SIZE = 8.0
 
     def __init__(self) -> None:
-        # BFS cache: re-walk only when the selected element changes (or the
-        # underlying IFC file is swapped). The walk is the dominant per-frame
-        # cost for a big system — caching turns "compute every redraw" into
-        # "compute on selection change". ``_cached_start_guid`` is the IFC
-        # GlobalId of the element the cached walk started from;
-        # ``_cached_ifc_id`` is ``id(ifc_file)`` so a file-reload silently
-        # invalidates the cache even when the new file has the same GUID.
+        # Two-tier cache. Walk cache keyed on (start_guid, ifc_file): re-walk
+        # only on selection change or file reload. Compare ``ifc_file`` with
+        # ``is`` (not id()) so a GC-recycled id() can't produce a false hit.
         self._cached_start_guid: str | None = None
-        self._cached_ifc_id: int | None = None
+        self._cached_ifc_file: Any = None
         self._cached_walk: list[Any] = []
-
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
+        # Geometry cache keyed on (start_guid, id(ifc_file), token). Token
+        # bump invalidates on depsgraph / undo / redo / load.
+        self._cached_geom_key: tuple | None = None
+        self._cached_lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        self._cached_port_positions: list[tuple[float, float, float]] = []
 
     def draw(self, context: bpy.types.Context) -> None:
         model_props = tool.Model.get_model_props()
@@ -3053,13 +3046,8 @@ class MEPSystemPathDecorator:
         if ifc_file is None:
             return
 
-        # Find the first selected MEP element. Walking from one is enough —
-        # the BFS pulls in everything else connected to it. If the user has
-        # several MEP elements selected from the same system, we still only
-        # walk once (additional starting points would just produce the same
-        # set). If they're from disjoint systems, only the first is shown —
-        # acceptable for the "follow this system" use case; documenting it
-        # would justify a future enhancement to walk from all selected.
+        # Walk from the first selected MEP element — the BFS pulls in the
+        # rest of its connected system. Disjoint systems show only the first.
         start_element = None
         for obj in context.selected_objects or []:
             element = tool.Ifc.get_entity(obj)
@@ -3067,19 +3055,12 @@ class MEPSystemPathDecorator:
                 start_element = element
                 break
         if start_element is None:
-            # No MEP selection — drop the cache so the next selection starts
-            # cleanly, and skip drawing.
             self._cached_start_guid = None
             self._cached_walk = []
             return
 
-        # Cache hit when selection AND IFC file both match the last walk.
-        # Misses on (a) selection change, (b) file reload (id(ifc_file) differs),
-        # (c) stale entity in the cached walk (handled by the try/except
-        # wrapping the geometry resolution below).
         start_guid = start_element.GlobalId
-        ifc_id = id(ifc_file)
-        if start_guid == self._cached_start_guid and ifc_id == self._cached_ifc_id and self._cached_walk:
+        if start_guid == self._cached_start_guid and ifc_file is self._cached_ifc_file and self._cached_walk:
             connected = self._cached_walk
         else:
             try:
@@ -3088,24 +3069,51 @@ class MEPSystemPathDecorator:
                 self._cached_walk = []
                 return
             self._cached_start_guid = start_guid
-            self._cached_ifc_id = ifc_id
+            self._cached_ifc_file = ifc_file
             self._cached_walk = connected
         if not connected:
             return
 
         prefs = tool.Blender.get_addon_preferences()
-        # Highlight color (selected-elements color) — same key
-        # ``WallAxisDecorator`` uses for its primary reference-axis line.
-        # The MEP path IS the focused context: the user has explicitly
-        # toggled the overlay on AND has an MEP element selected, so the
-        # highlight color matches what's semantically "in focus".
         color = tuple(prefs.decorator_color_selected[:3])
 
+        current_token = get_decorator_cache_token()
+        geom_key = (start_guid, id(ifc_file), current_token)
+        if geom_key == self._cached_geom_key:
+            lines = self._cached_lines
+            port_positions = self._cached_port_positions
+        else:
+            lines, port_positions = self._build_geometry(connected)
+            self._cached_geom_key = geom_key
+            self._cached_lines = lines
+            self._cached_port_positions = port_positions
+
+        if lines:
+            _stroke_lines_alpha(context, lines, color, self.LINE_WIDTH, self.LINE_ALPHA)
+
+        if port_positions:
+            # POINTS via UNIFORM_COLOR; point_size_set only affects the next batch.
+            point_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            point_shader.bind()
+            point_shader.uniform_float("color", (*color, self.LINE_ALPHA))
+            gpu.state.point_size_set(self.PORT_DOT_SIZE)
+            gpu.state.blend_set("ALPHA")
+            batch = batch_for_shader(point_shader, "POINTS", {"pos": port_positions})
+            batch.draw(point_shader)
+            gpu.state.blend_set("NONE")
+
+    def _build_geometry(
+        self,
+        connected: list[Any],
+    ) -> tuple[
+        list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+        list[tuple[tuple[float, float, float], float, float, float]],
+    ]:
+        """Resolve world-space line segments + port dots for one walk pass.
+
+        Returns ``(lines, port_positions)``. Never raises; skips degenerate
+        elements."""
         lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
-        # Collect every port world position so a discrete dot can be drawn at
-        # each one — the dots mark the actual connection nodes (where one
-        # element's port meets another's), giving the schematic path a clear
-        # "vertex" for each connection in addition to the path lines.
         port_positions: list[tuple[float, float, float]] = []
         for element in connected:
             if element.is_a("IfcFlowSegment"):
@@ -3149,20 +3157,4 @@ class MEPSystemPathDecorator:
                 # endpoint-only). Ports still emit dots below either way.
                 for port_pos in port_world_positions:
                     port_positions.append(tuple(port_pos))
-
-        if lines:
-            _stroke_lines_alpha(context, lines, color, self.LINE_WIDTH, self.LINE_ALPHA)
-
-        if port_positions:
-            # POINTS rendering via the simple UNIFORM_COLOR shader — matches
-            # the pattern used by ProfileDecorator / WallAxisDecorator for
-            # their vertex markers. ``point_size_set`` only affects the next
-            # batch, so it's safe to set here without restoring state.
-            point_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-            point_shader.bind()
-            point_shader.uniform_float("color", (*color, self.LINE_ALPHA))
-            gpu.state.point_size_set(self.PORT_DOT_SIZE)
-            gpu.state.blend_set("ALPHA")
-            batch = batch_for_shader(point_shader, "POINTS", {"pos": port_positions})
-            batch.draw(point_shader)
-            gpu.state.blend_set("NONE")
+        return lines, port_positions

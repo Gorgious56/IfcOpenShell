@@ -34,6 +34,7 @@ from mathutils import Vector
 import bonsai.bim
 import bonsai.core.model as core_model
 import bonsai.tool as tool
+from bonsai.bim.decorator_cache import install_decorator_cache_handlers
 from bonsai.bim.ifc import IfcStore
 from bonsai.bim.module.aggregate.decorator import AggregateDecorator
 from bonsai.bim.module.georeference.decorator import GeoreferenceDecorator
@@ -447,6 +448,7 @@ def load_post(scene):
         WallAxisDecorator.install(bpy.context)
     if model_props.show_slab_direction:
         SlabDirectionDecorator.install(bpy.context)
+    install_decorator_cache_handlers()
     if model_props.show_bounding_box:
         BoundingBoxDecorator.install(bpy.context)
     if getattr(model_props, "show_mep_path", False):
