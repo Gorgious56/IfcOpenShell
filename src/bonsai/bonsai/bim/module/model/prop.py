@@ -1906,13 +1906,68 @@ class BIMBendPreviewProperties(PropertyGroup):
         radius: float
 
 
+class BIMWallFilletPreviewProperties(PropertyGroup):
+    """Scene-level pending state for the wall-fillet preview flow.
+
+    Scene-level because the fillet spans two walls and commits a third
+    (corner) wall between them. ``SKIP_SAVE`` fields throughout."""
+
+    is_active: bpy.props.BoolProperty(
+        default=False,
+        options={"SKIP_SAVE"},
+        description="True while the wall-fillet preview flow is active.",
+    )
+    wall_a_id: bpy.props.IntProperty(
+        default=0,
+        options={"SKIP_SAVE"},
+        description=(
+            "IFC element id of the active wall — the corner wall inherits its "
+            "material layer set, height, x_angle, and type."
+        ),
+    )
+    wall_b_id: bpy.props.IntProperty(
+        default=0,
+        options={"SKIP_SAVE"},
+        description="IFC element id of the other selected wall.",
+    )
+    radius: bpy.props.FloatProperty(
+        name="Radius",
+        default=0.5,
+        soft_min=-10.0,
+        soft_max=10.0,
+        subtype="DISTANCE",
+        unit="LENGTH",
+        options={"SKIP_SAVE"},
+        description="Radius of the circular arc connecting the two walls.",
+    )
+    editing_corner_id: bpy.props.IntProperty(
+        default=0,
+        options={"SKIP_SAVE"},
+        description=(
+            "IFC element id of an existing fillet corner being re-edited "
+            "(non-zero only on the pen-icon re-edit flow). The create "
+            "operator deletes this corner + its connections before recreating "
+            "with the new radius — keeps the re-edit a single undo step."
+        ),
+    )
+
+    if TYPE_CHECKING:
+        is_active: bool
+        wall_a_id: int
+        wall_b_id: int
+        radius: float
+        editing_corner_id: int
+
+
 class BIMPreviewProperties(PropertyGroup):
     """Umbrella container for parametric-edit preview drafts attached to ``Scene``."""
 
     bend: bpy.props.PointerProperty(type=BIMBendPreviewProperties)
+    wall_fillet: bpy.props.PointerProperty(type=BIMWallFilletPreviewProperties)
 
     if TYPE_CHECKING:
         bend: BIMBendPreviewProperties
+        wall_fillet: BIMWallFilletPreviewProperties
 
 
 class SnapMousePoint(PropertyGroup):

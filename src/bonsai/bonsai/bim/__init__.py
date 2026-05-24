@@ -277,6 +277,18 @@ def unregister_classes(classes_to_unregister):
             bpy.utils.unregister_class(cls)
 
 
+@bpy.app.handlers.persistent
+def _clear_gizmo_texture_cache_on_load(_dummy) -> None:
+    """Invalidate the gizmo PNG → GPUTexture cache when a new blend file loads.
+
+    The cache holds references to ``bpy.types.Image`` data-blocks whose
+    backing memory is freed on file load — leaving the GPUTextures pointing
+    at stale Blender data."""
+    from bonsai.bim.module.drawing import gizmo_textures
+
+    gizmo_textures.clear_cache()
+
+
 def register():
     register_classes(classes)
 
@@ -285,6 +297,7 @@ def register():
     bpy.app.handlers.redo_post.append(handler.redo_post)
     bpy.app.handlers.load_post.append(handler.load_post)
     bpy.app.handlers.load_post.append(handler.loadIfcStore)
+    bpy.app.handlers.load_post.append(_clear_gizmo_texture_cache_on_load)
     bpy.types.Scene.BIMProperties = bpy.props.PointerProperty(type=prop.BIMProperties)
     bpy.types.Scene.BIMSnapProperties = bpy.props.PointerProperty(type=prop.BIMSnapProperties)
     bpy.types.Scene.BIMSnapGroups = bpy.props.PointerProperty(type=prop.BIMSnapGroups)
@@ -337,6 +350,10 @@ def unregister():
     global icons
 
     bpy.utils.previews.remove(icons)
+
+    from bonsai.bim.module.drawing import gizmo_textures
+
+    gizmo_textures.clear_cache()
 
     unregister_classes(classes)
 

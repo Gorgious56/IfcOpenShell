@@ -24,9 +24,11 @@ are pure-math wrappers over ``bonsai.core.model``."""
 
 from __future__ import annotations
 
+from collections import deque
 from typing import TYPE_CHECKING, TypedDict
 
 import ifcopenshell
+import ifcopenshell.util.element
 import ifcopenshell.util.representation
 import ifcopenshell.util.unit
 from mathutils import Vector
@@ -175,3 +177,150 @@ class Wall(bonsai.core.tool.Wall):
                 "(e.g. a brep mesh or boolean result without a base extrusion)."
             )
         return None
+
+    @classmethod
+    def has_layer2_usage(cls, wall: ifcopenshell.entity_instance) -> bool:
+        """True iff ``wall`` is a LAYER2 parametric wall (has ``IfcMaterialLayerSetUsage``
+        with ``LayerSetDirection == AXIS2``). Required by every parametric wall edit —
+        non-LAYER2 walls (brep / freeform bodies) cannot be driven by axis + thickness."""
+        return tool.Model.get_usage_type(wall) == "LAYER2"
+
+    @classmethod
+    def is_straight_axis(cls, wall: ifcopenshell.entity_instance) -> bool:
+        """True iff the wall's Axis representation is a single straight line segment.
+
+        Curved-axis walls (e.g. a fillet corner inserted between two straight walls)
+        report ``False`` so callers gate them out of operations that assume a straight
+        reference line. The check inspects the ``Plan/Axis/GRAPH_VIEW`` representation
+        when present; falls back to True when no Axis representation exists (the
+        ``Body`` extrusion alone is implicitly straight)."""
+        axis_rep = ifcopenshell.util.representation.get_representation(wall, "Plan", "Axis", "GRAPH_VIEW")
+        if axis_rep is None or not axis_rep.Items:
+            return True
+        for item in axis_rep.Items:
+            if item.is_a("IfcPolyline"):
+                if len(item.Points) != 2:
+                    return False
+            elif item.is_a("IfcIndexedPolyCurve"):
+                # An ``IfcIndexedPolyCurve`` is straight only when (a) its
+                # ``Points`` list holds exactly two points and (b) it has no
+                # ``Segments`` or only ``IfcLineIndex`` segments. Any ``IfcArcIndex``
+                # makes it curved.
+                segments = getattr(item, "Segments", None)
+                if segments:
+                    for seg in segments:
+                        if seg.is_a("IfcArcIndex"):
+                            return False
+                point_list = item.Points
+                point_coords = getattr(point_list, "CoordList", None) if point_list else None
+                if point_coords and len(point_coords) > 2:
+                    return False
+            else:
+                # Trimmed curve, composite curve, B-spline — definitely curved.
+                return False
+        return True
+
+    @classmethod
+    def get_world_reference_line(cls, obj: bpy.types.Object) -> tuple[Vector, Vector] | None:
+        """World-space endpoints of the wall's IFC reference line, in Blender units.
+
+        Returns ``(p1, p2)`` as 3D vectors with the wall's local Z preserved.
+        Returns ``None`` when the wall has no IFC element or no readable
+        reference line. Anchors to the IFC reference line, not the mesh bound
+        box, so it stays correct when the mesh is stale or trimmed past the
+        IFC axis endpoints."""
+        element = tool.Ifc.get_entity(obj)
+        if element is None:
+            return None
+        try:
+            p1, p2 = ifcopenshell.util.representation.get_reference_line(element)
+        except Exception:
+            return None
+        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
+        local_p1 = Vector((p1[0] * unit_scale, p1[1] * unit_scale, 0.0))
+        local_p2 = Vector((p2[0] * unit_scale, p2[1] * unit_scale, 0.0))
+        return obj.matrix_world @ local_p1, obj.matrix_world @ local_p2
+
+    @classmethod
+    def walk_connected_walls(
+        cls,
+        start_element: ifcopenshell.entity_instance,
+        node_cap: int = 5000,
+    ) -> list[ifcopenshell.entity_instance]:
+        """BFS over ``IfcRelConnectsPathElements`` from ``start_element``.
+
+        Returns every ``IfcWall`` reachable in either direction (relating /
+        related side of the relation) in BFS order with ``start_element``
+        first. Stops when ``node_cap`` walls have been visited so a corrupt
+        or massive network can't lock up a draw callback. Non-wall path
+        elements (e.g. ``IfcRoof``, ``IfcSlab``) are traversed but not
+        collected — they may bridge two disjoint wall runs.
+
+        Mirror of ``tool.System.walk_connected_mep_elements``."""
+        if not start_element.is_a("IfcWall"):
+            return []
+        result: list[ifcopenshell.entity_instance] = []
+        visited: set[int] = set()
+        queue: deque[ifcopenshell.entity_instance] = deque([start_element])
+        while queue and len(visited) < node_cap:
+            element = queue.popleft()
+            if element.id() in visited:
+                continue
+            visited.add(element.id())
+            if element.is_a("IfcWall"):
+                result.append(element)
+            # ``ConnectedTo`` / ``ConnectedFrom`` are the IFC inverse
+            # attributes that expose the relations where this element
+            # is the relating / related side respectively.
+            for rel in getattr(element, "ConnectedTo", []) or ():
+                if rel.is_a("IfcRelConnectsPathElements"):
+                    neighbor = rel.RelatedElement
+                    if neighbor is not None and neighbor.id() not in visited:
+                        queue.append(neighbor)
+            for rel in getattr(element, "ConnectedFrom", []) or ():
+                if rel.is_a("IfcRelConnectsPathElements"):
+                    neighbor = rel.RelatingElement
+                    if neighbor is not None and neighbor.id() not in visited:
+                        queue.append(neighbor)
+        return result
+
+    @classmethod
+    def compute_wall_fillet_geometry(
+        cls,
+        wall_a_obj: bpy.types.Object,
+        wall_b_obj: bpy.types.Object,
+        radius: float,
+        arc_resolution: int = 24,
+    ) -> dict | None:
+        """Compute fillet geometry between two walls in world space.
+
+        Returns a dict augmented with ``profile_thickness`` and ``height`` from
+        the active (A) wall's LAYER2 parameters, plus ``wall_type_id`` and
+        ``x_angle``. Returns ``None`` when either wall lacks a reference line
+        or LAYER2 usage."""
+        axis_a = cls.get_world_reference_line(wall_a_obj)
+        axis_b = cls.get_world_reference_line(wall_b_obj)
+        if axis_a is None or axis_b is None:
+            return None
+
+        wall_a = tool.Ifc.get_entity(wall_a_obj)
+        if wall_a is None or not cls.has_layer2_usage(wall_a):
+            return None
+
+        seg_a = ((axis_a[0].x, axis_a[0].y, axis_a[0].z), (axis_a[1].x, axis_a[1].y, axis_a[1].z))
+        seg_b = ((axis_b[0].x, axis_b[0].y, axis_b[0].z), (axis_b[1].x, axis_b[1].y, axis_b[1].z))
+        result = bonsai.core.model.compute_fillet_polylines(seg_a, seg_b, radius, arc_resolution)
+
+        layers = tool.Model.get_material_layer_parameters(wall_a)
+        length_height = cls.get_length_and_height(wall_a)
+        wall_type = ifcopenshell.util.element.get_type(wall_a)
+        result.update(
+            {
+                "profile_thickness": layers["thickness"],
+                "profile_offset": layers["offset"],
+                "height": length_height[1] if length_height else None,
+                "x_angle": cls.get_x_angle(wall_a) or 0.0,
+                "wall_type_id": wall_type.id() if wall_type else None,
+            }
+        )
+        return result

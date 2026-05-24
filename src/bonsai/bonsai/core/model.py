@@ -186,9 +186,9 @@ class RequireLayeredElement(Exception):
 def baseline_from_offset(offset: float, thickness: float, tolerance: float = 0.001) -> str:
     """Classify a numeric layer offset as EXTERIOR / CENTER / INTERIOR.
 
-    Mirrors the math in ``tool.Model.offset_wall`` for both POSITIVE and NEGATIVE
-    direction_sense walls. Returns the closest canonical baseline; falls back to
-    ``"CENTER"`` when nothing is within ``tolerance``."""
+    Handles both POSITIVE and NEGATIVE direction_sense walls. Returns the
+    closest canonical baseline; falls back to ``"CENTER"`` when nothing is
+    within ``tolerance``."""
     candidates = (
         ("EXTERIOR", 0.0),
         ("CENTER", -thickness / 2),
@@ -234,31 +234,20 @@ def project_axis_intersection(
 
 
 def opening_is_past_cut(min_t: float, cut_percentage: float) -> bool:
-    """True when the opening's near edge sits past the cut on the t axis —
-    the lower-t wall (element1) must drop the opening; the high-t side keeps it.
+    """True when the opening's near edge sits past the cut on the t axis.
 
-    Strict inequality is load-bearing: a boundary-only touch
-    (``min_t == cut_percentage``) keeps the opening on element1. A degenerate
-    extent sitting exactly on the cut must NOT be removed from both walls —
-    that would leave the user with two walls and no hole anywhere. NaN inputs
-    compare False and so leave the opening on both walls — the safe default
-    when the upstream extent helper cannot resolve a true bounding range."""
+    Strict inequality is load-bearing: a boundary touch or NaN keeps the
+    opening on both walls — the safe default when extent resolution fails."""
     return min_t > cut_percentage
 
 
 def opening_is_before_cut(max_t: float, cut_percentage: float) -> bool:
-    """Mirror of ``opening_is_past_cut`` for the high-t side — the wall on
-    the higher-t side (element2) drops the opening when its far edge sits
-    before the cut. Strict inequality carries the same boundary invariant;
-    NaN inputs leave the opening on both walls."""
+    """True when the opening's far edge sits before the cut on the t axis."""
     return max_t < cut_percentage
 
 
 def opening_straddles_cut(min_t: float, max_t: float, cut_percentage: float) -> bool:
-    """True when the opening's extent crosses the cut on the t axis — both
-    walls' bodies need cutting, so the neighbour wall gets a pure-void copy.
-    Strict inequalities: a boundary touch is not a straddle (handled by the
-    two single-sided predicates above). NaN inputs return False."""
+    """True when the opening's extent crosses the cut on the t axis."""
     return min_t < cut_percentage < max_t
 
 
@@ -272,27 +261,11 @@ def classify_wall_join_state(
     parallel_threshold: float,
     collinear_tolerance: float,
 ) -> tuple[WallJoinState, Optional[tuple[float, float, float]]]:
-    """Classify the geometric state of a wall pair as one of four mutually
-    exclusive outcomes. Centralising the decision in one function keeps
-    independent callers in lockstep — adding a state or re-ordering priority
-    cannot be forgotten in one branch.
+    """Classify a wall pair's geometric state — ``(state, intersection)``.
 
-    Returns ``(state, intersection)``. The intersection point is non-None
-    only for the ``"intersect"`` branch; callers that need it can read it
-    here without recomputing the axis intersection.
-
-    Branches, in priority order:
-
-    - ``("joined", None)`` — caller-supplied flag asserting an
-      ``IfcRelConnectsPathElements`` exists between the two walls. The IFC
-      inverse-graph query is bim-layer code; this function stays pure.
-    - ``("collinear", None)`` — the two axes are parallel within
-      ``parallel_threshold`` AND lie on the same infinite line within
-      ``collinear_tolerance``.
-    - ``("intersect", (x, y, z))`` — the two axes meet at a non-parallel angle
-      and the projected intersection is the second element.
-    - ``("none", None)`` — the axes are parallel but not collinear (no
-      meaningful intersection to anchor a join on)."""
+    Priority: ``"joined"`` (caller-supplied flag) → ``"collinear"`` →
+    ``"intersect"`` (projected point returned) → ``"none"`` (parallel,
+    non-collinear)."""
     if are_joined:
         return "joined", None
     if are_axes_collinear(seg_a, seg_b, parallel_threshold, collinear_tolerance):
@@ -308,18 +281,11 @@ def wall_join_preview_lines(
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
     intersection: tuple[float, float, float],
 ) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
-    """Two line segments showing how each wall axis would extend to reach a
-    precomputed XY intersection.
+    """Two segments showing each wall axis extending to ``intersection``.
 
-    Each segment goes from the input axis endpoint nearest the intersection
-    to the intersection itself, held at the originating axis's own Z so the
-    segment stays horizontal at that wall's floor level — even when the two
-    walls sit at different elevations.
-
-    Returned in input order ``[floor_a, floor_b]`` so callers can map line
-    index back to the two input segments. The caller supplies the
-    intersection (rather than this function recomputing it) so the math can
-    be shared with whichever upstream step also needed it."""
+    Each segment runs from the input axis's nearest endpoint to the
+    intersection, held at that wall's own Z. Returned in input order
+    ``[floor_a, floor_b]``."""
     ix, iy, _ = intersection
 
     def _nearest(seg: tuple[tuple[float, float, float], tuple[float, float, float]]) -> tuple[float, float, float]:
@@ -351,20 +317,16 @@ def resolve_extend_walls_target(
 
 
 def displacement_from_x_angle(height: float, x_angle: float) -> float:
-    """Top-edge horizontal displacement for a wall of given vertical ``height`` and
-    slope ``x_angle`` (radians). Drives the slope dimension gizmo's display value.
-
-    Inverse of :func:`x_angle_from_displacement`."""
+    """Top-edge horizontal displacement for a wall of given vertical ``height``
+    and slope ``x_angle`` (radians). Inverse of ``x_angle_from_displacement``."""
     return height * math.tan(x_angle)
 
 
 def x_angle_from_displacement(height: float, displacement: float) -> float:
     """Recover slope ``x_angle`` (radians) from a top-edge horizontal displacement.
 
-    ``height`` is clamped to ``max(height, 1e-6)`` so vertical walls of effectively
-    zero height map cleanly to ``±π/2`` via ``atan2`` rather than dividing by zero.
-
-    Inverse of :func:`displacement_from_x_angle`."""
+    ``height`` is clamped to ``max(height, 1e-6)`` so zero-height walls map
+    cleanly to ``±π/2`` instead of dividing by zero."""
     return math.atan2(displacement, max(height, 1e-6))
 
 
@@ -378,15 +340,8 @@ def vertical_height_from_extrusion_depth(extrusion_depth: float, x_angle: float)
 
 
 def extrusion_depth_from_vertical_height(vertical_height: float, x_angle: float) -> float:
-    """Slanted extrusion depth for a wall of given vertical height and slope.
-
-    The extrusion runs along a direction tilted by ``x_angle`` from vertical,
-    so the slanted depth is ``vertical_height / cos(x_angle)``. ``cos(x_angle)``
-    is clamped to ``1e-6`` to keep the result finite as ``x_angle`` approaches
-    ``±π/2`` (a wall extruded fully horizontally has no meaningful vertical
-    height to convert from).
-
-    Unit-agnostic: the result is in the same units as ``vertical_height``."""
+    """``vertical_height / cos(x_angle)`` with ``cos`` clamped at ``1e-6`` to
+    stay finite near ``±π/2``."""
     return vertical_height / max(abs(math.cos(x_angle)), 1e-6)
 
 
@@ -396,14 +351,10 @@ def length_and_height_from_extrusion(
     reference_line_x_extent: float,
     unit_scale: float,
 ) -> tuple[float, float]:
-    """SI length and vertical height of a LAYER2 wall from its IFC primitives.
+    """SI ``(length, vertical_height)`` of a LAYER2 wall.
 
-    Caller has already pulled the four primitives off the wall's Body
-    ``IfcExtrudedAreaSolid``: the slanted ``Depth``, the extrusion ``x_angle``,
-    the X-extent of the wall's reference-line polyline, and the file's unit
-    scale. Length is the reference-line extent scaled to SI; height is the
-    *vertical* projection of the slanted depth (``depth * cos(x_angle)``),
-    not the slanted depth itself."""
+    Height is the *vertical* projection of the slanted depth, not the
+    slanted depth itself."""
     length = reference_line_x_extent * unit_scale
     height = vertical_height_from_extrusion_depth(extrusion_depth * unit_scale, x_angle)
     return length, height
@@ -419,12 +370,7 @@ def are_axes_collinear(
 
     Two conditions: directions must be (anti-)parallel within ``parallel_threshold``
     (``cos(2°) ≈ 0.9994``), AND any endpoint of B must lie on A's infinite line
-    within ``line_tolerance``. Plan-only (Z ignored) — two parallel walls at
-    different elevations are still considered collinear because the merge operator
-    handles Z resolution itself.
-
-    Used by the wall-join gizmo's state machine: collinear pair → Merge icon at the
-    boundary, perpendicular pair → Join icon at the intersection."""
+    within ``line_tolerance``. Plan-only (Z ignored)."""
     d1x, d1y = seg_a[1][0] - seg_a[0][0], seg_a[1][1] - seg_a[0][1]
     d2x, d2y = seg_b[1][0] - seg_b[0][0], seg_b[1][1] - seg_b[0][1]
     d1_len = (d1x * d1x + d1y * d1y) ** 0.5
@@ -449,11 +395,7 @@ def closest_endpoint_midpoint(
     seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
 ) -> tuple[float, float, float]:
-    """Midpoint of the closest pair of endpoints between two segments.
-
-    For walls that meet end-to-end this is the shared corner; for walls with a
-    small gap it's the midpoint of the gap. Either way it's the user-meaningful
-    "boundary" where a merge would graft the two segments together."""
+    """Midpoint of the closest endpoint pair between two segments."""
     endpoints_a = (seg_a[0], seg_a[1])
     endpoints_b = (seg_b[0], seg_b[1])
 
@@ -472,21 +414,11 @@ def compute_path_connection_location(
     other_conn_type: str,
     parallel_threshold: float = 0.9994,
 ) -> tuple[float, float, float]:
-    """World-space location of a single ``IfcRelConnectsPathElements`` between two
-    wall axes, given each wall's connection type (``ATSTART`` | ``ATEND`` | ``ATPATH``
-    | ``NOTDEFINED``).
+    """World-space location of a single ``IfcRelConnectsPathElements`` between
+    two wall axes.
 
-    The physical join sits at whichever wall has an end-type connection: an end-joined
-    wall ends AT the join, while an ATPATH wall passes THROUGH it. Priority order:
-
-    1. ``self`` is ATSTART/ATEND → that endpoint of ``self``.
-    2. Else ``other`` is ATSTART/ATEND → that endpoint of ``other``.
-    3. Else (both ATPATH or NOTDEFINED — cross junction or under-specified):
-       fall back to the 2D axis intersection. If the axes are parallel,
-       degenerate to :func:`closest_endpoint_midpoint` so the caller still gets
-       a usable point on screen rather than ``None``.
-
-    Pure tuple-in/tuple-out — runs in the core test lane without ``mathutils``."""
+    Priority: ``self``'s ATSTART/ATEND endpoint → ``other``'s ATSTART/ATEND
+    endpoint → axis intersection → closest-endpoint midpoint fallback."""
     if self_conn_type == "ATSTART":
         return seg_self[0]
     if self_conn_type == "ATEND":
@@ -499,3 +431,183 @@ def compute_path_connection_location(
     if intersection is not None:
         return intersection
     return closest_endpoint_midpoint(seg_self, seg_other)
+
+
+def _vec_sub(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vec_dot(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vec_cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _vec_length(v: tuple[float, float, float]) -> float:
+    return (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+
+
+def _rotate_around_axis(
+    v: tuple[float, float, float],
+    axis: tuple[float, float, float],
+    angle: float,
+) -> tuple[float, float, float]:
+    """Rotate ``v`` around unit-length ``axis`` by ``angle`` radians."""
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    dot = _vec_dot(axis, v)
+    cross = _vec_cross(axis, v)
+    k = 1.0 - cos_a
+    return (
+        v[0] * cos_a + cross[0] * sin_a + axis[0] * dot * k,
+        v[1] * cos_a + cross[1] * sin_a + axis[1] * dot * k,
+        v[2] * cos_a + cross[2] * sin_a + axis[2] * dot * k,
+    )
+
+
+def compute_fillet_polylines(
+    seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
+    seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
+    radius: float,
+    arc_resolution: int = 24,
+    parallel_threshold: float = 0.9994,
+) -> dict:
+    """Preview polylines for a circular fillet at the junction of two axes.
+
+    Returns a dict with ``valid``, ``reason``, ``intersection``, ``tangent_a``
+    / ``tangent_b``, ``arc`` (``arc_resolution + 1`` samples), ``arc_center``,
+    ``arc_radius``, ``sweep_angle``, ``sweep_axis``, ``tangent_offset``,
+    ``wall_a_join_side`` / ``wall_b_join_side`` (ATSTART/ATEND/None),
+    ``invalid_radius`` (tangent overshoots — arc + tangents still populated
+    for warning rendering), and ``invalid_axes`` (set on parallel)."""
+    blank: dict = {
+        "valid": False,
+        "reason": None,
+        "intersection": None,
+        "tangent_a": None,
+        "tangent_b": None,
+        "arc": [],
+        "arc_center": None,
+        "arc_radius": radius,
+        "sweep_angle": 0.0,
+        "sweep_axis": None,
+        "tangent_offset": 0.0,
+        "wall_a_join_side": None,
+        "wall_b_join_side": None,
+        "invalid_radius": False,
+        "invalid_axes": None,
+    }
+
+    intersection = project_axis_intersection(seg_a, seg_b, parallel_threshold)
+    if intersection is None:
+        return {**blank, "reason": "parallel", "invalid_axes": [seg_a, seg_b]}
+
+    def _classify(seg, ipt):
+        d0 = (seg[0][0] - ipt[0]) ** 2 + (seg[0][1] - ipt[1]) ** 2 + (seg[0][2] - ipt[2]) ** 2
+        d1 = (seg[1][0] - ipt[0]) ** 2 + (seg[1][1] - ipt[1]) ** 2 + (seg[1][2] - ipt[2]) ** 2
+        if d0 <= d1:
+            return seg[0], seg[1], "ATSTART"
+        return seg[1], seg[0], "ATEND"
+
+    near_a, far_a, side_a = _classify(seg_a, intersection)
+    near_b, far_b, side_b = _classify(seg_b, intersection)
+
+    # Direction along each segment AWAY from the corner. ``far - intersection``
+    # handles both the shared-corner and extended-axes cases uniformly.
+    dir_a_raw = _vec_sub(far_a, intersection)
+    dir_b_raw = _vec_sub(far_b, intersection)
+    far_len_a = _vec_length(dir_a_raw)
+    far_len_b = _vec_length(dir_b_raw)
+    if far_len_a < 1e-9 or far_len_b < 1e-9:
+        return {**blank, "reason": "near_collinear", "intersection": intersection}
+    dir_a = (dir_a_raw[0] / far_len_a, dir_a_raw[1] / far_len_a, dir_a_raw[2] / far_len_a)
+    dir_b = (dir_b_raw[0] / far_len_b, dir_b_raw[1] / far_len_b, dir_b_raw[2] / far_len_b)
+
+    cos_angle = max(-1.0, min(1.0, _vec_dot(dir_a, dir_b)))
+    angle = math.acos(cos_angle)
+    sweep_angle = math.pi - angle
+    if sweep_angle < 1e-3 or sweep_angle > math.pi - 1e-3:
+        return {
+            **blank,
+            "reason": "near_collinear",
+            "intersection": intersection,
+            "sweep_angle": sweep_angle,
+            "wall_a_join_side": side_a,
+            "wall_b_join_side": side_b,
+        }
+
+    tangent_offset = radius * math.tan(sweep_angle / 2)
+    tangent_a = (
+        intersection[0] + dir_a[0] * tangent_offset,
+        intersection[1] + dir_a[1] * tangent_offset,
+        intersection[2] + dir_a[2] * tangent_offset,
+    )
+    tangent_b = (
+        intersection[0] + dir_b[0] * tangent_offset,
+        intersection[1] + dir_b[1] * tangent_offset,
+        intersection[2] + dir_b[2] * tangent_offset,
+    )
+
+    plane_normal_raw = _vec_cross(dir_a, dir_b)
+    pn_len = _vec_length(plane_normal_raw)
+    if pn_len < 1e-9:
+        return {**blank, "reason": "near_collinear", "intersection": intersection}
+    plane_normal = (
+        plane_normal_raw[0] / pn_len,
+        plane_normal_raw[1] / pn_len,
+        plane_normal_raw[2] / pn_len,
+    )
+
+    perp_a = _vec_cross(plane_normal, dir_a)
+    if _vec_dot(perp_a, dir_b) < 0:
+        perp_a = (-perp_a[0], -perp_a[1], -perp_a[2])
+
+    arc_center = (
+        tangent_a[0] + perp_a[0] * radius,
+        tangent_a[1] + perp_a[1] * radius,
+        tangent_a[2] + perp_a[2] * radius,
+    )
+
+    v_a = _vec_sub(tangent_a, arc_center)
+    v_b = _vec_sub(tangent_b, arc_center)
+    sweep_axis = plane_normal
+    if _vec_dot(_vec_cross(v_a, v_b), plane_normal) < 0:
+        sweep_axis = (-plane_normal[0], -plane_normal[1], -plane_normal[2])
+
+    arc_points: list[tuple[float, float, float]] = []
+    for i in range(arc_resolution + 1):
+        t = i / arc_resolution
+        rotated = _rotate_around_axis(v_a, sweep_axis, sweep_angle * t)
+        arc_points.append(
+            (
+                arc_center[0] + rotated[0],
+                arc_center[1] + rotated[1],
+                arc_center[2] + rotated[2],
+            )
+        )
+
+    # Overshoot check only for convex fillets (positive ``tangent_offset``);
+    # the inverted-fillet case puts tangents past the intersection.
+    invalid_radius = tangent_offset > 0 and (tangent_offset > far_len_a or tangent_offset > far_len_b)
+
+    return {
+        "valid": not invalid_radius,
+        "reason": "invalid_radius" if invalid_radius else None,
+        "intersection": intersection,
+        "tangent_a": tangent_a,
+        "tangent_b": tangent_b,
+        "arc": arc_points,
+        "arc_center": arc_center,
+        "arc_radius": radius,
+        "sweep_angle": sweep_angle,
+        "sweep_axis": sweep_axis,
+        "tangent_offset": tangent_offset,
+        "wall_a_join_side": side_a,
+        "wall_b_join_side": side_b,
+        "leg_a_available": far_len_a,
+        "leg_b_available": far_len_b,
+        "invalid_radius": invalid_radius,
+        "invalid_axes": None,
+    }

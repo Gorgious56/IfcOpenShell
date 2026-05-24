@@ -48,6 +48,7 @@ from bonsai.bim.module.model.decorator import (
     MEPSystemPathDecorator,
     SlabDirectionDecorator,
     WallAxisDecorator,
+    WallFilletPreviewDecorator,
     WallGizmoPreviewDecorator,
 )
 from bonsai.bim.module.nest.decorator import NestDecorator
@@ -475,6 +476,7 @@ def load_post(scene):
     # first action is the is_active check, so cost is one attribute read
     # per redraw when no bend is being previewed.
     BendPreviewDecorator.install(bpy.context)
+    WallFilletPreviewDecorator.install(bpy.context)
 
     if preferences.should_use_snap and (scene := bpy.context.scene):
         # Snapping is off by default in Blender, but in BIM, it's more useful to be on

@@ -64,6 +64,7 @@ import bonsai.tool as tool
 from bonsai.bim.ifc import IfcStore
 from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
+from bonsai.bim.module.model import preview_base
 from bonsai.bim.module.model.decorator import PolylineDecorator, ProductDecorator
 from bonsai.bim.module.model.polyline import PolylineOperator
 
@@ -278,9 +279,8 @@ class UnjoinWallPathConnection(_CommitWallDraftsFirstMixin, bpy.types.Operator, 
         ]
         for rel in rels:
             bonsai.core.geometry.remove_connection(tool.Geometry, connection=rel)
-        # Mirror DumbWallJoiner.unjoin — recreate body+axis on both walls so the
-        # mesh state matches the IFC mutation (the joiner's clean re-extrusion is
-        # what removes the now-stale miter cuts on the formerly-joined ends).
+        # Recreate body+axis on both walls so the mesh state matches the IFC
+        # mutation; the clean re-extrusion removes the stale miter cuts.
         #
         # The IFC rel removal above is already captured by
         # ``IfcStore.execute_ifc_operator``'s active transaction. If
@@ -368,10 +368,7 @@ class ExtendWallsToWall(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.If
                 and tool.Model.get_usage_type(element) == "LAYER2"
             ):
                 objs.append(obj)
-        # Shift+click semantic: behave as if the user had selected the walls in
-        # reversed order. Logic kept in :func:`core.resolve_extend_walls_target`
-        # so the swap (and its "no-op for n>1" fallback) is unit-testable in
-        # the core lane without bim-layer fixtures.
+        # Shift+click: behave as if the walls were selected in reversed order.
         target_obj, objs = core.resolve_extend_walls_target(target_obj, objs, self.reverse)
         if target_obj and objs:
             if tool.Ifc.is_moved(target_obj):
@@ -877,8 +874,9 @@ class AddWallsFromSlab(bpy.types.Operator, tool.Ifc.Operator):
         self.relating_type = None
         props = tool.Model.get_model_props()
         relating_type_id = props.relating_type_id
-        if relating_type_id:
-            self.relating_type = tool.Ifc.get().by_id(int(relating_type_id))
+        ifc = tool.Ifc.get()
+        if relating_type_id and ifc:
+            self.relating_type = ifc.by_id(int(relating_type_id))
 
     def _execute(self, context):
         if not self.relating_type:
@@ -912,8 +910,9 @@ class DrawPolylineWall(bpy.types.Operator, PolylineOperator, tool.Ifc.Operator):
         self.relating_type = None
         props = tool.Model.get_model_props()
         relating_type_id = props.relating_type_id
-        if relating_type_id:
-            self.relating_type = tool.Ifc.get().by_id(int(relating_type_id))
+        ifc = tool.Ifc.get()
+        if relating_type_id and ifc:
+            self.relating_type = ifc.by_id(int(relating_type_id))
 
     def create_walls_from_polyline(self, context: bpy.types.Context) -> Union[set[str], None]:
         if not self.relating_type:
@@ -1335,11 +1334,14 @@ class DumbWallPlaner:
         total_thickness = sum([l.LayerThickness for l in layer_set.MaterialLayers])
         if not total_thickness:
             return
-        for inverse in tool.Ifc.get().get_inverse(layer_set):
+        ifc = tool.Ifc.get()
+        if ifc is None:
+            return
+        for inverse in ifc.get_inverse(layer_set):
             if not inverse.is_a("IfcMaterialLayerSetUsage") or inverse.LayerSetDirection != "AXIS2":
                 continue
-            if tool.Ifc.get().schema == "IFC2X3":
-                for rel in tool.Ifc.get().get_inverse(inverse):
+            if ifc.schema == "IFC2X3":
+                for rel in ifc.get_inverse(inverse):
                     if not rel.is_a("IfcRelAssociatesMaterial"):
                         continue
                     walls.extend([tool.Ifc.get_object(e) for e in rel.RelatedObjects])
@@ -1468,14 +1470,11 @@ class DumbWallJoiner:
                 description=description,
             )
 
-        # During the duplication process, unfilled voids are copied, so we need
-        # to check openings on both element1 and element2. Each wall keeps the
-        # opening when the opening's axis-projected extent overlaps that wall's
-        # portion of the axis — straddling openings are intentionally kept on
-        # both walls so each wall body gets the appropriate cut. Strict
-        # inequalities mean a boundary-only touch (or a degenerate single-point
-        # extent at the cut) keeps the opening on both walls — the safer
-        # default when the helper cannot resolve a true bounding range.
+        # Unfilled voids are copied during duplication; each wall keeps an
+        # opening whose axis-projected extent overlaps its portion of the
+        # axis. Straddling openings stay on both walls so each body gets the
+        # appropriate cut; strict inequalities keep boundary-only / degenerate
+        # cases on both walls (the safer default).
         for opening in [
             r.RelatedOpeningElement for r in element1.HasOpenings if not r.RelatedOpeningElement.HasFillings
         ]:
@@ -1520,7 +1519,7 @@ class DumbWallJoiner:
                         tool.Ifc.get(), opening.Representation, exclude=["IfcGeometricRepresentationContext"]
                     )
 
-                rel.RelatingOpeningElement = new_opening
+                ifcopenshell.api.feature.add_filling(tool.Ifc.get(), opening=new_opening, element=filling)
 
                 # Remove the old opening
                 ifcopenshell.api.feature.remove_feature(tool.Ifc.get(), feature=opening)
@@ -1993,12 +1992,22 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         ),
     ]
 
-    props_getter = "get_wall_props"
+    props_getter = tool.Model.get_wall_props
     gizmo_pref_name = "wall"
 
     @classmethod
     def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
-        return tool.Blender.Modifier.is_wall(element)
+        if not tool.Blender.Modifier.is_wall(element):
+            return False
+        # Fillet corner walls have a hand-built curved body; the parametric
+        # length/height/x_angle edit operators all dispatch through
+        # ``regenerate_wall_representation`` which would flatten the curve.
+        # Hiding the entire edition gizmo group here is cheaper than gating
+        # each operator individually and gives the user no surface that could
+        # destroy the fillet.
+        if _is_fillet_corner_wall(element):
+            return False
+        return True
 
     def get_icon_y_extent(self, props: "BIMWallProperties") -> tuple[float, float]:
         far = props.offset + props.thickness + 2 * self.GIZMO_OFFSET
@@ -2016,9 +2025,8 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         - When viewing from -Y: place handles at wall-local Y = ``offset - GIZMO_OFFSET``.
         - When viewing from +Y: place handles at wall-local Y = ``offset + thickness + GIZMO_OFFSET``.
 
-        Slope (``x_angle``) is intentionally NOT view-flipped — it lives at the wall
-        axis centerline because the gizmo IS the Y-displacement indicator. Flipping
-        it would invert the drag direction relative to the user's pointer motion."""
+        Slope (``x_angle``) is NOT view-flipped — flipping it would invert the
+        drag direction relative to the user's pointer motion."""
         viewing_from_neg_y, _ = self._frame_view_dir
         y_camera_side = self.get_camera_facing_outer_y(
             viewing_from_neg_y,
@@ -2096,50 +2104,8 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         """
         default_color, highlight_color = self.get_decoration_colors()
         warning_highlight_color = gizmo.get_warning_color_from_prefs(self.get_addon_prefs())
-        self.split_gizmo = self._setup_icon_gizmo(
-            "VIEW3D_GT_split",
-            default_color,
-            "bim.split_wall_at_cursor",
-            warning_highlight_color,
-        )
-        self.extend_x_gizmo = self._setup_icon_gizmo(
-            "VIEW3D_GT_extend",
-            default_color,
-            "bim.extend_wall_to_cursor",
-            highlight_color,
-        )
-        self.extend_z_gizmo = self._setup_icon_gizmo(
-            "VIEW3D_GT_extend_vertical",
-            default_color,
-            "bim.extend_wall_height_to_cursor",
-            highlight_color,
-        )
-        # Three baseline-state icons — only one is visible at a time, picked by
-        # the current props.desired_offset_baseline. All point to the same cycle
-        # operator so clicking any of them advances the cycle.
-        for baseline, attr_name in self._BASELINE_GIZMO_ATTRS.items():
-            setattr(
-                self,
-                attr_name,
-                self._setup_icon_gizmo(
-                    f"VIEW3D_GT_offset_{baseline.lower()}",
-                    default_color,
-                    "bim.cycle_wall_offset",
-                    highlight_color,
-                ),
-            )
-        self.rotate_gizmo = self._setup_icon_gizmo(
-            "VIEW3D_GT_cycle",
-            default_color,
-            "bim.rotate_wall_90",
-            highlight_color,
-        )
-        self.toggle_openings_gizmo = self._setup_icon_gizmo(
-            "VIEW3D_GT_add_opening",
-            default_color,
-            "bim.toggle_wall_openings",
-            highlight_color,
-        )
+        _setup_cursor_anchored_gizmos(self, default_color, highlight_color, warning_highlight_color)
+        _setup_icon_row_extras(self, default_color, highlight_color)
         if context.region is not None:
             type(self)._active_instances[context.region.as_pointer()] = weakref.ref(self)
 
@@ -2157,144 +2123,172 @@ class GizmoWallEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
 
     def _refresh_element_specific(self, context: bpy.types.Context, mw: Matrix, props: "BIMWallProperties") -> None:
         """Position cursor-anchored gizmos and the wall-specific icon-row extras."""
-        self._update_cursor_gizmos(context, mw, props)
-        self._update_icon_row_extras(context, mw, props)
+        _position_cursor_anchored_gizmos(self, context, mw, props)
+        _position_icon_row_extras(self, context, mw, props)
 
     # World-Z spacing between stacked cursor icons. ~0.3m is ~1.5× icon diameter
     # at default scale, leaving a small visual gap between consecutive icons.
     CURSOR_STACK_OFFSET = 0.3
 
-    def _update_cursor_gizmos(self, context: bpy.types.Context, mw: Matrix, props: "BIMWallProperties") -> None:
-        """Position the cursor-anchored icons (extend-X / extend-Z / split) on the wall
-        axis at the cursor's projected X, each at the Z its action would land at.
 
-        Visible whenever the wall is parametrically editable, regardless of
-        ``props.is_editing``. The backing operators are one-shot IFC mutations
-        that go straight through ``ifcopenshell.api`` — there's no draft state
-        to require an explicit edit mode, and exposing them at all times lets
-        the user click-to-act without first entering edit mode.
+def _setup_cursor_anchored_gizmos(
+    group: "GizmoWallEdition",
+    default_color: tuple[float, float, float, float],
+    highlight_color: tuple[float, float, float, float],
+    warning_highlight_color: tuple[float, float, float, float],
+) -> None:
+    group.split_gizmo = group._setup_icon_gizmo(
+        "VIEW3D_GT_split",
+        default_color,
+        "bim.split_wall_at_cursor",
+        warning_highlight_color,
+    )
+    group.extend_x_gizmo = group._setup_icon_gizmo(
+        "VIEW3D_GT_extend",
+        default_color,
+        "bim.extend_wall_to_cursor",
+        highlight_color,
+    )
+    group.extend_z_gizmo = group._setup_icon_gizmo(
+        "VIEW3D_GT_extend_vertical",
+        default_color,
+        "bim.extend_wall_height_to_cursor",
+        highlight_color,
+    )
 
-        When two icons want the same Z (within ``CURSOR_STACK_OFFSET``), bump the
-        lower-priority one upward so both stay clickable. Priority low → high:
-        extend-X, extend-Z, split. Bumps cascade — bumping extend-Z up can in turn
-        collide with split, so extend-Z gets bumped further to clear it."""
-        if not hasattr(self, "split_gizmo"):
-            return
-        all_gizmos = (self.extend_x_gizmo, self.extend_z_gizmo, self.split_gizmo)
-        cursor_world = context.scene.cursor.location
-        cursor_local = mw.inverted() @ cursor_world
-        in_range = props.anchor_x < cursor_local.x < props.anchor_x + props.length
-        billboard_rot = self._frame_billboard_rot
-        top_down = tool.Blender.is_view_top_down(context)
 
-        # Candidates ordered by priority (lowest first). Each is (gizmo, local_z).
-        # The local X and Y are common: at the cursor's projected X on the axis.
-        # extend-Z is skipped in plan view — a vertical-intent gizmo has no
-        # readable cue when the camera is looking along world Z, and clicking
-        # one would mutate the wall in a direction the user can't see change.
-        candidates: list[tuple[bpy.types.Gizmo, float]] = [(self.extend_x_gizmo, 0.0)]
-        if not top_down:
-            candidates.append((self.extend_z_gizmo, cursor_local.z))
-        if in_range:
-            # props.height is the vertical (world-Z) height; convert to wall-local Z so
-            # the icon lands on the slanted top edge for sloped walls (x_angle != 0).
-            split_local_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle)
-            candidates.append((self.split_gizmo, split_local_z))
+def _setup_icon_row_extras(
+    group: "GizmoWallEdition",
+    default_color: tuple[float, float, float, float],
+    highlight_color: tuple[float, float, float, float],
+) -> None:
+    """Set up baseline / rotate-90 / toggle-openings icons. All three
+    baseline icons share one cycle operator so clicking any advances the
+    baseline."""
+    for baseline, attr_name in GizmoWallEdition._BASELINE_GIZMO_ATTRS.items():
+        setattr(
+            group,
+            attr_name,
+            group._setup_icon_gizmo(
+                f"VIEW3D_GT_offset_{baseline.lower()}",
+                default_color,
+                "bim.cycle_wall_offset",
+                highlight_color,
+            ),
+        )
+    group.rotate_gizmo = group._setup_icon_gizmo(
+        "VIEW3D_GT_cycle",
+        default_color,
+        "bim.rotate_wall_90",
+        highlight_color,
+    )
+    group.toggle_openings_gizmo = group._setup_icon_gizmo(
+        "VIEW3D_GT_add_opening",
+        default_color,
+        "bim.toggle_wall_openings",
+        highlight_color,
+    )
 
-        # Resolve collisions: walk in priority order and ensure each gizmo's
-        # final Z is at least CURSOR_STACK_OFFSET above the previous one (when
-        # the previous one's final Z is higher).
-        resolved: list[tuple[bpy.types.Gizmo, float]] = []
-        for gz, desired_z in candidates:
-            final_z = desired_z
-            for _, prev_z in resolved:
-                if abs(final_z - prev_z) < self.CURSOR_STACK_OFFSET:
-                    # Bump up to clear the previous gizmo's slot.
-                    final_z = prev_z + self.CURSOR_STACK_OFFSET
-            resolved.append((gz, final_z))
 
-        for gz in all_gizmos:
-            gz.hide = True
-        # In plan / top-down views every world-Z slot projects to the same
-        # on-screen point — the remaining cursor gizmos would sit on top of
-        # each other at the projected cursor X. Swap world-Z stacking for
-        # screen-up stacking so each icon stays individually clickable;
-        # preserve the resolved priority order so the visual order matches 3D.
-        if top_down:
-            screen_up = tool.Blender.get_screen_up_world(context)
-            base_world = mw @ Vector((cursor_local.x, 0.0, 0.0))
-            for index, (gz, _local_z) in enumerate(resolved):
-                gz.hide = self.is_gizmo_hidden_by_modal(gz)
-                world_pos = base_world + screen_up * (index * self.CURSOR_STACK_OFFSET)
+def _position_cursor_anchored_gizmos(
+    group: "GizmoWallEdition",
+    context: bpy.types.Context,
+    mw: Matrix,
+    props: "BIMWallProperties",
+) -> None:
+    """Position the cursor-anchored icons (extend-X / extend-Z / split) on the wall
+    axis at the cursor's projected X.
+
+    Colliding icons stack at ``CURSOR_STACK_OFFSET`` increments; priority
+    low → high: extend-X, extend-Z, split."""
+    if not hasattr(group, "split_gizmo"):
+        return
+    all_gizmos = (group.extend_x_gizmo, group.extend_z_gizmo, group.split_gizmo)
+    cursor_world = context.scene.cursor.location
+    cursor_local = mw.inverted() @ cursor_world
+    in_range = props.anchor_x < cursor_local.x < props.anchor_x + props.length
+    billboard_rot = group._frame_billboard_rot
+    top_down = tool.Blender.is_view_top_down(context)
+
+    # extend-Z is skipped in plan view: a vertical-intent gizmo has no readable
+    # cue when the camera is looking along world Z, and clicking one would
+    # mutate the wall in a direction the user can't see change.
+    candidates: list[tuple[bpy.types.Gizmo, float]] = [(group.extend_x_gizmo, 0.0)]
+    if not top_down:
+        candidates.append((group.extend_z_gizmo, cursor_local.z))
+    if in_range:
+        # Convert vertical (world-Z) height to wall-local Z so the icon lands on
+        # the slanted top edge for sloped walls (x_angle != 0).
+        split_local_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle)
+        candidates.append((group.split_gizmo, split_local_z))
+
+    resolved: list[tuple[bpy.types.Gizmo, float]] = []
+    for gz, desired_z in candidates:
+        final_z = desired_z
+        for _, prev_z in resolved:
+            if abs(final_z - prev_z) < group.CURSOR_STACK_OFFSET:
+                final_z = prev_z + group.CURSOR_STACK_OFFSET
+        resolved.append((gz, final_z))
+
+    for gz in all_gizmos:
+        gz.hide = True
+    # In plan / top-down views every world-Z slot projects to the same
+    # on-screen point; swap world-Z stacking for screen-up stacking so each
+    # icon stays individually clickable.
+    if top_down:
+        screen_up = tool.Blender.get_screen_up_world(context)
+        base_world = mw @ Vector((cursor_local.x, 0.0, 0.0))
+        for index, (gz, _local_z) in enumerate(resolved):
+            gz.hide = group.is_gizmo_hidden_by_modal(gz)
+            world_pos = base_world + screen_up * (index * group.CURSOR_STACK_OFFSET)
+            gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+    else:
+        for gz, local_z in resolved:
+            gz.hide = group.is_gizmo_hidden_by_modal(gz)
+            world_pos = mw @ Vector((cursor_local.x, 0.0, local_z))
+            gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+
+
+def _position_icon_row_extras(
+    group: "GizmoWallEdition",
+    context: bpy.types.Context,
+    mw: Matrix,
+    props: "BIMWallProperties",
+) -> None:
+    """Position the wall-specific icons in the icon row."""
+    if not hasattr(group, "rotate_gizmo"):
+        return
+    # Convert vertical (world-Z) height to wall-local Z so the icon row sits
+    # above the slanted top edge for sloped walls.
+    icon_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle) + group.ICON_Z_OFFSET
+    icon_y = group.get_icon_y_offset(context, mw)
+    billboard_rot = group._frame_billboard_rot
+
+    if props.is_editing:
+        # Show only the baseline icon matching ``props.desired_offset_baseline``.
+        for baseline, attr in GizmoWallEdition._BASELINE_GIZMO_ATTRS.items():
+            gz = getattr(group, attr)
+            if baseline == props.desired_offset_baseline:
+                gz.hide = group.is_gizmo_hidden_by_modal(gz)
+                world_pos = mw @ Vector((group.ICON_VALIDATE_X + group.ICON_CYCLE_X, icon_y, icon_z))
                 gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
-        else:
-            for gz, local_z in resolved:
-                gz.hide = self.is_gizmo_hidden_by_modal(gz)
-                world_pos = mw @ Vector((cursor_local.x, 0.0, local_z))
-                gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+            else:
+                gz.hide = True
+    else:
+        for attr in GizmoWallEdition._BASELINE_GIZMO_ATTRS.values():
+            getattr(group, attr).hide = True
 
-    def _update_icon_row_extras(self, context: bpy.types.Context, mw: Matrix, props: "BIMWallProperties") -> None:
-        """Position the wall-specific icons in the icon row.
+    group.rotate_gizmo.hide = group.is_gizmo_hidden_by_modal(group.rotate_gizmo)
+    world_pos = mw @ Vector((group.ICON_VALIDATE_X + group.ICON_ROTATE_X, icon_y, icon_z))
+    group.rotate_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot, scale=group.ROTATE_ICON_SCALE)
 
-        Edit-mode-only icons (visible only when ``props.is_editing``):
-
-        - Three baseline icons (Exterior / Centreline / Interior) share the cycle
-          slot — only the one matching ``props.desired_offset_baseline`` shows.
-          State-bearing: the visible icon tells the user the current baseline.
-
-        Always-visible icons (whenever the wall is parametrically editable):
-
-        - Rotate-90 icon at ``ICON_ROTATE_X``. One-shot IFC mutation, no draft
-          state required, so it joins the click-to-act set alongside the
-          cursor-anchored extend / split gizmos.
-
-        Non-edit-mode icons (visible alongside the pen icon, hidden during edit):
-
-        - Toggle-openings icon next to the pen. Lives outside edit mode because
-          opening visibility is a viewport-display concern, not a wall-edit action.
-
-        Calls ``billboarded_at`` directly rather than routing through
-        ``set_icon_gizmo_position`` because the icon row has wall-specific
-        visibility/state branching (baseline-indicator selection, edit-mode
-        toggle for opening-visibility) that the helper does not model."""
-        if not hasattr(self, "rotate_gizmo"):
-            return
-        # props.height is the vertical (world-Z) height; convert to wall-local Z so
-        # the icon row sits above the slanted top edge for sloped walls (x_angle != 0).
-        icon_z = core.extrusion_depth_from_vertical_height(props.height, props.x_angle) + self.ICON_Z_OFFSET
-        icon_y = self.get_icon_y_offset(context, mw)
-        billboard_rot = self._frame_billboard_rot
-
-        # --- Edit-mode-only icons (baseline indicator) ---
-        if props.is_editing:
-            # Stateful baseline indicator at the cycle slot. Show exactly one of the
-            # three icons (the one matching the current baseline), hide the others.
-            for baseline, attr in self._BASELINE_GIZMO_ATTRS.items():
-                gz = getattr(self, attr)
-                if baseline == props.desired_offset_baseline:
-                    gz.hide = self.is_gizmo_hidden_by_modal(gz)
-                    world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_CYCLE_X, icon_y, icon_z))
-                    gz.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
-                else:
-                    gz.hide = True
-        else:
-            for attr in self._BASELINE_GIZMO_ATTRS.values():
-                getattr(self, attr).hide = True
-
-        # --- Always-visible (when wall is editable): rotate-90 ---
-        self.rotate_gizmo.hide = self.is_gizmo_hidden_by_modal(self.rotate_gizmo)
-        world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_ROTATE_X, icon_y, icon_z))
-        # Smaller scale to match the visual weight of the surrounding validate / cancel icons.
-        self.rotate_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot, scale=self.ROTATE_ICON_SCALE)
-
-        # --- Non-edit-mode icons (toggle openings) ---
-        # Reuse the cancel-icon slot so the pen + openings pair stays compact.
-        if not props.is_editing:
-            self.toggle_openings_gizmo.hide = self.is_gizmo_hidden_by_modal(self.toggle_openings_gizmo)
-            world_pos = mw @ Vector((self.ICON_VALIDATE_X + self.ICON_CANCEL_X, icon_y, icon_z))
-            self.toggle_openings_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
-        else:
-            self.toggle_openings_gizmo.hide = True
+    # Reuse the cancel-icon slot so the pen + openings pair stays compact.
+    if not props.is_editing:
+        group.toggle_openings_gizmo.hide = group.is_gizmo_hidden_by_modal(group.toggle_openings_gizmo)
+        world_pos = mw @ Vector((group.ICON_VALIDATE_X + group.ICON_CANCEL_X, icon_y, icon_z))
+        group.toggle_openings_gizmo.matrix_basis = gizmo.billboarded_at(world_pos, billboard_rot)
+    else:
+        group.toggle_openings_gizmo.hide = True
 
 
 def _commit_active_wall_edit_if_any(context: bpy.types.Context) -> bpy.types.Object | None:
@@ -2559,15 +2553,8 @@ def _classify_wall_join_state(
     parallel_threshold: float,
     collinear_tolerance: float,
 ) -> "tuple[core.WallJoinState, Optional[tuple[float, float, float]]]":
-    """Bim-layer wrapper: pre-compute the IFC-graph join check then forward to
-    the pure :func:`core.classify_wall_join_state` classifier. Single entry
-    point shared by :meth:`GizmoWallJoinIntersection.position_gizmos` and the
-    wall-join preview decorator — neither caller branches on the state
-    machine on its own, so adding a new state requires one edit, not two.
-
-    Returns ``(state, intersection)``: the intersection tuple is non-``None``
-    only on the ``"intersect"`` branch, and callers should destructure both
-    rather than re-call :func:`core.project_axis_intersection` themselves."""
+    """``(state, intersection)`` — intersection is non-``None`` only on
+    the ``"intersect"`` branch."""
     return core.classify_wall_join_state(
         (tuple(seg_a[0]), tuple(seg_a[1])),
         (tuple(seg_b[0]), tuple(seg_b[1])),
@@ -2647,6 +2634,8 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, WallGeomCachedBillboarding
     def poll(cls, context: bpy.types.Context) -> bool:
         if not tool.Blender.are_viewport_gizmos_enabled():
             return False
+        if _wall_fillet_preview_active(context):
+            return False
         # Plan / top-down view has no meaningful "vertical" — the elevation cue
         # that motivates the gizmo (icon at the target slab's Z) collapses to
         # zero on-screen. Hide the gizmo entirely; the N-panel button remains.
@@ -2664,6 +2653,11 @@ class GizmoWallExtendVertically(bpy.types.GizmoGroup, WallGeomCachedBillboarding
         other = next(o for o in selected if o is not active)
         other_element = tool.Ifc.get_entity(other)
         if not other_element or tool.Model.get_usage_type(other_element) != "LAYER2":
+            return False
+        # Extending a fillet corner wall vertically dispatches through the
+        # generic wall regen path that flattens the curve — same hazard the
+        # wall-edition gizmo group has on this kind of wall.
+        if _is_fillet_corner_wall(other_element):
             return False
         return True
 
@@ -2741,6 +2735,11 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
     def poll(cls, context: bpy.types.Context) -> bool:
         if not tool.Blender.are_viewport_gizmos_enabled():
             return False
+        # Mid-preview the user is tuning radius / hitting validate or cancel —
+        # don't show the join/unjoin/extend/fillet icons next to that flow.
+        # ``GizmoWallFilletPreview`` takes over the same two-wall selection.
+        if _wall_fillet_preview_active(context):
+            return False
         selected = tool.Blender.get_selected_objects()
         if len(selected) != 2:
             return False
@@ -2750,21 +2749,47 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
                 return False
         return True
 
+    # Screen-space vertical step between stacked icons (join / extend /
+    # fillet) — each sits ``ICON_STACK_OFFSET_Y`` above the previous in the
+    # camera's screen-up direction so the user gets a tidy three-icon
+    # column anchored above the taller of the two walls.
+    ICON_STACK_OFFSET_Y = 0.4
+
+    # Lift above the taller wall's top so the icons clear the wall body
+    # outline in perspective views — without this the icons sit exactly on
+    # the wall edge and read as occluded geometry.
+    ICON_TOP_LIFT = 0.15
+
     def setup(self, context: bpy.types.Context) -> None:
         colors = self._icon_colors()
         self.unjoin_icon = self.setup_icon_gizmo("VIEW3D_GT_split", colors.default, colors.warning, "bim.unjoin_walls")
         self.merge_icon = self.setup_icon_gizmo("VIEW3D_GT_merge", colors.default, colors.highlight, "bim.merge_wall")
+        # Wall-specific corner / tee glyphs (defined in
+        # ``bim/module/drawing/gizmos.py``) replace the generic merge /
+        # extend arrows on this group only — the join-walls / extend-to-wall
+        # operations have a wall-corner-specific meaning here that the
+        # generic glyphs don't communicate, and other gizmo groups still
+        # use the generic glyphs for their own purposes.
         self.join_icon = self.setup_icon_gizmo(
-            "VIEW3D_GT_merge", colors.default, colors.highlight, "bim.join_walls_intersection"
+            "VIEW3D_GT_wall_corner", colors.default, colors.highlight, "bim.join_walls_intersection"
         )
         self.extend_to_wall_icon = self.setup_icon_gizmo(
-            "VIEW3D_GT_extend", colors.default, colors.highlight, "bim.extend_walls_to_wall"
+            "VIEW3D_GT_wall_tee", colors.default, colors.highlight, "bim.extend_walls_to_wall"
+        )
+        # Fillet icon — shows on the same two states (intersect/joined) where
+        # rounding the corner is well-defined. Click enters the preview flow;
+        # the user then drags the radius and clicks validate or cancel on the
+        # GizmoWallFilletPreview group that polls in next. ``VIEW3D_GT_fillet``
+        # is a custom Bonsai filled glyph (bars + rounded inner corner) — the
+        # stroked ``VIEW3D_GT_arc`` outline was too thin to read at a glance.
+        self.fillet_icon = self.setup_icon_gizmo(
+            "VIEW3D_GT_fillet", colors.default, colors.highlight, "bim.enable_wall_fillet_preview"
         )
         if context.region is not None:
             type(self)._active_instances[context.region.as_pointer()] = weakref.ref(self)
 
     def _all_icons(self) -> tuple[bpy.types.Gizmo, ...]:
-        return (self.unjoin_icon, self.merge_icon, self.join_icon, self.extend_to_wall_icon)
+        return (self.unjoin_icon, self.merge_icon, self.join_icon, self.extend_to_wall_icon, self.fillet_icon)
 
     def _hide_all(self) -> None:
         for icon in self._all_icons():
@@ -2789,20 +2814,44 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
             elem_a, elem_b, seg_a, seg_b, self.PARALLEL_DOT_THRESHOLD, self.COLLINEAR_LINE_TOLERANCE
         )
 
-        # State 1: walls are already joined → show Unjoin only, at the shared
-        # corner's floor Z (no visibility lift — user expects the icon to sit
-        # exactly at the corner, not floating above it).
+        # Reject re-filleting an already-curved corner wall — its axis is the
+        # straight chord, but its body is curved; treating the chord as a
+        # genuine reference line for another fillet would produce nonsense.
+        a_is_fillet = _is_fillet_corner_wall(elem_a)
+        b_is_fillet = _is_fillet_corner_wall(elem_b)
+        eligible_for_fillet = not (a_is_fillet or b_is_fillet)
+
+        # Anchor every junction icon above the TALLER of the two walls so the
+        # stack of icons clears the bodies in perspective views — having them
+        # at floor level was fine for plan view but read as buried geometry
+        # from any angled camera. Stack vertically in screen space so the
+        # user sees an unambiguous column of choices at a single XY anchor.
+        wall_a_top = selected[0].matrix_world.translation.z + (geom_a.get("height") or 0.0)
+        wall_b_top = selected[1].matrix_world.translation.z + (geom_b.get("height") or 0.0)
+        anchor_z = max(wall_a_top, wall_b_top) + self.ICON_TOP_LIFT
+        screen_up = billboard_rot @ Vector((0.0, 1.0, 0.0))
+
+        # State 1: walls are already joined → show Unjoin + Fillet stacked
+        # above the shared corner.
         if state == "joined":
             corner = tool.Wall.collinear_boundary_world(seg_a, seg_b)
-            self.unjoin_icon.matrix_basis = gizmo.billboarded_at(corner, billboard_rot)
+            stack_anchor = Vector((corner.x, corner.y, anchor_z))
+            self.unjoin_icon.matrix_basis = gizmo.billboarded_at(stack_anchor, billboard_rot)
             self.unjoin_icon.hide = False
             self.merge_icon.hide = True
             self.join_icon.hide = True
             self.extend_to_wall_icon.hide = True
+            if eligible_for_fillet:
+                fillet_anchor = stack_anchor + screen_up * self.ICON_STACK_OFFSET_Y
+                self.fillet_icon.matrix_basis = gizmo.billboarded_at(fillet_anchor, billboard_rot)
+                self.fillet_icon.hide = False
+            else:
+                self.fillet_icon.hide = True
             return
 
         # State 2: walls are collinear (parallel axes on the same line) → show Merge
         # at the boundary midpoint between them, at floor Z (no visibility lift).
+        # Fillet not offered — collinear walls don't have a corner to round.
         if state == "collinear":
             boundary = tool.Wall.collinear_boundary_world(seg_a, seg_b)
             self.merge_icon.matrix_basis = gizmo.billboarded_at(boundary, billboard_rot)
@@ -2810,6 +2859,7 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
             self.unjoin_icon.hide = True
             self.join_icon.hide = True
             self.extend_to_wall_icon.hide = True
+            self.fillet_icon.hide = True
             return
 
         if state == "none":
@@ -2817,33 +2867,27 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
             self._hide_all()
             return
 
-        # State 3 (state == "intersect"): non-parallel walls → show Join at the
-        # floor + Extend-to-Wall at the active wall's top, anchored at the
-        # projected axis intersection returned by the classifier. The classifier
-        # guarantees ``intersection_tuple is not None`` for this state by its
-        # return contract, so no redundant ``project_axis_intersection`` call.
-        assert intersection_tuple is not None  # tightened by the "intersect" branch
+        # State 3 (state == "intersect"): non-parallel walls → stack Join +
+        # Extend + Fillet vertically above the taller wall's top, all
+        # anchored at the projected XY intersection. The classifier
+        # guarantees ``intersection_tuple is not None`` for this state.
+        assert intersection_tuple is not None
         intersection = Vector(intersection_tuple)
 
-        # Join sits on the floor (lowest endpoint Z across both wall axes), exactly
-        # where the corner meets the ground — no visibility lift.
-        floor_z = min(seg_a[0].z, seg_a[1].z, seg_b[0].z, seg_b[1].z)
-        join_world = Vector((intersection.x, intersection.y, floor_z))
-        self.join_icon.matrix_basis = gizmo.billboarded_at(join_world, billboard_rot)
+        stack_anchor = Vector((intersection.x, intersection.y, anchor_z))
+        self.join_icon.matrix_basis = gizmo.billboarded_at(stack_anchor, billboard_rot)
         self.join_icon.hide = False
 
-        # Extend-to-Wall sits at the active wall's top, same XY as the join icon —
-        # the Z gap is what differentiates "join at corner" from "extend into other".
-        active = context.active_object if context.active_object in selected else None
-        geom = tool.Wall.read_geometry(active) if active else None
-        if geom is None:
-            self.extend_to_wall_icon.hide = True
+        extend_anchor = stack_anchor + screen_up * self.ICON_STACK_OFFSET_Y
+        self.extend_to_wall_icon.matrix_basis = gizmo.billboarded_at(extend_anchor, billboard_rot)
+        self.extend_to_wall_icon.hide = False
+
+        if eligible_for_fillet:
+            fillet_anchor = stack_anchor + screen_up * (2.0 * self.ICON_STACK_OFFSET_Y)
+            self.fillet_icon.matrix_basis = gizmo.billboarded_at(fillet_anchor, billboard_rot)
+            self.fillet_icon.hide = False
         else:
-            active_top_z = active.matrix_world.translation.z + geom["height"]
-            top_world = Vector((intersection.x, intersection.y, active_top_z))
-            extend_world = gizmo.BaseParametricGizmoGroup.pick_visible_anchor(context, join_world, top_world)
-            self.extend_to_wall_icon.matrix_basis = gizmo.billboarded_at(extend_world, billboard_rot)
-            self.extend_to_wall_icon.hide = False
+            self.fillet_icon.hide = True
 
         self.unjoin_icon.hide = True
         self.merge_icon.hide = True
@@ -2873,13 +2917,17 @@ class GizmoWallUnjoinSingle(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixi
     # Preallocated pool size. ATSTART + ATEND + ATPATH connections are rarely more
     # than a handful on real models; 16 is generous enough that excess is exceptional.
     # Excess connections beyond this drop a one-time warning to the Blender console
-    # (the wall's remaining joins are still visible and clickable). The cap is
-    # bounded by design so ``setup()`` allocates a deterministic number of gizmos.
+    # (the wall's remaining joins are still visible and clickable). The cap exists
+    # because Blender only permits ``GizmoGroup`` to allocate gizmos inside
+    # ``setup()`` — ``draw_prepare`` / refresh-time creation is forbidden — so the
+    # pool must be sized upfront for the worst-case visible count.
     POOL_SIZE = 16
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         if not tool.Blender.are_viewport_gizmos_enabled():
+            return False
+        if _wall_fillet_preview_active(context):
             return False
         selected = tool.Blender.get_selected_objects()
         if len(selected) != 1:
@@ -2960,6 +3008,1028 @@ class GizmoWallUnjoinSingle(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixi
             # renames, file save/reload, and any sit-in-the-undo-stack interlude
             # between dispatch and execute.
             self.unjoin_op_props[slot_idx].other_wall_guid = other_elem.GlobalId
+
+
+def _wall_fillet_props(context: bpy.types.Context):
+    return preview_base.get_preview_props(context, "wall_fillet")
+
+
+def _is_fillet_corner_wall(element: ifcopenshell.entity_instance) -> bool:
+    """``True`` if the wall carries the ``BBIM_Wall.IsFilletCorner`` flag."""
+    return bool(ifcopenshell.util.element.get_pset(element, "BBIM_Wall", "IsFilletCorner"))
+
+
+def _wall_fillet_preview_active(context: bpy.types.Context) -> bool:
+    """``True`` while a wall-fillet preview is open."""
+    return preview_base.is_preview_active(context, "wall_fillet")
+
+
+def _short_arc_midpoint_direction(dir_a: tuple[float, float], dir_b: tuple[float, float]) -> tuple[float, float]:
+    """Unit vector at the midpoint of the short arc from ``dir_a`` to ``dir_b``."""
+    cross_z = dir_a[0] * dir_b[1] - dir_a[1] * dir_b[0]
+    cos_sa = max(-1.0, min(1.0, dir_a[0] * dir_b[0] + dir_a[1] * dir_b[1]))
+    half = math.acos(cos_sa) / 2.0
+    sign = 1.0 if cross_z >= 0 else -1.0
+    cos_h, sin_h = math.cos(half), sign * math.sin(half)
+    return (dir_a[0] * cos_h - dir_a[1] * sin_h, dir_a[0] * sin_h + dir_a[1] * cos_h)
+
+
+def _build_curved_corner_body_representation(
+    ifc_file: ifcopenshell.file,
+    body_context: ifcopenshell.entity_instance,
+    arc_center_local: tuple[float, float, float],
+    chord_length_si: float,
+    radius_si: float,
+    r_outer_si: float,
+    r_inner_si: float,
+    height_si: float,
+) -> ifcopenshell.entity_instance:
+    """Build an ``IfcShapeRepresentation`` with a banana (annular sector)
+    ``IfcExtrudedAreaSolid``.
+
+    Local frame: origin at ``tangent_a``, +X along the chord to ``tangent_b``,
+    +Z vertical. ``r_outer_si`` / ``r_inner_si`` come from wall A's
+    ``IfcMaterialLayerSetUsage`` so the cross-section matches A at
+    ``tangent_a`` rather than centring on the reference arc."""
+    unit_scale = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
+
+    cx_si, cy_si, _ = arc_center_local
+    dir_a = (-cx_si / radius_si, -cy_si / radius_si)
+    dir_b = ((chord_length_si - cx_si) / radius_si, -cy_si / radius_si)
+    dir_mid = _short_arc_midpoint_direction(dir_a, dir_b)
+
+    def point_at(direction, r_si):
+        x_ifc = (cx_si + r_si * direction[0]) / unit_scale
+        y_ifc = (cy_si + r_si * direction[1]) / unit_scale
+        return (x_ifc, y_ifc)
+
+    points = [
+        point_at(dir_a, r_outer_si),  # 1 — outer arc start
+        point_at(dir_mid, r_outer_si),  # 2 — outer arc midpoint
+        point_at(dir_b, r_outer_si),  # 3 — outer arc end
+        point_at(dir_b, r_inner_si),  # 4 — inner arc end (reversed sweep)
+        point_at(dir_mid, r_inner_si),  # 5 — inner arc midpoint
+        point_at(dir_a, r_inner_si),  # 6 — inner arc start
+    ]
+
+    point_list = ifc_file.createIfcCartesianPointList2D(points)
+    segments = [
+        ifc_file.createIfcArcIndex((1, 2, 3)),
+        ifc_file.createIfcLineIndex((3, 4)),
+        ifc_file.createIfcArcIndex((4, 5, 6)),
+        ifc_file.createIfcLineIndex((6, 1)),
+    ]
+    curve = ifc_file.createIfcIndexedPolyCurve(point_list, segments, False)
+    profile = ifc_file.createIfcArbitraryClosedProfileDef("AREA", None, curve)
+
+    extrusion = ifc_file.createIfcExtrudedAreaSolid(
+        profile,
+        ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0, 0.0)),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((1.0, 0.0, 0.0)),
+        ),
+        ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+        height_si / unit_scale,
+    )
+    return ifc_file.createIfcShapeRepresentation(
+        body_context, body_context.ContextIdentifier, "SweptSolid", [extrusion]
+    )
+
+
+def _resolve_two_walls(context: bpy.types.Context) -> tuple[bpy.types.Object, bpy.types.Object] | None:
+    """``(active, other)`` from a 2-wall selection, both LAYER2 with straight axes."""
+    selected = list(tool.Blender.get_selected_objects())
+    if len(selected) != 2:
+        return None
+    active = context.active_object
+    if active is None or active not in selected:
+        return None
+    other = next((o for o in selected if o is not active), None)
+    if other is None:
+        return None
+    for obj in (active, other):
+        element = tool.Ifc.get_entity(obj)
+        if element is None or not element.is_a("IfcWall"):
+            return None
+        if not tool.Wall.has_layer2_usage(element):
+            return None
+        if not tool.Wall.is_straight_axis(element):
+            return None
+        if _is_fillet_corner_wall(element):
+            # Re-filleting a curved corner would treat its chord as the
+            # reference line and produce nonsense geometry.
+            return None
+    return active, other
+
+
+class EnableWallFilletPreview(bpy.types.Operator):
+    """Enter wall-fillet preview mode for two selected walls. No IFC
+    mutation until finish."""
+
+    bl_idname = "bim.enable_wall_fillet_preview"
+    bl_label = "Enter Wall Fillet Preview"
+    bl_description = "Begin tuning the fillet radius before committing the rounded corner"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        if _resolve_two_walls(context) is None:
+            cls.poll_message_set("Select exactly 2 LAYER2 walls with straight axes.")
+            return False
+        return True
+
+    def execute(self, context):
+        walls = _resolve_two_walls(context)
+        if walls is None:
+            self.report({"ERROR"}, "Selection no longer eligible for fillet preview.")
+            return {"CANCELLED"}
+        wall_a, wall_b = walls
+
+        elem_a = tool.Ifc.get_entity(wall_a)
+        elem_b = tool.Ifc.get_entity(wall_b)
+
+        # Joined / intersecting only; parallel pairs have no corner to round.
+        seg_a = tool.Wall.get_world_reference_line(wall_a)
+        seg_b = tool.Wall.get_world_reference_line(wall_b)
+        if seg_a is None or seg_b is None:
+            self.report({"ERROR"}, "Could not read reference line on one of the walls.")
+            return {"CANCELLED"}
+        state, _ = _classify_wall_join_state(elem_a, elem_b, seg_a, seg_b, 0.9994, 0.05)
+        if state not in {"intersect", "joined"}:
+            self.report({"ERROR"}, f"Fillet requires intersecting or joined walls (state was {state}).")
+            return {"CANCELLED"}
+
+        preview_base.sync_uncommitted_moves([wall_a, wall_b])
+
+        props = _wall_fillet_props(context)
+        if props is None:
+            self.report({"ERROR"}, "Wall fillet preview state is unavailable.")
+            return {"CANCELLED"}
+
+        # Auto-cancel any prior preview before opening a fresh one — fillet
+        # creates a new IFC entity at finish.
+        preview_base.cancel_prior_preview(props, "cancel_wall_fillet_preview")
+
+        # Default radius: a quarter of the shorter available leg, clamped
+        # against the tangent-overshoot upper bound. Fall back to 0.5m.
+        geom = tool.Wall.compute_wall_fillet_geometry(wall_a, wall_b, radius=0.5)
+        default_radius = 0.5
+        if geom is not None and geom.get("sweep_angle") and geom["sweep_angle"] > 1e-3:
+            leg_a_available = geom.get("leg_a_available") or 0.0
+            leg_b_available = geom.get("leg_b_available") or 0.0
+            shortest_leg = min(leg_a_available, leg_b_available)
+            if shortest_leg > 1e-6:
+                upper = shortest_leg / max(math.tan(geom["sweep_angle"] / 2), 1e-6)
+                default_radius = max(0.001, min(0.25 * shortest_leg, upper, 0.5))
+
+        props.wall_a_id = elem_a.id()
+        props.wall_b_id = elem_b.id()
+        props.radius = default_radius
+        props.editing_corner_id = 0
+        props.is_active = True
+        return {"FINISHED"}
+
+
+class FinishWallFilletPreview(preview_base.BasePreviewFinishOperator):
+    """Commit the previewed fillet via ``bim.create_wall_fillet`` and exit preview."""
+
+    bl_idname = "bim.finish_wall_fillet_preview"
+    bl_label = "Apply Wall Fillet"
+    bl_description = "Commit the rounded corner with the previewed radius"
+
+    PREVIEW_ATTR = "wall_fillet"
+    DISPATCH_OPERATOR = "create_wall_fillet"
+    DISPATCH_PROP_MAP = {
+        "wall_a_id": "wall_a_id",
+        "wall_b_id": "wall_b_id",
+        "radius": "radius",
+        "editing_corner_id": "editing_corner_id",
+    }
+    RESET_FIELDS = (("wall_a_id", 0), ("wall_b_id", 0), ("editing_corner_id", 0))
+
+
+class CancelWallFilletPreview(preview_base.BasePreviewCancelOperator):
+    """Exit wall-fillet preview without committing."""
+
+    bl_idname = "bim.cancel_wall_fillet_preview"
+    bl_label = "Cancel Wall Fillet"
+    bl_description = "Discard the previewed fillet"
+
+    PREVIEW_ATTR = "wall_fillet"
+    RESET_FIELDS = (("wall_a_id", 0), ("wall_b_id", 0), ("editing_corner_id", 0))
+
+
+class EnableWallFilletPreviewFromCorner(bpy.types.Operator):
+    """Re-open the fillet preview on an existing corner wall (pen-icon entry).
+
+    Validate deletes and recreates the corner inside a single undo step."""
+
+    bl_idname = "bim.enable_wall_fillet_preview_from_corner"
+    bl_label = "Edit Wall Fillet"
+    bl_description = "Open the fillet preview for an existing rounded corner — drag radius to retune"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        selected = list(tool.Blender.get_selected_objects())
+        if len(selected) != 1:
+            return False
+        element = tool.Ifc.get_entity(selected[0])
+        return element is not None and _is_fillet_corner_wall(element)
+
+    def execute(self, context: bpy.types.Context):
+        selected = list(tool.Blender.get_selected_objects())
+        if len(selected) != 1:
+            self.report({"ERROR"}, "Select exactly one fillet corner wall.")
+            return {"CANCELLED"}
+        corner_obj = selected[0]
+        corner_elem = tool.Ifc.get_entity(corner_obj)
+        if corner_elem is None or not _is_fillet_corner_wall(corner_elem):
+            self.report({"ERROR"}, "Selection is not a fillet corner wall.")
+            return {"CANCELLED"}
+
+        radius = ifcopenshell.util.element.get_pset(corner_elem, "BBIM_Wall", "FilletRadius")
+        if not radius:
+            self.report({"ERROR"}, "Corner wall has no FilletRadius pset to re-edit.")
+            return {"CANCELLED"}
+
+        # See ``regenerate_fillet_corner_wall`` for why we don't filter on
+        # connection type here — the corner's own side is ``NOTDEFINED`` so
+        # neighbours don't miter against the chord axis.
+        wall_a = None
+        for rel in getattr(corner_elem, "ConnectedFrom", []):
+            if rel.is_a("IfcRelConnectsPathElements"):
+                wall_a = rel.RelatingElement
+                break
+        wall_b = None
+        for rel in getattr(corner_elem, "ConnectedTo", []):
+            if rel.is_a("IfcRelConnectsPathElements"):
+                wall_b = rel.RelatedElement
+                break
+        if wall_a is None or wall_b is None:
+            self.report({"ERROR"}, "Corner wall is not connected to both source walls anymore.")
+            return {"CANCELLED"}
+
+        props = _wall_fillet_props(context)
+        if props is None:
+            self.report({"ERROR"}, "Wall fillet preview state is unavailable.")
+            return {"CANCELLED"}
+        preview_base.cancel_prior_preview(props, "cancel_wall_fillet_preview")
+
+        props.wall_a_id = wall_a.id()
+        props.wall_b_id = wall_b.id()
+        props.radius = float(radius)
+        props.editing_corner_id = corner_elem.id()
+        props.is_active = True
+        return {"FINISHED"}
+
+
+class CreateWallFillet(bpy.types.Operator, tool.Ifc.Operator):
+    """Replace the corner between two straight walls with a curved LAYER2
+    corner wall (banana body, inherits layer set / height / x_angle / type
+    from wall A)."""
+
+    bl_idname = "bim.create_wall_fillet"
+    bl_label = "Create Wall Fillet"
+    bl_description = "Replace the corner between two walls with a rounded corner of the given radius"
+    bl_options = {"REGISTER", "UNDO"}
+
+    wall_a_id: bpy.props.IntProperty(name="Wall A (active) IFC id")
+    wall_b_id: bpy.props.IntProperty(name="Wall B (other) IFC id")
+    radius: bpy.props.FloatProperty(
+        name="Radius",
+        default=0.5,
+        subtype="DISTANCE",
+        unit="LENGTH",
+        description=(
+            "Signed radius — positive produces a convex outward fillet, "
+            "negative flips the arc center to the opposite side for an "
+            "inverted (concave inward) corner."
+        ),
+    )
+    editing_corner_id: bpy.props.IntProperty(
+        name="Existing fillet corner IFC id",
+        default=0,
+        description=(
+            "Non-zero on the pen-icon re-edit flow. The operator deletes this "
+            "corner + its path connections before recreating with the new radius."
+        ),
+    )
+
+    if TYPE_CHECKING:
+        wall_a_id: int
+        wall_b_id: int
+        radius: float
+        editing_corner_id: int
+
+    def _execute(self, context):
+        ifc_file = tool.Ifc.get()
+        if ifc_file is None:
+            self.report({"ERROR"}, "No IFC file loaded.")
+            return {"CANCELLED"}
+
+        try:
+            elem_a = ifc_file.by_id(self.wall_a_id)
+            elem_b = ifc_file.by_id(self.wall_b_id)
+        except Exception:
+            self.report({"ERROR"}, "One of the source walls is no longer in the IFC file.")
+            return {"CANCELLED"}
+
+        wall_a_obj = tool.Ifc.get_object(elem_a)
+        wall_b_obj = tool.Ifc.get_object(elem_b)
+        if wall_a_obj is None or wall_b_obj is None:
+            self.report({"ERROR"}, "One of the source walls has no Blender object.")
+            return {"CANCELLED"}
+
+        geom = tool.Wall.compute_wall_fillet_geometry(wall_a_obj, wall_b_obj, self.radius)
+        if geom is None or not geom["valid"]:
+            reason = geom.get("reason") if geom else "unknown"
+            self.report({"ERROR"}, f"Fillet geometry rejected (reason: {reason}).")
+            return {"CANCELLED"}
+        if geom["wall_type_id"] is None:
+            self.report({"ERROR"}, "Active wall has no IfcWallType to inherit.")
+            return {"CANCELLED"}
+
+        tangent_a = Vector(geom["tangent_a"])
+        tangent_b = Vector(geom["tangent_b"])
+        side_a = geom["wall_a_join_side"]
+        side_b = geom["wall_b_join_side"]
+        chord = tangent_b - tangent_a
+        chord_length = chord.length
+        if chord_length < 1e-6:
+            self.report({"ERROR"}, "Tangent points coincide — invalid fillet geometry.")
+            return {"CANCELLED"}
+
+        # Pen-icon re-edit path: remove the existing fillet corner (and its
+        # two path connections to A and B) so the rest of the operator can
+        # treat A and B as if they were a fresh pair. Without this the new
+        # corner would be ADDED on top of the old one — three corners between
+        # two neighbors. The deletion + recreation runs inside the same
+        # ``tool.Ifc.Operator`` transaction, so a single undo restores the
+        # pre-re-edit state.
+        if self.editing_corner_id:
+            try:
+                old_corner = ifc_file.by_id(self.editing_corner_id)
+            except Exception:
+                old_corner = None
+            if old_corner is not None:
+                for rel in list(getattr(old_corner, "ConnectedFrom", [])) + list(
+                    getattr(old_corner, "ConnectedTo", [])
+                ):
+                    if rel.is_a("IfcRelConnectsPathElements"):
+                        bonsai.core.geometry.remove_connection(tool.Geometry, connection=rel)
+                old_corner_obj = tool.Ifc.get_object(old_corner)
+                ifcopenshell.api.root.remove_product(ifc_file, product=old_corner)
+                if old_corner_obj is not None:
+                    bpy.data.objects.remove(old_corner_obj)
+
+        # Drop any existing connection between A and B before retopologising
+        # — the corner wall will own the new connections at both ends.
+        for conn in list(elem_a.ConnectedTo) + list(elem_a.ConnectedFrom):
+            if not conn.is_a("IfcRelConnectsPathElements"):
+                continue
+            other = conn.RelatedElement if conn.RelatingElement == elem_a else conn.RelatingElement
+            if other == elem_b:
+                bonsai.core.geometry.remove_connection(tool.Geometry, connection=conn)
+
+        # Shorten A and B so their corner-side endpoints sit on the tangent
+        # points. ``DumbWallJoiner.extend`` projects the world-space target
+        # onto the wall's local axis and rewrites the relevant endpoint, then
+        # regenerates the body so it matches the new axis.
+        joiner = DumbWallJoiner()
+        joiner.extend(wall_a_obj, tangent_a, connection=side_a)
+        joiner.extend(wall_b_obj, tangent_b, connection=side_b)
+
+        # Instantiate the corner wall from A's wall type so it inherits the
+        # material layer set, height, x_angle, and IfcWallType.
+        bpy.ops.bim.add_occurrence(relating_type_id=geom["wall_type_id"])
+        corner_obj = bpy.context.active_object
+        if corner_obj is None:
+            self.report({"ERROR"}, "Failed to instantiate the corner wall.")
+            return {"CANCELLED"}
+        corner_elem = tool.Ifc.get_entity(corner_obj)
+        if corner_elem is None:
+            self.report({"ERROR"}, "Corner wall has no IFC entity after creation.")
+            return {"CANCELLED"}
+
+        # Place the corner wall: origin at tangent_a, local +X along the
+        # chord toward tangent_b, local +Z = world up (floor-plan walls
+        # extrude vertically). +Y completes the right-handed frame.
+        x_dir = chord.normalized()
+        z_dir = Vector((0.0, 0.0, 1.0))
+        y_dir = z_dir.cross(x_dir).normalized()
+        corner_obj.matrix_world = Matrix(
+            (
+                (x_dir.x, y_dir.x, z_dir.x, tangent_a.x),
+                (x_dir.y, y_dir.y, z_dir.y, tangent_a.y),
+                (x_dir.z, y_dir.z, z_dir.z, tangent_a.z),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+        )
+        bonsai.core.geometry.edit_object_placement(
+            tool.Ifc, tool.Geometry, tool.Surveyor, obj=corner_obj, apply_scale=False
+        )
+
+        # Axis: 2-point straight chord polyline from (0,0) to (chord_length,0)
+        # in wall-local IFC units. The body curves while the axis stays
+        # straight — IFC viewers and downstream Bonsai code that read the
+        # reference line via ``get_reference_line`` get a usable 2-point
+        # result instead of partial samples off a 3-point arc.
+        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
+        joiner.set_axis(
+            corner_elem,
+            Vector((0.0, 0.0)),
+            Vector((chord_length / unit_scale, 0.0)),
+        )
+
+        # Mark the corner wall BEFORE the body swap and the downstream
+        # recalculate so ``tool.Model.recreate_wall`` short-circuits and
+        # preserves the curved geometry. The pset also gates the enable
+        # poll so a follow-up fillet attempt that includes this wall is
+        # rejected (re-filleting a curved corner is not a defined op).
+        # ``FilletRadius`` is stored alongside ``IsFilletCorner`` so the
+        # corner can be rebuilt later — when the wall type's thickness
+        # changes via panel edit, the recreate-wall hook reads this radius
+        # back to regenerate the banana profile with the new thickness
+        # instead of either flattening the curve or freezing the stale
+        # thickness from creation time. The pen-icon re-edit flow reads it
+        # too to preload the preview's radius.
+        pset = ifcopenshell.api.pset.add_pset(ifc_file, product=corner_elem, name="BBIM_Wall")
+        ifcopenshell.api.pset.edit_pset(
+            ifc_file,
+            pset=pset,
+            properties={"IsFilletCorner": True, "FilletRadius": float(self.radius)},
+        )
+
+        # Express arc_center in chord-local coords (z=0 for floor walls).
+        arc_center_world = Vector(geom["arc_center"])
+        v_world = arc_center_world - tangent_a
+        arc_center_local = (v_world.dot(x_dir), v_world.dot(y_dir), v_world.dot(z_dir))
+
+        # Match the banana's cross-section AT tangent_a to wall A's actual
+        # body cross-section there. Without this the banana is centered on
+        # the reference arc and the body slips by ``thickness/2`` onto the
+        # wrong side of A's reference line (an "offset miscalculated" look
+        # at the corner). The math:
+        #
+        # - The wall body in wall-local Y spans ``[offset, offset + thickness]``
+        #   where ``offset`` comes from ``IfcMaterialLayerSetUsage.OffsetFromReferenceLine``.
+        # - The arc's radial direction at tangent_a is parallel to wall A's
+        #   local +Y (because tangent_a IS the tangent point). The sign tells
+        #   us whether body extends toward arc_center or away.
+        # - Each body endpoint's distance from arc_center is ``|R + s*y|``
+        #   where ``s = sign(wall_y . radial)`` and ``y`` is the wall-local
+        #   Y of the endpoint. The two values are the banana's outer and
+        #   inner radii.
+        radial_a_world = tangent_a - arc_center_world
+        if radial_a_world.length > 1e-6:
+            radial_a_world = radial_a_world.normalized()
+            wall_a_y_world = wall_a_obj.matrix_world.col[1].to_3d().normalized()
+            side_sign = 1.0 if wall_a_y_world.dot(radial_a_world) >= 0.0 else -1.0
+        else:
+            side_sign = -1.0
+        # Banana radii use the magnitude — negative radius on the input
+        # only flips the arc center to the opposite side (inverted fillet);
+        # the banana itself still has positive radii for its outer / inner
+        # arcs around that center.
+        radius_si = abs(geom["arc_radius"])
+        offset_si = geom["profile_offset"] or 0.0
+        thickness_si = geom["profile_thickness"]
+        r_endpoint_1 = abs(radius_si + side_sign * offset_si)
+        r_endpoint_2 = abs(radius_si + side_sign * (offset_si + thickness_si))
+        r_outer_si = max(r_endpoint_1, r_endpoint_2)
+        r_inner_si = min(r_endpoint_1, r_endpoint_2)
+
+        body_context = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
+        if body_context is None:
+            self.report({"ERROR"}, "Model/Body/MODEL_VIEW context missing — cannot build curved corner body.")
+            return {"CANCELLED"}
+        new_body = _build_curved_corner_body_representation(
+            ifc_file,
+            body_context,
+            arc_center_local=arc_center_local,
+            chord_length_si=chord_length,
+            radius_si=radius_si,
+            r_outer_si=r_outer_si,
+            r_inner_si=r_inner_si,
+            height_si=geom["height"] or 3.0,
+        )
+        tool.Model.replace_object_ifc_representation(body_context, corner_obj, new_body)
+
+        # Connect A and B to the corner with the corner's OWN side typed as
+        # ``NOTDEFINED`` rather than ATSTART/ATEND.
+        # ``regenerate_wall_representation.join()`` early-returns when either
+        # side is NOTDEFINED, so neighbour A's miter cut never reads the
+        # corner's chord-axis reference line. A and B end FLAT at
+        # tangent_a / tangent_b — which is perpendicular to their own axis
+        # AND to the curve's tangent direction at that point, so the
+        # neighbour cross-sections align exactly with the banana profile's
+        # cap. The old ATSTART/ATEND on the corner side caused neighbours
+        # to miter against the chord, producing the visible seam between
+        # the straight walls and the curved corner.
+        ifcopenshell.api.geometry.connect_path(
+            ifc_file,
+            relating_element=elem_a,
+            related_element=corner_elem,
+            relating_connection=side_a,
+            related_connection="NOTDEFINED",
+        )
+        ifcopenshell.api.geometry.connect_path(
+            ifc_file,
+            relating_element=corner_elem,
+            related_element=elem_b,
+            relating_connection="NOTDEFINED",
+            related_connection=side_b,
+        )
+
+        # Recalculate A and B so their miter cuts pick up the new
+        # connections to the corner. The corner itself is skipped by
+        # ``tool.Model.recreate_wall``'s IsFilletCorner gate, preserving
+        # the curved body.
+        tool.Model.recalculate_walls([wall_a_obj, corner_obj, wall_b_obj])
+        return {"FINISHED"}
+
+
+def regenerate_fillet_corner_wall(element: ifcopenshell.entity_instance, obj: bpy.types.Object) -> None:
+    """Rebuild a fillet corner wall's banana body from ``BBIM_Wall.FilletRadius``
+    and its neighbours' current layer parameters."""
+    ifc_file = tool.Ifc.get()
+    if ifc_file is None:
+        return
+    radius_si = ifcopenshell.util.element.get_pset(element, "BBIM_Wall", "FilletRadius")
+    if not radius_si:
+        return
+
+    # Find the two neighbor walls from ``IfcRelConnectsPathElements``. The
+    # corner-side connection type is ``NOTDEFINED`` so neighbours don't miter
+    # against the chord-axis reference line — take the single rel on each
+    # side of the corner's inverse graph rather than filtering on type.
+    wall_a = None
+    for rel in getattr(element, "ConnectedFrom", []):
+        if rel.is_a("IfcRelConnectsPathElements"):
+            wall_a = rel.RelatingElement
+            break
+    wall_b = None
+    for rel in getattr(element, "ConnectedTo", []):
+        if rel.is_a("IfcRelConnectsPathElements"):
+            wall_b = rel.RelatedElement
+            break
+    if wall_a is None or wall_b is None:
+        return
+    wall_a_obj = tool.Ifc.get_object(wall_a)
+    wall_b_obj = tool.Ifc.get_object(wall_b)
+    if wall_a_obj is None or wall_b_obj is None:
+        return
+
+    geom = tool.Wall.compute_wall_fillet_geometry(wall_a_obj, wall_b_obj, float(radius_si))
+    if geom is None or not geom["valid"]:
+        return
+
+    tangent_a = Vector(geom["tangent_a"])
+    tangent_b = Vector(geom["tangent_b"])
+    chord_length = (tangent_b - tangent_a).length
+    if chord_length < 1e-6:
+        return
+
+    # Re-anchor the corner wall's ``ObjectPlacement`` at the NEW tangent_a
+    # with axes aligned to the NEW chord direction. If a neighbour moved,
+    # this is what makes the corner follow — without this update, the
+    # body would be rebuilt in the OLD local frame and visually detach
+    # from the moved neighbour. If neither neighbour moved, the new
+    # placement matrix equals the old one within floating-point noise, so
+    # the update is a no-op.
+    chord = tangent_b - tangent_a
+    x_dir = chord.normalized()
+    z_dir = Vector((0.0, 0.0, 1.0))
+    y_dir = z_dir.cross(x_dir).normalized()
+    obj.matrix_world = Matrix(
+        (
+            (x_dir.x, y_dir.x, z_dir.x, tangent_a.x),
+            (x_dir.y, y_dir.y, z_dir.y, tangent_a.y),
+            (x_dir.z, y_dir.z, z_dir.z, tangent_a.z),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=False)
+
+    arc_center_world = Vector(geom["arc_center"])
+    v_world = arc_center_world - tangent_a
+    arc_center_local = (v_world.dot(x_dir), v_world.dot(y_dir), v_world.dot(z_dir))
+
+    # Same body-side detection as creation — picks (R-T, R), (R-T/2, R+T/2),
+    # or (R, R+T) based on neighbor A's body convention.
+    radial_a_world = tangent_a - arc_center_world
+    if radial_a_world.length > 1e-6:
+        radial_a_world = radial_a_world.normalized()
+        wall_a_y_world = wall_a_obj.matrix_world.col[1].to_3d().normalized()
+        side_sign = 1.0 if wall_a_y_world.dot(radial_a_world) >= 0.0 else -1.0
+    else:
+        side_sign = -1.0
+    offset_si = geom["profile_offset"] or 0.0
+    thickness_si = geom["profile_thickness"]
+    # ``arc_radius`` in the geom dict is signed (negative on inverted
+    # fillets); the actual circle radius for the banana is the magnitude.
+    arc_radius_si = abs(geom["arc_radius"])
+    r_endpoint_1 = abs(arc_radius_si + side_sign * offset_si)
+    r_endpoint_2 = abs(arc_radius_si + side_sign * (offset_si + thickness_si))
+    r_outer_si = max(r_endpoint_1, r_endpoint_2)
+    r_inner_si = min(r_endpoint_1, r_endpoint_2)
+
+    body_context = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
+    if body_context is None:
+        return
+    new_body = _build_curved_corner_body_representation(
+        ifc_file,
+        body_context,
+        arc_center_local=arc_center_local,
+        chord_length_si=chord_length,
+        radius_si=arc_radius_si,
+        r_outer_si=r_outer_si,
+        r_inner_si=r_inner_si,
+        height_si=geom["height"] or 3.0,
+    )
+    tool.Model.replace_object_ifc_representation(body_context, obj, new_body)
+
+
+def _wall_fillet_gizmo_x_matrix(location: Vector, x_direction: Vector) -> Matrix:
+    """4×4 matrix placing a gizmo at ``location`` with local +X aligned to
+    ``x_direction`` in world space."""
+    x = x_direction.normalized()
+    seed = Vector((0, 0, 1)) if abs(x.z) < 0.9 else Vector((1, 0, 0))
+    y = (seed - x * seed.dot(x)).normalized()
+    z = x.cross(y)
+    mat = Matrix.Identity(4)
+    mat[0][:3] = (x.x, y.x, z.x)
+    mat[1][:3] = (x.y, y.y, z.y)
+    mat[2][:3] = (x.z, y.z, z.z)
+    mat.translation = location
+    return mat
+
+
+def _wall_fillet_preview_walls(context: bpy.types.Context):
+    """``(wall_a_obj, wall_b_obj)`` pinned by the preview, or ``(None, None)``
+    when inactive or stale."""
+    props = _wall_fillet_props(context)
+    if props is None or not props.is_active:
+        return None, None
+    ifc_file = tool.Ifc.get()
+    if ifc_file is None:
+        return None, None
+    try:
+        elem_a = ifc_file.by_id(props.wall_a_id)
+        elem_b = ifc_file.by_id(props.wall_b_id)
+    except (RuntimeError, KeyError):
+        return None, None
+    wall_a_obj = tool.Ifc.get_object(elem_a) if elem_a else None
+    wall_b_obj = tool.Ifc.get_object(elem_b) if elem_b else None
+    return wall_a_obj, wall_b_obj
+
+
+class GizmoWallFilletPreview(bpy.types.GizmoGroup):
+    """Gizmo group for the wall-fillet preview: radius dimension widget
+    plus validate / cancel icons.
+
+    On degenerate geometry the dimension and validate hide but cancel
+    stays visible so the user always has an exit."""
+
+    bl_idname = "OBJECT_GGT_bim_wall_fillet_preview"
+    bl_label = "Wall Fillet Preview Gizmos"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_options = {"3D", "PERSISTENT"}
+
+    ICON_SCALE: ClassVar[float] = 0.375
+    ICON_SPACING_X: ClassVar[float] = 0.4
+    ICON_Z_OFFSET: ClassVar[float] = 1.5
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        props = _wall_fillet_props(context)
+        if props is None or not props.is_active:
+            return False
+        if not tool.Blender.are_viewport_gizmos_enabled():
+            return False
+        ifc_file = tool.Ifc.get()
+        if ifc_file is None:
+            props.is_active = False
+            return False
+        try:
+            ifc_file.by_id(props.wall_a_id)
+            ifc_file.by_id(props.wall_b_id)
+        except (RuntimeError, KeyError):
+            props.is_active = False
+            props.wall_a_id = 0
+            props.wall_b_id = 0
+            props.editing_corner_id = 0
+            return False
+        return True
+
+    def setup(self, context: bpy.types.Context) -> None:
+        prefs = tool.Blender.get_addon_preferences()
+        default_color = tuple(prefs.decorations_colour[:3])
+        highlight_color = tuple(prefs.decorator_color_selected[:3])
+
+        # Lazy-fetched closures from ``preview_base`` re-resolve the Scene
+        # per call so the freed-RNA crash on file open / undo doesn't hit
+        # the gizmo callbacks — same shape MEP bend uses.
+        _props_callback = preview_base.make_props_callback("wall_fillet")
+
+        gz = self.gizmos.new("BIM_GT_gizmo_dimension")
+        gz.move_get_cb = preview_base.make_dim_getter(_props_callback, "radius")
+        gz.move_set_cb = preview_base.make_dim_setter(_props_callback, "radius")
+        # Set ``axis`` only (NOT ``local_axis``) so ``get_axis_direction``
+        # falls through to the world-space direction we set in
+        # ``_position_gizmos``. The preview spans world space independent
+        # of either wall's local frame, so the active-object transform that
+        # ``local_axis`` would go through is the wrong frame.
+        gz.axis = Vector((1, 0, 0))
+        gz.invert_delta = False
+        gz.delta_scale = 1.0
+        gz.prop_name = "Radius"
+        gz.gizmo_group = self
+        gz.color = default_color
+        gz.color_highlight = highlight_color
+        gz.alpha = 1.0
+        gz.use_draw_modal = True
+        gz.use_draw_scale = False
+        gz.text_offset_sign = 1
+        gz.text_alignment = gizmo.TextAlignment.CENTER
+        # Arrowheads at BOTH ends + extension lines make this read as a proper
+        # dimension annotation rather than a single-direction drag arrow. Walls
+        # are typically a few metres long, so the radius dimension at the apex
+        # points away from the wall body — having visible terminators on both
+        # ends keeps it readable even when the apex sits near a wall edge.
+        gz.show_start_arrow = True
+        gz.show_end_arrow = True
+        gz.show_extension_lines = True
+        gz.text_formatter = None
+        self.radius_dim = gz
+
+        # Sweep angle is geometrically invariant during drag (depends only on
+        # the angle between the two walls). Cached here per-frame from
+        # ``_position_gizmos`` so the trim getter / setter can convert
+        # trim_length ↔ radius via ``tan(sweep/2)`` without re-running the
+        # full geometry pipeline on every drag tick.
+        self._sweep_angle = math.pi / 2
+
+        # Trim-length widget expresses the SAME single DOF as the radius
+        # widget via the leg setback distance (intersection → tangent point).
+        # Architects often think "how much of each wall do I cut back" rather
+        # than "what radius do I want"; this widget surfaces that mental model
+        # without introducing a second degree of freedom. Conversion:
+        # ``trim = |radius| * tan(sweep_angle / 2)``. Both widgets stay in
+        # sync because they read/write the same canonical ``radius`` field.
+        trim_gz = self.gizmos.new("BIM_GT_gizmo_dimension")
+        trim_gz.move_get_cb = self._make_trim_getter()
+        trim_gz.move_set_cb = self._make_trim_setter()
+        trim_gz.axis = Vector((1, 0, 0))
+        trim_gz.invert_delta = False
+        trim_gz.delta_scale = 1.0
+        trim_gz.prop_name = "Trim Length"
+        trim_gz.gizmo_group = self
+        trim_gz.color = default_color
+        trim_gz.color_highlight = highlight_color
+        trim_gz.alpha = 1.0
+        trim_gz.use_draw_modal = True
+        trim_gz.use_draw_scale = False
+        trim_gz.text_offset_sign = 1
+        trim_gz.text_alignment = gizmo.TextAlignment.CENTER
+        trim_gz.show_start_arrow = True
+        trim_gz.show_end_arrow = True
+        trim_gz.show_extension_lines = True
+        trim_gz.text_formatter = None
+        self.trim_dim = trim_gz
+
+        from bonsai.bim.module.drawing.gizmos import BaseParametricGizmoGroup
+
+        self.validate_icon = self.gizmos.new("VIEW3D_GT_validate")
+        self.validate_icon.use_draw_scale = False
+        self.validate_icon.color = BaseParametricGizmoGroup.COLOR_GREEN
+        self.validate_icon.color_highlight = highlight_color
+        self.validate_icon.target_set_operator("bim.finish_wall_fillet_preview")
+
+        self.cancel_icon = self.gizmos.new("VIEW3D_GT_cancel")
+        self.cancel_icon.use_draw_scale = False
+        self.cancel_icon.color = BaseParametricGizmoGroup.COLOR_RED
+        self.cancel_icon.color_highlight = highlight_color
+        self.cancel_icon.target_set_operator("bim.cancel_wall_fillet_preview")
+
+    def _make_trim_getter(self):
+        """Closure returning |radius| * tan(sweep/2) — the live leg setback
+        distance — from the cached sweep angle and the canonical radius."""
+
+        def _get() -> float:
+            props = _wall_fillet_props(bpy.context)
+            if props is None:
+                return 0.0
+            sweep = max(self._sweep_angle, 1e-3)
+            return abs(float(props.radius)) * math.tan(sweep / 2.0)
+
+        return _get
+
+    def _make_trim_setter(self):
+        """Closure writing radius from a dragged trim_length, preserving the
+        radius sign so a concave preview stays concave when the user drags the
+        trim widget. Clamps to the FloatProperty's lower bound so the gizmo
+        can't push radius below the geometry helper's tolerance."""
+
+        def _set(value: float) -> None:
+            props = _wall_fillet_props(bpy.context)
+            if props is None:
+                return
+            sweep = max(self._sweep_angle, 1e-3)
+            tan_half = math.tan(sweep / 2.0)
+            if tan_half < 1e-9:
+                return
+            sign = -1.0 if float(props.radius) < 0 else 1.0
+            new_radius = sign * max(0.001, float(value)) / tan_half
+            props.radius = new_radius
+            for area in bpy.context.screen.areas if bpy.context.screen else ():
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+
+        return _set
+
+    def refresh(self, context: bpy.types.Context) -> None:
+        self._position_gizmos(context)
+
+    def draw_prepare(self, context: bpy.types.Context) -> None:
+        self._position_gizmos(context)
+
+    def _position_gizmos(self, context: bpy.types.Context) -> None:
+        wall_a_obj, wall_b_obj = _wall_fillet_preview_walls(context)
+        if wall_a_obj is None or wall_b_obj is None:
+            for gz in (self.radius_dim, self.trim_dim, self.validate_icon, self.cancel_icon):
+                gz.hide = True
+            return
+
+        props = _wall_fillet_props(context)
+        if props is None:
+            for gz in (self.radius_dim, self.trim_dim, self.validate_icon, self.cancel_icon):
+                gz.hide = True
+            return
+
+        geom = tool.Wall.compute_wall_fillet_geometry(wall_a_obj, wall_b_obj, props.radius)
+        billboard_rot = gizmo.get_billboard_rotation(context)
+
+        # Geometry helper failed outright (e.g. wall A's reference line went
+        # missing). No anchor to draw on — hide everything.
+        if geom is None:
+            for gz in (self.radius_dim, self.trim_dim, self.validate_icon, self.cancel_icon):
+                gz.hide = True
+            return
+
+        # Parallel / near-collinear axes — no defined arc at all. Drop radius
+        # + trim + validate; keep cancel visible at the would-be intersection
+        # so the user has an exit. The dim widgets have nowhere to anchor.
+        if not geom["valid"] and not geom.get("invalid_radius"):
+            self.radius_dim.hide = True
+            self.trim_dim.hide = True
+            self.validate_icon.hide = True
+            anchor = None
+            if geom.get("arc_center") is not None:
+                anchor = Vector(geom["arc_center"])
+            elif geom.get("intersection") is not None:
+                anchor = Vector(geom["intersection"])
+            if anchor is not None:
+                # Same screen-up lift as the valid branch so the cancel
+                # icon doesn't sit on top of any underlying preview lines
+                # in top-down view.
+                screen_up = billboard_rot @ Vector((0.0, 1.0, 0.0))
+                self.cancel_icon.matrix_basis = gizmo.billboarded_at(
+                    anchor + screen_up * self.ICON_Z_OFFSET, billboard_rot, scale=self.ICON_SCALE
+                )
+                self.cancel_icon.hide = False
+            else:
+                self.cancel_icon.hide = True
+            return
+
+        # Both ``valid=True`` and ``invalid_radius=True`` populate arc_center,
+        # apex, and tangent points. Keep the radius dim visible on overshoot
+        # so the user can drag back to a valid radius; hide validate so a
+        # commit can't surface an operator-level error.
+        invalid_radius = bool(geom.get("invalid_radius"))
+        self.radius_dim.hide = False
+        self.trim_dim.hide = False
+        self.cancel_icon.hide = False
+        self.validate_icon.hide = invalid_radius
+
+        # Cache the sweep angle so the trim widget's getter / setter can
+        # convert without re-running the geometry pipeline. Falls back to a
+        # right angle if the helper somehow omits it.
+        self._sweep_angle = float(geom.get("sweep_angle") or math.pi / 2)
+
+        arc = geom["arc"]
+        arc_center = Vector(geom["arc_center"])
+        tangent_a = Vector(geom["tangent_a"])
+        tangent_b = Vector(geom["tangent_b"])
+        intersection = Vector(geom["intersection"])
+
+        # Radius dimension at the arc apex with local +X pointing INWARD
+        # toward the arc center. Visual line traces apex → center, matching
+        # the radius itself; drag in the +X direction (toward arrow tip =
+        # toward arc center) increases the radius. Anchored at the FLOOR
+        # of the wall (z=0 of the arc samples) — the previous mid-height
+        # lift looked confused, hovering in space away from the geometry it
+        # describes.
+        apex_index = len(arc) // 2
+        apex = Vector(arc[apex_index])
+        inward = arc_center - apex
+        if inward.length > 1e-6:
+            inward.normalize()
+            self.radius_dim.matrix_basis = _wall_fillet_gizmo_x_matrix(apex, inward)
+            self.radius_dim.axis = inward
+            self.radius_dim.set_dimension_length(abs(props.radius))
+        else:
+            self.radius_dim.hide = True
+
+        # Trim dimension along wall A from intersection toward tangent_a;
+        # same DOF as the radius widget, both update ``radius``.
+        along_a = tangent_a - intersection
+        tangent_offset = abs(float(props.radius)) * math.tan(self._sweep_angle / 2.0)
+        if along_a.length > 1e-6 and tangent_offset > 1e-6:
+            along_a_dir = along_a.normalized()
+            self.trim_dim.matrix_basis = _wall_fillet_gizmo_x_matrix(intersection, along_a_dir)
+            self.trim_dim.axis = along_a_dir
+            self.trim_dim.set_dimension_length(tangent_offset)
+        else:
+            self.trim_dim.hide = True
+
+        # Validate / cancel anchored ABOVE the arc apex along the camera's
+        # screen-up direction so they're always visibly clear of the radius
+        # dim widget (which runs apex → arc_center). Screen-up keeps the
+        # offset perpendicular to the view plane at any angle — world +Z
+        # would collapse to zero on-screen in top-down view and plant the
+        # icons on top of the radius arrowhead.
+        screen_up = billboard_rot @ Vector((0.0, 1.0, 0.0))
+        anchor = apex + screen_up * self.ICON_Z_OFFSET
+        offset_x = billboard_rot @ Vector((self.ICON_SPACING_X, 0.0, 0.0))
+        self.validate_icon.matrix_basis = gizmo.billboarded_at(anchor, billboard_rot, scale=self.ICON_SCALE)
+        self.cancel_icon.matrix_basis = gizmo.billboarded_at(anchor + offset_x, billboard_rot, scale=self.ICON_SCALE)
+
+
+class GizmoWallFilletReedit(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin):
+    """Pen-icon re-edit gizmo for an existing fillet corner wall.
+
+    Mutually exclusive with an active preview and with ``GizmoWallEdition``."""
+
+    bl_idname = "OBJECT_GGT_bim_wall_fillet_reedit"
+    bl_label = "Wall Fillet Re-edit Gizmo"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_options = {"3D", "PERSISTENT"}
+
+    ICON_TOP_LIFT: ClassVar[float] = 0.15
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        if not tool.Blender.are_viewport_gizmos_enabled():
+            return False
+        if _wall_fillet_preview_active(context):
+            return False
+        selected = list(tool.Blender.get_selected_objects())
+        if len(selected) != 1:
+            return False
+        element = tool.Ifc.get_entity(selected[0])
+        if element is None or not element.is_a("IfcWall"):
+            return False
+        if not _is_fillet_corner_wall(element):
+            return False
+        # Both neighbour connections must still exist for the re-edit to
+        # recover the original corner.
+        has_a = any(r.is_a("IfcRelConnectsPathElements") for r in getattr(element, "ConnectedFrom", []))
+        has_b = any(r.is_a("IfcRelConnectsPathElements") for r in getattr(element, "ConnectedTo", []))
+        return has_a and has_b
+
+    def setup(self, context: bpy.types.Context) -> None:
+        colors = self._icon_colors()
+        self.edit_icon = self.setup_icon_gizmo(
+            "VIEW3D_GT_pen",
+            colors.default,
+            colors.highlight,
+            "bim.enable_wall_fillet_preview_from_corner",
+        )
+
+    def _all_icons(self) -> tuple[bpy.types.Gizmo, ...]:
+        return (self.edit_icon,)
+
+    def position_gizmos(self, context: bpy.types.Context) -> None:
+        selected = list(tool.Blender.get_selected_objects())
+        if len(selected) != 1:
+            self.edit_icon.hide = True
+            return
+        corner_obj = selected[0]
+        geom = get_wall_geom_cached(self, corner_obj)
+        if geom is None:
+            self.edit_icon.hide = True
+            return
+        billboard_rot = gizmo.get_billboard_rotation(context)
+        origin = corner_obj.matrix_world.translation
+        top_z = origin.z + (geom.get("height") or 3.0) + self.ICON_TOP_LIFT
+        anchor = Vector((origin.x, origin.y, top_z))
+        self.edit_icon.matrix_basis = gizmo.billboarded_at(anchor, billboard_rot)
+        self.edit_icon.hide = False
 
 
 class JoinWallsIntersection(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.Ifc.Operator):

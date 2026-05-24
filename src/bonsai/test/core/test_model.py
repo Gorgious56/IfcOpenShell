@@ -20,9 +20,7 @@
 
 """Tests for pure-Python math helpers in bonsai.core.model used by the wall gizmo system.
 
-These run in the core lane (``pytest test/core/``) — no Blender, no IFC file. The
-helpers under test live in ``bonsai/core/model.py`` and are deliberately pure (tuple
-in, tuple out) so they're exercisable without ``mathutils`` or ``bpy``."""
+These run in the core lane (``pytest test/core/``) — no Blender, no IFC file."""
 
 import math
 
@@ -566,3 +564,191 @@ class TestComputePathConnectionLocation:
         result = subject.compute_path_connection_location(seg_self, "NOTDEFINED", seg_other, "NOTDEFINED")
         assert result[0] == pytest.approx(2.5)
         assert result[1] == pytest.approx(0.0)
+
+
+class TestOpeningSplitPredicates:
+    """Branch behaviour of the three wall-split inequality predicates that
+    ``DumbWallJoiner.split`` uses to decide which side(s) of a cut keep each
+    opening. The strict ``>`` / ``<`` choices are the load-bearing invariant —
+    a regression to ``>=`` / ``<=`` here would silently drop an opening from
+    both walls when its extent collapses onto the cut."""
+
+    def test_straddling_opening_is_kept_on_both_sides(self):
+        # An opening with extent [0.3, 0.7] and cut at 0.6 overlaps both
+        # element1 and element2 — neither side may drop it.
+        assert subject.opening_is_past_cut(0.3, 0.6) is False, "straddling opening must remain on element1"
+        assert subject.opening_is_before_cut(0.7, 0.6) is False, "straddling opening must remain on element2"
+
+    def test_opening_entirely_past_cut_is_removed_from_element1_only(self):
+        # Extent [0.7, 0.9], cut 0.5 → opening sits wholly on element2's side.
+        assert subject.opening_is_past_cut(0.7, 0.5) is True  # removed from element1
+        assert subject.opening_is_before_cut(0.9, 0.5) is False  # kept on element2
+
+    def test_opening_entirely_before_cut_is_removed_from_element2_only(self):
+        # Mirror: extent [0.1, 0.3], cut 0.5 → opening sits wholly on element1's side.
+        assert subject.opening_is_past_cut(0.1, 0.5) is False  # kept on element1
+        assert subject.opening_is_before_cut(0.3, 0.5) is True  # removed from element2
+
+    def test_opening_touching_cut_at_boundary_stays_on_both_walls(self):
+        # Boundary touch: ``max_t == cut_percentage``. Strict inequality keeps
+        # the opening on both walls — the safer default. A regression to
+        # non-strict ``<=`` would remove it from element2.
+        assert subject.opening_is_past_cut(0.2, 0.5) is False  # kept on element1
+        assert subject.opening_is_before_cut(0.5, 0.5) is False  # kept on element2 (boundary == cut)
+
+    def test_degenerate_range_at_cut_keeps_opening_on_both_walls(self):
+        # Degenerate extent (t, t) at the cut, e.g. when the upstream extent
+        # helper fell back to the placement origin. Non-strict comparisons
+        # would match both removal conditions and both walls would drop the
+        # opening; strict comparisons keep it on both.
+        assert subject.opening_is_past_cut(0.5, 0.5) is False
+        assert subject.opening_is_before_cut(0.5, 0.5) is False
+
+    def test_filled_opening_void_straddle_keeps_void_on_neighbour(self):
+        # Filling on element1 (filling_position < cut_percentage) while the
+        # void straddles the cut → neighbour wall (element2) needs a void copy
+        # via ``_add_void_copy``.
+        assert subject.opening_straddles_cut(0.3, 0.7, 0.5) is True
+        assert 0.4 <= 0.5  # filling_position <= cut_percentage — production takes the else branch
+
+    def test_filled_opening_void_straddle_with_filling_on_far_side(self):
+        # Symmetric case: filling moves to element2 with the original void;
+        # element1 then needs a pure-void copy back.
+        assert subject.opening_straddles_cut(0.3, 0.7, 0.5) is True
+        assert 0.6 > 0.5  # filling_position > cut_percentage — production adds void copy to element1
+
+
+class TestOpeningPredicateNaNHandling:
+    """NaN / inf propagation. The upstream extent helper can return NaN when
+    the wall axis is degenerate (zero length) or when ``ifcopenshell.geom``
+    fails on a representation it can't process. The predicates must degrade
+    safely: leave the opening on both walls rather than silently drop it."""
+
+    def test_opening_is_past_cut_returns_false_on_nan(self):
+        # NaN compares false in any direction — opening stays on element1.
+        assert subject.opening_is_past_cut(math.nan, 0.5) is False
+        assert subject.opening_is_past_cut(0.5, math.nan) is False
+
+    def test_opening_is_before_cut_returns_false_on_nan(self):
+        # Same safe default on the high-t side.
+        assert subject.opening_is_before_cut(math.nan, 0.5) is False
+        assert subject.opening_is_before_cut(0.5, math.nan) is False
+
+    def test_opening_straddles_cut_returns_false_on_nan(self):
+        # A NaN bound cannot straddle anything; the chained comparison short-
+        # circuits to False on the first NaN comparison.
+        assert subject.opening_straddles_cut(math.nan, 0.7, 0.5) is False
+        assert subject.opening_straddles_cut(0.3, math.nan, 0.5) is False
+        assert subject.opening_straddles_cut(0.3, 0.7, math.nan) is False
+
+    def test_predicates_handle_infinity_as_well_defined_comparisons(self):
+        # Sanity check: +inf min_t IS past any finite cut; -inf max_t IS
+        # before any finite cut. This isn't a NaN safety property — it's
+        # documenting the well-defined IEEE semantics for completeness so a
+        # future change that wraps the predicates can't "fix" inf handling
+        # by accident.
+        assert subject.opening_is_past_cut(math.inf, 0.5) is True
+        assert subject.opening_is_before_cut(-math.inf, 0.5) is True
+
+
+class TestComputeFilletPolylines:
+    """The fillet preview helper for two axis segments meeting at a corner.
+
+    All segments lie on z=0 unless stated; the helper supports general 3D but
+    the wall-corner use case is planar."""
+
+    def _perpendicular_pair(self):
+        # Wall A along +X ending at (5, 0); wall B along +Y starting at (5, 0).
+        # Axes meet at (5, 0); both legs are 5m long.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((5.0, 0.0, 0.0), (5.0, 5.0, 0.0))
+        return seg_a, seg_b
+
+    def test_perpendicular_walls_return_quarter_arc(self):
+        seg_a, seg_b = self._perpendicular_pair()
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=1.0, arc_resolution=8)
+        assert r["valid"] is True
+        assert r["reason"] is None
+        assert r["sweep_angle"] == pytest.approx(math.pi / 2)
+        assert r["tangent_offset"] == pytest.approx(1.0)
+        assert r["arc_radius"] == pytest.approx(1.0)
+        assert len(r["arc"]) == 9  # arc_resolution + 1
+
+    def test_acute_corner_returns_larger_tangent_offset(self):
+        # 45° corner: wall A along +X, wall B going up-and-to-the-left at 135°.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((5.0, 0.0, 0.0), (5.0 - 5.0 * math.cos(math.radians(45)), 5.0 * math.sin(math.radians(45)), 0.0))
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=1.0)
+        assert r["valid"] is True
+        # angle between legs = 45° → sweep = 135° → tangent_offset = tan(67.5°) ≈ 2.414
+        assert r["sweep_angle"] == pytest.approx(math.radians(135))
+        assert r["tangent_offset"] == pytest.approx(math.tan(math.radians(67.5)))
+
+    def test_parallel_walls_return_invalid_with_parallel_reason(self):
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((0.0, 1.0, 0.0), (5.0, 1.0, 0.0))
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=0.5)
+        assert r["valid"] is False
+        assert r["reason"] == "parallel"
+        assert r["invalid_axes"] is not None
+        assert len(r["invalid_axes"]) == 2
+
+    def test_collinear_walls_return_invalid_near_collinear(self):
+        # End-to-end along +X: axes meet but sweep_angle ≈ 0.
+        seg_a = ((0.0, 0.0, 0.0), (5.0, 0.0, 0.0))
+        seg_b = ((5.0, 0.0, 0.0), (10.0, 0.0, 0.0))
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=0.5)
+        # Anti-parallel by direction (one approaches the corner from the
+        # west, the other leaves it to the east) — sweep_angle near zero.
+        assert r["valid"] is False
+        assert r["reason"] in {"near_collinear", "parallel"}
+
+    def test_radius_overshoot_returns_invalid_radius_with_arc_populated(self):
+        # 90° corner, but the radius is so large the tangent point lies past
+        # the far end of each leg. Decorator still needs arc + tangents to
+        # render the overshoot in red.
+        seg_a, seg_b = self._perpendicular_pair()  # legs are 5m
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=10.0, arc_resolution=4)
+        assert r["valid"] is False
+        assert r["reason"] == "invalid_radius"
+        assert r["invalid_radius"] is True
+        assert r["tangent_a"] is not None
+        assert r["tangent_b"] is not None
+        assert len(r["arc"]) == 5
+
+    def test_join_side_matches_axis_orientation(self):
+        # Wall A points away from the corner: seg_a[0] = corner, seg_a[1] = far.
+        # → join side is ATSTART (corner is at seg_a[0]).
+        # Wall B points toward the corner: seg_b[0] = far, seg_b[1] = corner.
+        # → join side is ATEND.
+        seg_a = ((5.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        seg_b = ((5.0, 5.0, 0.0), (5.0, 0.0, 0.0))
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=1.0)
+        assert r["valid"] is True
+        assert r["wall_a_join_side"] == "ATSTART"
+        assert r["wall_b_join_side"] == "ATEND"
+
+    def test_arc_endpoints_match_tangent_points(self):
+        seg_a, seg_b = self._perpendicular_pair()
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=1.0, arc_resolution=16)
+        assert r["valid"] is True
+        first = r["arc"][0]
+        last = r["arc"][-1]
+        tangent_a = r["tangent_a"]
+        tangent_b = r["tangent_b"]
+        for coord_arc, coord_tan in zip(first, tangent_a):
+            assert coord_arc == pytest.approx(coord_tan, abs=1e-9)
+        for coord_arc, coord_tan in zip(last, tangent_b):
+            assert coord_arc == pytest.approx(coord_tan, abs=1e-9)
+
+    def test_arc_lies_in_horizontal_plane_for_floorplan_walls(self):
+        seg_a, seg_b = self._perpendicular_pair()
+        r = subject.compute_fillet_polylines(seg_a, seg_b, radius=1.0, arc_resolution=32)
+        assert r["valid"] is True
+        for point in r["arc"]:
+            assert point[2] == pytest.approx(0.0, abs=1e-9)
+        # All arc points sit at distance ``radius`` from arc_center.
+        cx, cy, cz = r["arc_center"]
+        for x, y, z in r["arc"]:
+            distance = ((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) ** 0.5
+            assert distance == pytest.approx(1.0, abs=1e-9)

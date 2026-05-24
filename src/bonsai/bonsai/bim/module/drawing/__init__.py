@@ -141,6 +141,9 @@ classes = (
     gizmos.GizmoLockOpen,
     gizmos.GizmoLockClosed,
     gizmos.GizmoArc,
+    gizmos.GizmoFillet,
+    gizmos.GizmoWallCornerIcon,
+    gizmos.GizmoWallTeeIcon,
     gizmos.GizmoPen,
     gizmos.GizmoValidate,
     gizmos.GizmoCancel,
@@ -159,6 +162,7 @@ classes = (
     gizmos.GizmoOffsetInterior,
     gizmos.GizmoAddOpening,
     gizmos.GizmoCycle,
+    gizmos.GizmoMenu,
     # Drawing-specific gizmos
     gizmos.UglyDotGizmo,
     gizmos.ExtrusionGuidesGizmo,
