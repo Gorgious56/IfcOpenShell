@@ -73,6 +73,7 @@ __all__ = [  # noqa: RUF022 (unsorted `__all__`)
     "GizmoDimension",
     "DimensionRenderer",
     "CycleTypeMixin",
+    "PickTypeMixin",
     "BaseParametricGizmoGroup",
     "UglyDotGizmo",
     "ExtrusionGuidesGizmo",
@@ -4516,6 +4517,100 @@ class CycleTypeMixin:
         direction = -1 if self.reverse else 1
         setattr(props, self.type_attr, types[(idx + direction) % len(types)])
 
+        return {"FINISHED"}
+
+
+class PickTypeMixin:
+    """Mixin for operators that open a popup menu to pick from a type literal.
+
+    Subclasses define ``element_checker``, ``props_getter``, ``type_literal``,
+    ``type_attr``; ``skip_element_check`` bypasses element validation.
+
+    Empty ``value`` ⇒ ``invoke`` opens the popup; non-empty ⇒ the user picked
+    an item and ``_pick_type`` applies it.
+
+    When invoked mid-click (e.g. from a gizmo's ``target_set_operator``), the
+    menu opens only after the originating ``LEFTMOUSE`` releases. Otherwise
+    the still-pressed click flows straight into Blender's drag-through-pick
+    gesture and the menu commits whichever item the cursor drifts over on
+    release. Other invocation paths (command-palette / F3, EXEC_DEFAULT, F6
+    redo) bypass the wait and open the menu immediately.
+
+    Test doubles must be set on the operator instance — predicates are bound
+    at class-definition time."""
+
+    element_checker: Callable[[ifcopenshell.entity_instance], bool]
+    props_getter: Callable[[bpy.types.Object], bpy.types.PropertyGroup]
+    type_literal: type
+    type_attr: str
+    skip_element_check: bool = False
+
+    # Carries the picked value through invoke→execute; empty default
+    # distinguishes "open popup" from "apply".
+    value: bpy.props.StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Open the picker menu, or apply a value that was preset by a
+        menu-item click.
+
+        Routing through ``execute()`` keeps subclass IFC-transaction wrapping
+        in the loop and means F6 redo / ``EXEC_DEFAULT`` reach the apply path."""
+        if self.value:
+            return self.execute(context)
+
+        obj = context.active_object
+        if not obj:
+            return {"CANCELLED"}
+
+        if not self.skip_element_check:
+            element = tool.Ifc.get_entity(obj)
+            if not element or not self.element_checker(element):
+                return {"CANCELLED"}
+
+        if event.value == "PRESS":
+            context.window_manager.modal_handler_add(self)
+            return {"RUNNING_MODAL"}
+        return self._open_picker(context)
+
+    def modal(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            return self._open_picker(context)
+        if event.type in {"RIGHTMOUSE", "ESC"}:
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _open_picker(self, context: bpy.types.Context) -> set[str]:
+        bl_idname = self.bl_idname
+        values = list(get_args(self.type_literal))
+
+        def draw(menu_self, _menu_context):
+            layout = menu_self.layout
+            for v in values:
+                op = layout.operator(bl_idname, text=v)
+                op.value = v
+
+        context.window_manager.popup_menu(draw, title=self.bl_label, icon="MENU_PANEL")
+        return {"FINISHED"}
+
+    def _pick_type(self, context: bpy.types.Context) -> set[str]:
+        if not self.value:
+            # No-op rather than re-open the menu, so command-palette misuse
+            # doesn't infinite-loop.
+            return {"CANCELLED"}
+        obj = context.active_object
+        if not obj:
+            return {"CANCELLED"}
+
+        if not self.skip_element_check:
+            element = tool.Ifc.get_entity(obj)
+            if not element or not self.element_checker(element):
+                return {"CANCELLED"}
+
+        if self.value not in get_args(self.type_literal):
+            return {"CANCELLED"}
+
+        props = self.props_getter(obj)
+        setattr(props, self.type_attr, self.value)
         return {"FINISHED"}
 
 

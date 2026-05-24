@@ -81,9 +81,8 @@ def regenerate_stair_mesh(obj: bpy.types.Object) -> None:
 
 
 def update_ifc_stair_props(obj: bpy.types.Object) -> None:
-    """should be called after new geometry settled
-    since it's going to update ifc representation
-    """
+    """Write the stair's geometric props to its IFC representation.
+    Call after the bmesh is settled."""
     element = tool.Ifc.get_entity(obj)
     assert element
     props = tool.Model.get_stair_props(obj)
@@ -423,20 +422,20 @@ class SetStairTreads(bpy.types.Operator):
         return f"Number of Treads: {input_str}_{validity}  |  Enter to confirm, Esc to cancel"
 
 
-class CycleStairType(bpy.types.Operator, gizmo.CycleTypeMixin):
-    """Cycle through stair types. Shift+click to cycle in reverse."""
+class PickStairType(bpy.types.Operator, gizmo.PickTypeMixin):
+    """Pick a stair type from a popup menu."""
 
-    bl_idname = "bim.cycle_stair_type"
-    bl_label = "Cycle Stair Type"
+    bl_idname = "bim.pick_stair_type"
+    bl_label = "Pick Stair Type"
     bl_options = {"REGISTER", "UNDO"}
 
-    props_getter = "get_stair_props"
+    props_getter = tool.Model.get_stair_props
     type_literal = tool.Model.StairType
     type_attr = "stair_type"
     skip_element_check = True
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        return self._cycle_type(context)
+        return self._pick_type(context)
 
 
 # Tread run accessors - callbacks that delegate to BIMStairProperties methods
@@ -451,7 +450,6 @@ _tread_run_accessors = {
     ),
 }
 
-# Shorthand for gizmo offset constants used in DimensionGizmoConfig lambdas
 _G = gizmo.BaseParametricGizmoGroup
 
 
@@ -480,7 +478,7 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_stair"
     finish_editing_operator = "bim.finish_editing_stair"
     cancel_editing_operator = "bim.cancel_editing_stair"
-    cycle_type_operator = "bim.cycle_stair_type"
+    pick_type_operator = "bim.pick_stair_type"
 
     def get_icon_y_extent(self, props: "BIMStairProperties") -> tuple[float, float]:
         """Get Y extents for stair icon positioning.
@@ -585,7 +583,7 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     ]
 
     # Metadata-driven dispatch for props and preferences
-    props_getter = "get_stair_props"
+    props_getter = tool.Model.get_stair_props
     gizmo_pref_name = "stair"
 
     @classmethod
@@ -593,19 +591,32 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         return tool.Blender.Modifier.is_stair(element)
 
     def setup_element_specific_gizmos(self, context: bpy.types.Context) -> None:
-        """Create stair-specific icon gizmos (lock, plus, minus)."""
-        self.lock_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock",
-            self.COLOR_BLUE,
+        # Static open/closed lock pairs; consumer toggles visibility. The
+        # total-length pair colours each member at setup (green/red);
+        # tread-lock pair stays neutral.
+        self.lock_open_gizmo = self.create_icon_gizmo(
+            "VIEW3D_GT_lock_open",
+            self.COLOR_GREEN,
             "bim.toggle_stair_property",
-            prop_path="BIMStairProperties.total_length_lock",
             property_name="total_length_lock",
         )
-        self.tread_lock_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock",
-            (1.0, 1.0, 1.0),
+        self.lock_closed_gizmo = self.create_icon_gizmo(
+            "VIEW3D_GT_lock_closed",
+            self.COLOR_RED,
             "bim.toggle_stair_property",
-            prop_path="BIMStairProperties.custom_tread_lock",
+            property_name="total_length_lock",
+        )
+        tread_lock_color = (1.0, 1.0, 1.0)
+        self.tread_lock_open_gizmo = self.create_icon_gizmo(
+            "VIEW3D_GT_lock_open",
+            tread_lock_color,
+            "bim.toggle_stair_property",
+            property_name="custom_tread_lock",
+        )
+        self.tread_lock_closed_gizmo = self.create_icon_gizmo(
+            "VIEW3D_GT_lock_closed",
+            tread_lock_color,
+            "bim.toggle_stair_property",
             property_name="custom_tread_lock",
         )
         self.plus_gizmo = self.create_icon_gizmo(
@@ -625,30 +636,27 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         self.update_tread_count_gizmos(props)
 
     def update_lock_gizmo(self, props: "BIMStairProperties") -> None:
-        """Update lock gizmo color and visibility. Positioning is handled
-        per-frame by the dimension-positioning hook."""
-        gizmo_prefs = self.get_gizmo_prefs()
-        if not self.update_gizmo_visibility(self.lock_gizmo, props.is_editing, gizmo_prefs.lock):
-            return  # Hidden, skip color update
-        self.lock_gizmo.color = self.COLOR_RED if props.total_length_lock else self.COLOR_GREEN
+        if not hasattr(self, "lock_open_gizmo"):
+            return
+        editing = props.is_editing
+        locked = bool(props.total_length_lock)
+        self.lock_open_gizmo.hide = not editing or locked
+        self.lock_closed_gizmo.hide = not editing or not locked
 
     def update_tread_lock_gizmo(self, props: "BIMStairProperties") -> None:
-        """Update visibility of tread lock gizmo. Positioning is handled in _update_editing_icon_positions."""
-        if not hasattr(self, "tread_lock_gizmo"):
+        if not hasattr(self, "tread_lock_open_gizmo"):
             return
-        gizmo_prefs = self.get_gizmo_prefs()
-        self.update_gizmo_visibility(self.tread_lock_gizmo, props.is_editing, gizmo_prefs.lock)
+        editing = props.is_editing
+        locked = bool(props.custom_tread_lock)
+        self.tread_lock_open_gizmo.hide = not editing or locked
+        self.tread_lock_closed_gizmo.hide = not editing or not locked
 
     def update_tread_count_gizmos(self, props: "BIMStairProperties") -> None:
-        """Update visibility of +/- tread count gizmos. Positioning is handled in _update_editing_icon_positions."""
         if not hasattr(self, "plus_gizmo") or not hasattr(self, "minus_gizmo"):
             return
-        gizmo_prefs = self.get_gizmo_prefs()
-        self.update_gizmo_visibility(self.plus_gizmo, props.is_editing, gizmo_prefs.plus)
+        self.update_gizmo_visibility(self.plus_gizmo, props.is_editing, True)
         # Minus has additional condition: number_of_treads > 1
-        self.update_gizmo_visibility(
-            self.minus_gizmo, props.is_editing and props.number_of_treads > 1, gizmo_prefs.minus
-        )
+        self.update_gizmo_visibility(self.minus_gizmo, props.is_editing and props.number_of_treads > 1, True)
 
     def _update_dimension_gizmo_positions(
         self, context: bpy.types.Context, mw: Matrix, props: "BIMStairProperties"  # noqa: ARG002
@@ -728,8 +736,9 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     ) -> None:
         """Update lock gizmo position based on Y view direction."""
         y_pos = self.get_y_position_for_view(props, viewing_from_negative_y, use_offset=True)
-        self.set_icon_gizmo_position(
-            "lock_gizmo",
+        self.set_icon_gizmo_pair_position(
+            "lock_open_gizmo",
+            "lock_closed_gizmo",
             mw,
             total_run + self.ICON_Z_OFFSET,
             y_pos,
@@ -753,8 +762,9 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         self.set_icon_gizmo_position(
             "cycle_gizmo", mw, self.ICON_CYCLE_X, y_pos, icon_z, billboard_rot, scale=self.ICON_CYCLE_SCALE
         )
-        self.set_icon_gizmo_position(
-            "tread_lock_gizmo",
+        self.set_icon_gizmo_pair_position(
+            "tread_lock_open_gizmo",
+            "tread_lock_closed_gizmo",
             mw,
             self.ICON_TREAD_LOCK_X,
             y_pos,

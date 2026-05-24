@@ -38,14 +38,14 @@ import pytest
 
 pytestmark = pytest.mark.model
 
+# Matrix-rotation float epsilon. Tight enough to catch a per-element drift
+# from the mw-rotation @ billboard_rot regression yet loose enough to absorb
+# the float drift of constructing a Matrix.Rotation via degree-to-radian
+# conversion.
+MATRIX_ROTATION_TOLERANCE = 1e-6
 
-@pytest.fixture(autouse=True)
-def _require_real_bpy():
-    if not isinstance(bpy, types.ModuleType) or hasattr(bpy, "_mock_name"):
-        pytest.skip("requires real Blender (bpy is mocked or absent)")
 
-
-def _rotation_close(a, b, tol: float = 1e-6) -> bool:
+def _rotation_close(a, b, tol: float = MATRIX_ROTATION_TOLERANCE) -> bool:
     for row_a, row_b in zip(a, b):
         for va, vb in zip(row_a, row_b):
             if abs(va - vb) > tol:
@@ -80,7 +80,7 @@ def test_billboarded_at_translation_is_world_pos():
 
     world_pos = Vector((1.23, 4.56, 7.89))
     result = billboarded_at(world_pos, Matrix.Identity(4), scale=0.5)
-    assert (result.translation - world_pos).length < 1e-6
+    assert (result.translation - world_pos).length < MATRIX_ROTATION_TOLERANCE
 
 
 def test_set_icon_gizmo_position_does_not_apply_object_rotation():
@@ -132,4 +132,104 @@ def test_set_icon_gizmo_position_does_not_apply_object_rotation():
     assert captured["name"] == "validate_gizmo"
     for row_a, row_b in zip(stub.matrix_basis, expected):
         for va, vb in zip(row_a, row_b):
-            assert abs(va - vb) < 1e-6
+            assert abs(va - vb) < MATRIX_ROTATION_TOLERANCE
+
+
+# ---------------------------------------------------------------------------
+# Stair lock visibility — the static open/closed pair pattern hides one
+# member based on a typed prop read. The contract: when editing is off both
+# lock glyphs are hidden; when editing is on, the OPEN glyph is visible iff
+# the property is unlocked, otherwise the CLOSED glyph is visible. Both
+# update_lock_gizmo (total_length_lock) and update_tread_lock_gizmo
+# (custom_tread_lock) share this contract; tested in isolation by calling
+# the methods unbound with a SimpleNamespace stand-in self.
+# ---------------------------------------------------------------------------
+
+
+def _make_lock_pair_stub():
+    open_gizmo = types.SimpleNamespace(hide=False)
+    closed_gizmo = types.SimpleNamespace(hide=False)
+    return open_gizmo, closed_gizmo
+
+
+def test_update_lock_gizmo_bails_when_setup_not_complete():
+    """``setup_element_specific_gizmos`` runs after the GizmoGroup is created;
+    a refresh that fires before setup completes must no-op rather than
+    AttributeError on the missing pair attributes."""
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    self_ns = types.SimpleNamespace()  # no lock_open_gizmo attribute
+    props = types.SimpleNamespace(is_editing=True, total_length_lock=True)
+    GizmoStairEdition.update_lock_gizmo(self_ns, props)
+    # No exception; no attribute side-effects.
+    assert not hasattr(self_ns, "lock_open_gizmo")
+
+
+def test_update_lock_gizmo_hides_both_when_not_editing():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    open_gizmo, closed_gizmo = _make_lock_pair_stub()
+    self_ns = types.SimpleNamespace(lock_open_gizmo=open_gizmo, lock_closed_gizmo=closed_gizmo)
+    props = types.SimpleNamespace(is_editing=False, total_length_lock=True)
+    GizmoStairEdition.update_lock_gizmo(self_ns, props)
+    assert open_gizmo.hide is True
+    assert closed_gizmo.hide is True
+
+
+def test_update_lock_gizmo_shows_closed_when_locked():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    open_gizmo, closed_gizmo = _make_lock_pair_stub()
+    self_ns = types.SimpleNamespace(lock_open_gizmo=open_gizmo, lock_closed_gizmo=closed_gizmo)
+    props = types.SimpleNamespace(is_editing=True, total_length_lock=True)
+    GizmoStairEdition.update_lock_gizmo(self_ns, props)
+    assert open_gizmo.hide is True
+    assert closed_gizmo.hide is False
+
+
+def test_update_lock_gizmo_shows_open_when_unlocked():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    open_gizmo, closed_gizmo = _make_lock_pair_stub()
+    self_ns = types.SimpleNamespace(lock_open_gizmo=open_gizmo, lock_closed_gizmo=closed_gizmo)
+    props = types.SimpleNamespace(is_editing=True, total_length_lock=False)
+    GizmoStairEdition.update_lock_gizmo(self_ns, props)
+    assert open_gizmo.hide is False
+    assert closed_gizmo.hide is True
+
+
+def test_update_tread_lock_gizmo_bails_when_setup_not_complete():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    self_ns = types.SimpleNamespace()
+    props = types.SimpleNamespace(is_editing=True, custom_tread_lock=True)
+    GizmoStairEdition.update_tread_lock_gizmo(self_ns, props)
+    assert not hasattr(self_ns, "tread_lock_open_gizmo")
+
+
+def test_update_tread_lock_gizmo_shows_closed_when_locked():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    open_gizmo, closed_gizmo = _make_lock_pair_stub()
+    self_ns = types.SimpleNamespace(
+        tread_lock_open_gizmo=open_gizmo,
+        tread_lock_closed_gizmo=closed_gizmo,
+    )
+    props = types.SimpleNamespace(is_editing=True, custom_tread_lock=True)
+    GizmoStairEdition.update_tread_lock_gizmo(self_ns, props)
+    assert open_gizmo.hide is True
+    assert closed_gizmo.hide is False
+
+
+def test_update_tread_lock_gizmo_shows_open_when_unlocked():
+    from bonsai.bim.module.model.stair import GizmoStairEdition
+
+    open_gizmo, closed_gizmo = _make_lock_pair_stub()
+    self_ns = types.SimpleNamespace(
+        tread_lock_open_gizmo=open_gizmo,
+        tread_lock_closed_gizmo=closed_gizmo,
+    )
+    props = types.SimpleNamespace(is_editing=True, custom_tread_lock=False)
+    GizmoStairEdition.update_tread_lock_gizmo(self_ns, props)
+    assert open_gizmo.hide is False
+    assert closed_gizmo.hide is True
