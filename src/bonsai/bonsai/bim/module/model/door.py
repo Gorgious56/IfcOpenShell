@@ -706,11 +706,11 @@ class ToggleDoorSwing(bpy.types.Operator, tool.Ifc.Operator):
         return {"FINISHED"}
 
 
-class CycleDoorType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
-    """Cycle through available door types. Shift+click to cycle in reverse."""
+class PickDoorType(bpy.types.Operator, tool.Ifc.Operator, gizmo.PickTypeMixin):
+    """Pick a door type from a popup menu."""
 
-    bl_idname = "bim.cycle_door_type"
-    bl_label = "Cycle Door Type"
+    bl_idname = "bim.pick_door_type"
+    bl_label = "Pick Door Type"
     bl_options = {"REGISTER", "UNDO"}
 
     element_checker = tool.Blender.Modifier.is_door
@@ -719,7 +719,7 @@ class CycleDoorType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin)
     type_attr = "door_type"
 
     def _execute(self, context: bpy.types.Context) -> set[str]:
-        return self._cycle_type(context)
+        return self._pick_type(context)
 
 
 class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
@@ -732,7 +732,7 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_door"
     finish_editing_operator = "bim.finish_editing_door"
     cancel_editing_operator = "bim.cancel_editing_door"
-    cycle_type_operator = "bim.cycle_door_type"
+    cycle_type_operator = "bim.pick_door_type"
 
     # Declarative dimension gizmo configuration with visibility and position
     # matrix_position lambdas replace the get_dimension_matrix_* methods

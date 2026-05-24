@@ -550,11 +550,11 @@ class RemoveWindow(bpy.types.Operator, tool.Ifc.Operator):
         return {"FINISHED"}
 
 
-class CycleWindowType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
-    """Cycle through available window types. Shift+click to cycle in reverse."""
+class PickWindowType(bpy.types.Operator, tool.Ifc.Operator, gizmo.PickTypeMixin):
+    """Pick a window type from a popup menu."""
 
-    bl_idname = "bim.cycle_window_type"
-    bl_label = "Cycle Window Type"
+    bl_idname = "bim.pick_window_type"
+    bl_label = "Pick Window Type"
     bl_options = {"REGISTER", "UNDO"}
 
     element_checker = tool.Blender.Modifier.is_window
@@ -563,7 +563,7 @@ class CycleWindowType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixi
     type_attr = "window_type"
 
     def _execute(self, context: bpy.types.Context) -> set[str]:
-        return self._cycle_type(context)
+        return self._pick_type(context)
 
 
 def _make_frame_accessors(attr_name: str, panel_index: int) -> tuple[
@@ -592,7 +592,7 @@ class GizmoWindowEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_window"
     finish_editing_operator = "bim.finish_editing_window"
     cancel_editing_operator = "bim.cancel_editing_window"
-    cycle_type_operator = "bim.cycle_window_type"
+    cycle_type_operator = "bim.pick_window_type"
 
     # matrix_position lambdas replace the get_dimension_matrix_* methods
     dimension_gizmo_props = [
