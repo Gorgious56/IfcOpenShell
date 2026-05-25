@@ -20,11 +20,29 @@
 
 """Four wall-offset dimension gizmos (left / right / top / bottom) shared by door and
 window edit gizmo groups — both fillings sit in a LAYER2 wall and the offset math is
-identical."""
+identical.
+
+The compute side returns a *signed* value on the X axis (negative when the filling
+is 180°-flipped onto the wall's opposite face) so the gizmo framework auto-flips
+the rendered arrow; the apply side takes ``abs(value)`` because the user-facing
+offset is always positive. Z-axis values are unsigned in both directions.
+
+Fillings are assumed to align with the wall's local X axis to within ±90° — the
+parametric door/window construction path enforces this, and the X-sign math
+falls back to +1 if ``col[0].x`` lands on the ambiguous zero (filling rotated
+exactly 90° in the wall plane).
+
+Every public entry point falls back to a safe no-op when the host-wall chain
+cannot be resolved: reads return 0.0, writes do nothing, and gizmo anchors
+return a filling-relative position. This keeps the gizmos non-crashing when a
+filling momentarily loses its host (e.g. mid-edit, partially-loaded files).
+
+``_GEOM_CACHE`` is module-scoped and persists across tests — tests must call
+``clear_caches()`` between cases."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from mathutils import Vector
 
@@ -34,7 +52,13 @@ from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 if TYPE_CHECKING:
     import bpy
 
-    FillingProps = "BIMDoorProperties | BIMWindowProperties"
+
+class FillingProps(Protocol):
+    """Structural subset of door/window props this module touches."""
+
+    id_data: bpy.types.Object
+    overall_width: float
+    overall_height: float
 
 
 # Wall-local frame axis indices. Y (depth) is unused — fillings sit on the wall's centreline.
@@ -53,10 +77,14 @@ class _HostWallGeom(NamedTuple):
 
 
 class _AxisExtent(NamedTuple):
-    """``[low, high]`` interval on one wall-local axis; low = near end (left/bottom)."""
+    """``[low, high]`` interval on one wall-local axis; low = near end.
+
+    ``x_sign`` is +1 / -1 for an X-axis filling extent only (carries the
+    180° auto-flip); always 1.0 elsewhere."""
 
     low: float
     high: float
+    x_sign: float = 1.0
 
 
 class _Edge(NamedTuple):
@@ -105,15 +133,18 @@ def _compute_host_wall_geom(filling_obj: bpy.types.Object) -> _HostWallGeom | No
 
 
 def _filling_axis_extent(props: FillingProps, host_wall_obj: bpy.types.Object, axis_index: int) -> _AxisExtent:
-    """Filling footprint on the wall's local axis. X-axis extent is signed by the
-    filling's orientation against the wall (180° flip lands it on the opposite face);
-    Z is direction-preserving so the footprint is unsigned."""
+    """Filling footprint on the wall's local axis.
+
+    X-axis extent carries the filling's orientation sign (180° flip onto
+    the opposite face) in ``x_sign``."""
     filling_in_wall = host_wall_obj.matrix_world.inverted() @ props.id_data.matrix_world
     origin = filling_in_wall.translation[axis_index]
     if axis_index == _AXIS_X:
-        sign = 1.0 if filling_in_wall.col[0].x >= 0.0 else -1.0
-        signed_width = sign * props.overall_width
-        return _AxisExtent(origin + min(0.0, signed_width), origin + max(0.0, signed_width))
+        # col[0].x is the X-component of the filling's local X axis in the wall-local frame:
+        # +1 when filling's +X aligns with wall's +X, -1 after a 180° Z-flip.
+        x_sign = 1.0 if filling_in_wall.col[0].x >= 0.0 else -1.0
+        signed_width = x_sign * props.overall_width
+        return _AxisExtent(origin + min(0.0, signed_width), origin + max(0.0, signed_width), x_sign)
     return _AxisExtent(origin, origin + props.overall_height)
 
 
@@ -125,13 +156,11 @@ def _wall_axis_extent(geom: _HostWallGeom, axis_index: int) -> _AxisExtent:
     return _AxisExtent(0.0, geom.height)
 
 
-def _filling_x_sign(props: FillingProps) -> float:
-    """+1 if the filling's local +X aligns with the wall's local +X, else -1."""
-    geom = _host_wall_geom(props.id_data)
-    if not geom:
-        return 1.0
-    filling_in_wall = geom.wall_obj.matrix_world.inverted() @ props.id_data.matrix_world
-    return 1.0 if filling_in_wall.col[0].x >= 0.0 else -1.0
+def _offset_from_extents(filling: _AxisExtent, wall: _AxisExtent, is_max_end: bool) -> float:
+    """Distance from the wall edge to the filling's matching edge on the same axis."""
+    if is_max_end:
+        return wall.high - filling.high
+    return filling.low - wall.low
 
 
 def _translate_along_wall_axis(
@@ -153,9 +182,7 @@ def _get_offset(props: FillingProps, edge: _Edge) -> float:
         return 0.0
     filling = _filling_axis_extent(props, geom.wall_obj, edge.axis_index)
     wall = _wall_axis_extent(geom, edge.axis_index)
-    if edge.is_max_end:
-        return wall.high - filling.high
-    return filling.low - wall.low
+    return _offset_from_extents(filling, wall, edge.is_max_end)
 
 
 def _set_offset(props: FillingProps, edge: _Edge, value: float) -> None:
@@ -175,43 +202,13 @@ def has_host_wall(props: FillingProps) -> bool:
     return _host_wall_geom(props.id_data) is not None
 
 
-def get_wall_offset_left(props: FillingProps) -> float:
-    return _get_offset(props, _LEFT)
-
-
-def get_wall_offset_right(props: FillingProps) -> float:
-    return _get_offset(props, _RIGHT)
-
-
-def get_wall_offset_bottom(props: FillingProps) -> float:
-    return _get_offset(props, _BOTTOM)
-
-
-def get_wall_offset_top(props: FillingProps) -> float:
-    return _get_offset(props, _TOP)
-
-
-def set_wall_offset_left(props: FillingProps, value: float) -> None:
-    _set_offset(props, _LEFT, value)
-
-
-def set_wall_offset_right(props: FillingProps, value: float) -> None:
-    _set_offset(props, _RIGHT, value)
-
-
-def set_wall_offset_bottom(props: FillingProps, value: float) -> None:
-    _set_offset(props, _BOTTOM, value)
-
-
-def set_wall_offset_top(props: FillingProps, value: float) -> None:
-    _set_offset(props, _TOP, value)
-
-
 def _edge_position(props: FillingProps, edge: _Edge) -> Vector:
     """Gizmo anchor in filling-local space, at the wall edge, pointing toward the filling."""
     geom = _host_wall_geom(props.id_data)
     if not geom:
-        return Vector((0.0, 0.0, props.overall_height / 2))
+        if edge.axis_index == _AXIS_X:
+            return Vector((0.0, 0.0, props.overall_height / 2))
+        return Vector((props.overall_width / 2, 0.0, props.overall_height if edge.is_max_end else 0.0))
     wall = _wall_axis_extent(geom, edge.axis_index)
     edge_value = wall.high if edge.is_max_end else wall.low
     if edge.axis_index == _AXIS_X:
@@ -224,29 +221,15 @@ def _edge_position(props: FillingProps, edge: _Edge) -> Vector:
     return Vector((props.overall_width / 2, 0.0, edge_value - filling_z_in_wall))
 
 
-def left_offset_position(props: FillingProps) -> Vector:
-    return _edge_position(props, _LEFT)
-
-
-def right_offset_position(props: FillingProps) -> Vector:
-    return _edge_position(props, _RIGHT)
-
-
-def bottom_offset_position(props: FillingProps) -> Vector:
-    return _edge_position(props, _BOTTOM)
-
-
-def top_offset_position(props: FillingProps) -> Vector:
-    return _edge_position(props, _TOP)
-
-
 def _compute_value(props: FillingProps, edge: _Edge) -> float:
     """Renderer-side value. X-axis edges return a signed value so the gizmo's
     auto-flip kicks in for fillings on the wall's opposite face; Z-axis returns unsigned."""
-    value = _get_offset(props, edge)
-    if edge.axis_index == _AXIS_X:
-        return _filling_x_sign(props) * value
-    return value
+    geom = _host_wall_geom(props.id_data)
+    if not geom:
+        return 0.0
+    filling = _filling_axis_extent(props, geom.wall_obj, edge.axis_index)
+    wall = _wall_axis_extent(geom, edge.axis_index)
+    return filling.x_sign * _offset_from_extents(filling, wall, edge.is_max_end)
 
 
 def _apply_value(props: FillingProps, edge: _Edge, value: float) -> None:
@@ -258,16 +241,8 @@ def _apply_value(props: FillingProps, edge: _Edge, value: float) -> None:
         _set_offset(props, edge, value)
 
 
-def get_wall_offset_left_signed(props: FillingProps) -> float:
-    return _compute_value(props, _LEFT)
-
-
-def get_wall_offset_right_signed(props: FillingProps) -> float:
-    return _compute_value(props, _RIGHT)
-
-
-# attr_name doubles as the GizmoPreferences{Door,Window} BoolProperty name — keep in sync
-# with the registrations in bim/ui.py.
+# attr_name identifies the gizmo within its group; values flow through
+# compute/apply, not via a registered property.
 WALL_OFFSET_GIZMO_CONFIGS: list[DimensionGizmoConfig] = [
     DimensionGizmoConfig(
         attr_name="host_wall_offset_left",

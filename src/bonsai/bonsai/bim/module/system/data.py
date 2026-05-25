@@ -156,8 +156,12 @@ class PortData:
         return bool(cls.element and cls.element.is_a("IfcDistributionPort"))
 
     @classmethod
-    def port_relating_object_name(cls) -> str:
-        return tool.Ifc.get_object(tool.System.get_port_relating_element(cls.element)).name
+    def port_relating_object_name(cls) -> Union[str, None]:
+        relating_element = tool.System.get_port_relating_element(cls.element)
+        if relating_element is None:
+            return None
+        relating_obj = tool.Ifc.get_object(relating_element)
+        return relating_obj.name if relating_obj else None
 
     @classmethod
     def port_connected_object_name(cls) -> Union[str, None]:
@@ -165,7 +169,10 @@ class PortData:
         if not connected_port:
             return
         connected_element = tool.System.get_port_relating_element(connected_port)
-        return tool.Ifc.get_object(connected_element).name
+        if connected_element is None:
+            return None
+        connected_obj = tool.Ifc.get_object(connected_element)
+        return connected_obj.name if connected_obj else None
 
     @classmethod
     def located_ports_data(cls) -> list[dict[str, Any]]:
@@ -176,10 +183,12 @@ class PortData:
             # port may be not present as a scene object
             port_obj_name = getattr(tool.Ifc.get_object(port), "name", None)
             connected_port = tool.System.get_connected_port(port)
+            connected_obj_name = None
             if connected_port:
-                connected_obj_name = tool.Ifc.get_object(tool.System.get_port_relating_element(connected_port)).name
-            else:
-                connected_obj_name = None
+                connected_element = tool.System.get_port_relating_element(connected_port)
+                if connected_element is not None:
+                    connected_obj = tool.Ifc.get_object(connected_element)
+                    connected_obj_name = connected_obj.name if connected_obj else None
 
             data.append(
                 {

@@ -35,6 +35,15 @@ import ifcopenshell.util.unit
 
 PRECISION = 1.0e-5
 
+# Numpy axis-index helpers for 3D coordinates. Use these instead of redefining
+# local copies in every geometry-builder module — they index ``np.ndarray``
+# vectors of shape ``(3,)`` or ``(N, 3)``.
+NP_X, NP_Y, NP_Z = 0, 1, 2
+NP_XY = slice(2)
+NP_XZ = [0, 2]
+NP_YZ = [1, 2]
+NP_YX = [1, 0]
+
 
 if TYPE_CHECKING:
     # NOTE: mathutils is never used at runtime in ifcopenshell,

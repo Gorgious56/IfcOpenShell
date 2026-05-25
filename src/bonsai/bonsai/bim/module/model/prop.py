@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Union, get_args
 import bpy
 import ifcopenshell.util.element
 from bpy.types import NodeTree, PropertyGroup
+from ifcopenshell.api.geometry import TERMINAL_TYPE as CapType
 from mathutils import Vector
 
 import bonsai.tool as tool
@@ -33,8 +34,10 @@ from bonsai.bim.module.drawing.decoration import CutDecorator
 from bonsai.bim.module.model.data import AuthoringData
 from bonsai.bim.module.model.decorator import (
     BoundingBoxDecorator,
+    MEPSystemPathDecorator,
     SlabDirectionDecorator,
     WallAxisDecorator,
+    WallSystemPathDecorator,
 )
 from bonsai.bim.module.model.door import update_door_modifier_bmesh
 from bonsai.bim.module.model.window import update_window_modifier_bmesh
@@ -103,7 +106,7 @@ def update_type_page(self: "BIMModelProperties", context: bpy.types.Context) -> 
 
 
 def update_relating_array_from_object(self: "BIMArrayProperties", context: bpy.types.Context) -> None:
-    bpy.ops.bim.enable_editing_array(item=self.is_editing)
+    bpy.ops.bim.enable_editing_array_item(item=self.editing_item_index)
     return
 
 
@@ -111,7 +114,7 @@ def is_object_array_applicable(self: "BIMArrayProperties", obj: bpy.types.Object
     element = tool.Ifc.get_entity(obj)
     if not element:
         return False
-    return ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+    return bool(ifcopenshell.util.element.get_pset(element, "BBIM_Array"))
 
 
 def update_wall_axis_decorator(self: "BIMModelProperties", context: bpy.types.Context) -> None:
@@ -126,6 +129,19 @@ def update_slab_direction_decorator(self: "BIMModelProperties", context: bpy.typ
         SlabDirectionDecorator.install(bpy.context)
     else:
         SlabDirectionDecorator.uninstall()
+
+
+def update_paths_decorator(self: "BIMModelProperties", context: bpy.types.Context) -> None:
+    """Unified toggle for connected-element path overlays. Drives both the
+    MEP and wall path decorators — each decorator's ``draw`` short-circuits
+    when its kind of element isn't selected, so leaving both installed is
+    cheap and lets one toggle cover any connected-element family."""
+    if self.show_paths:
+        MEPSystemPathDecorator.install(bpy.context)
+        WallSystemPathDecorator.install(bpy.context)
+    else:
+        MEPSystemPathDecorator.uninstall()
+        WallSystemPathDecorator.uninstall()
 
 
 def update_measure_xyz(self: "BIMModelProperties", context: bpy.types.Context) -> None:
@@ -222,13 +238,10 @@ def update_wall_offset_baseline(self: "BIMWallProperties", context: bpy.types.Co
 
 
 def update_railing(self: "BIMRailingProperties", context: bpy.types.Context) -> None:
-    """Regenerate railing mesh when property changes."""
+    """Regenerate railing mesh when a property changes. Preview-only via bmesh
+    until the user commits."""
     if self.is_editing:
-        # Only FRAMELESS_PANEL can update live via bmesh.
-        # WALL_MOUNTED_HANDRAIL geometry is generated from IFC representation,
-        # so it only updates on "Finish Editing" to avoid modifying IFC during preview.
-        if self.railing_type == "FRAMELESS_PANEL":
-            _get_updater("railing", "update_railing_modifier_bmesh")(context)
+        _get_updater("railing", "update_railing_modifier_bmesh")(context)
 
 
 def update_roof(self: "BIMRoofProperties", context: bpy.types.Context) -> None:
@@ -354,6 +367,19 @@ class BIMModelProperties(PropertyGroup):
         default=False,
         update=update_slab_direction_decorator,
     )
+    show_paths: bpy.props.BoolProperty(
+        name="Show Paths",
+        default=False,
+        update=update_paths_decorator,
+        description=(
+            "Trace the connected element path from the selected element. For "
+            "walls, follows ``IfcRelConnectsPathElements`` and draws each "
+            "connected wall's reference axis with endpoint dots. For MEP "
+            "elements, follows ``IfcRelConnectsPorts`` and draws each segment's "
+            "axis plus a port-to-port spider for each fitting. Toggle off to "
+            "skip the BFS traversal entirely."
+        ),
+    )
 
     prev_transform_orientation_slot_type: bpy.props.StringProperty(name="Previous Gizmo Orientation Type")
     prev_show_gizmo_object_translate: bpy.props.BoolProperty(name="Previous Gizmo Translate")
@@ -411,8 +437,14 @@ class BIMModelProperties(PropertyGroup):
 
 
 class BIMArrayProperties(PropertyGroup):
-    is_editing: bpy.props.IntProperty(
-        default=-1, description="Currently edited array index. -1 if not in array editing mode."
+    is_editing: bpy.props.BoolProperty(
+        name="Is Editing",
+        default=False,
+        description="True while an element-wide array edit is in progress (parametric triad).",
+    )
+    editing_item_index: bpy.props.IntProperty(
+        default=-1,
+        description="Index of the array layer currently edited via the per-item UI flow. -1 if none.",
     )
     count: bpy.props.IntProperty(name="Count", default=0, min=0)
     x: bpy.props.FloatProperty(name="X", default=0, subtype="DISTANCE")
@@ -428,6 +460,15 @@ class BIMArrayProperties(PropertyGroup):
         name="Method",
         default="OFFSET",
     )
+    mirror_to_host: bpy.props.BoolProperty(
+        name="Mirror to Host",
+        description=(
+            "When the array parent fills a wall (or any voidable host), give each array child its own opening + "
+            "filling against the same host so the host is cut once per child. Disable for a free-floating array "
+            "that leaves the host uncut"
+        ),
+        default=True,
+    )
     relating_array_object: bpy.props.PointerProperty(
         type=bpy.types.Object,
         name="Copy Array Properties",
@@ -436,13 +477,15 @@ class BIMArrayProperties(PropertyGroup):
     )
 
     if TYPE_CHECKING:
-        is_editing: int
+        is_editing: bool
+        editing_item_index: int
         count: int
         x: float
         y: float
         z: float
         use_local_space: bool
         method: Literal["OFFSET", "DISTRIBUTE"]
+        mirror_to_host: bool
         sync_children: bool
         relating_array_object: Union[bpy.types.Object, None]
 
@@ -1446,7 +1489,6 @@ class BIMDoorProperties(PropertyGroup):
 
 
 RailingType = Literal["FRAMELESS_PANEL", "WALL_MOUNTED_HANDRAIL"]
-CapType = Literal["TO_END_POST_AND_FLOOR", "TO_END_POST", "TO_FLOOR", "TO_WALL", "180", "NONE"]
 
 
 class BIMRailingProperties(PropertyGroup):
@@ -1482,7 +1524,7 @@ class BIMRailingProperties(PropertyGroup):
     support_spacing: bpy.props.FloatProperty(
         name="Support Spacing",
         default=1.0,
-        min=0.01,
+        min=0.05,
         description="Distance between supports if automatic supports are used",
         subtype="DISTANCE",
         update=update_railing,
@@ -1795,7 +1837,10 @@ class BIMPipeSegmentProperties(PropertyGroup):
     mesh_dirty: bpy.props.BoolProperty(
         default=False,
         options={"HIDDEN", "SKIP_SAVE"},
-        description="True while the visible mesh is the preview shape.",
+        description=(
+            "True while the visible mesh is the preview shape; cleared once the "
+            "real IFC-derived geometry is restored (on commit or cancel)."
+        ),
     )
     length: bpy.props.FloatProperty(
         name="Length",
@@ -1810,7 +1855,11 @@ class BIMPipeSegmentProperties(PropertyGroup):
     )
     snap_object_scale_z: bpy.props.FloatProperty(
         default=1.0,
-        description="Snapshot of obj.scale.z at edit-enable; cancel / no-op-finish restore exactly.",
+        description=(
+            "Snapshot of obj.scale.z at edit-enable. Cancel / no-op-finish restore "
+            "this exact value so a user's non-identity pre-edit scale isn't silently "
+            "zeroed by the scale-based preview."
+        ),
     )
 
     if TYPE_CHECKING:
@@ -1822,7 +1871,7 @@ class BIMPipeSegmentProperties(PropertyGroup):
 
 
 class BIMDuctSegmentProperties(PropertyGroup):
-    """Transient draft state for parametric duct-segment gizmo editing (mirror of pipe)."""
+    """Transient draft state for parametric duct-segment gizmo editing."""
 
     is_editing: bpy.props.BoolProperty(
         default=False,
@@ -1831,7 +1880,10 @@ class BIMDuctSegmentProperties(PropertyGroup):
     mesh_dirty: bpy.props.BoolProperty(
         default=False,
         options={"HIDDEN", "SKIP_SAVE"},
-        description="True while the visible mesh is the preview shape.",
+        description=(
+            "True while the visible mesh is the preview shape; cleared once the "
+            "real IFC-derived geometry is restored (on commit or cancel)."
+        ),
     )
     length: bpy.props.FloatProperty(
         name="Length",
@@ -1846,7 +1898,11 @@ class BIMDuctSegmentProperties(PropertyGroup):
     )
     snap_object_scale_z: bpy.props.FloatProperty(
         default=1.0,
-        description="Snapshot of obj.scale.z at edit-enable; cancel / no-op-finish restore exactly.",
+        description=(
+            "Snapshot of obj.scale.z at edit-enable. Cancel / no-op-finish restore "
+            "this exact value so a user's non-identity pre-edit scale isn't silently "
+            "zeroed by the scale-based preview."
+        ),
     )
 
     if TYPE_CHECKING:
@@ -1858,7 +1914,10 @@ class BIMDuctSegmentProperties(PropertyGroup):
 
 
 class BIMBendPreviewProperties(PropertyGroup):
-    """Scene-level pending state for the bend-creation preview flow."""
+    """Scene-level pending state for the bend-creation preview flow.
+
+    Scene-level (not per-object) because the bend involves two segments by
+    GUID — neither alone owns the draft."""
 
     is_active: bpy.props.BoolProperty(
         default=False,
@@ -1960,7 +2019,7 @@ class BIMWallFilletPreviewProperties(PropertyGroup):
 
 
 class BIMPreviewProperties(PropertyGroup):
-    """Umbrella container for parametric-edit preview drafts attached to ``Scene``."""
+    """Umbrella for parametric-edit preview drafts attached to ``Scene``."""
 
     bend: bpy.props.PointerProperty(type=BIMBendPreviewProperties)
     wall_fillet: bpy.props.PointerProperty(type=BIMWallFilletPreviewProperties)

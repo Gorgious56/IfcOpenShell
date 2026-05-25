@@ -209,7 +209,8 @@ class ShowPorts(bpy.types.Operator, tool.Ifc.Operator):
                 connected_port_obj = tool.Ifc.get_object(connected_port)
                 if not connected_port_obj:
                     parent_element = tool.System.get_port_relating_element(connected_port)
-                    core.show_ports(tool.Ifc, tool.System, tool.Spatial, element=parent_element)
+                    if parent_element is not None:
+                        core.show_ports(tool.Ifc, tool.System, tool.Spatial, element=parent_element)
 
 
 class HidePorts(bpy.types.Operator, tool.Ifc.Operator):
@@ -511,6 +512,9 @@ class EstablishPathDirection(bpy.types.Operator, tool.Ifc.Operator):
             "NOTDEFINED": "NOTDEFINED",
         }
         next_element = tool.System.get_port_relating_element(connected_port)
+        if next_element is None:
+            self.report({"WARNING"}, "Connected port has no relating element; cannot propagate direction.")
+            return {"CANCELLED"}
         ports = tool.System.get_ports(next_element)
         segments_processed = 0
         while len(ports) == 2:
@@ -529,8 +533,7 @@ class EstablishPathDirection(bpy.types.Operator, tool.Ifc.Operator):
             connected_port.FlowDirection = direction_map.get(other_port.FlowDirection, "NOTDEFINED")
             next_element = tool.System.get_port_relating_element(connected_port)
 
-            if not next_element.is_a("IfcFlowSegment"):
-                print(f"DEBUG: next_element is not IfcFlowSegment, stopping")
+            if next_element is None or not next_element.is_a("IfcFlowSegment"):
                 break
 
             ports = tool.System.get_ports(next_element)

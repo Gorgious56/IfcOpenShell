@@ -42,6 +42,7 @@ import bonsai.core.root
 import bonsai.tool as tool
 from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig, IconActionConfig
+from bonsai.bim.module.model import preview_base
 from bonsai.bim.module.model.decorator import compute_mep_join_location
 from bonsai.bim.module.model.profile import DumbProfileJoiner
 from bonsai.tool.cad import VTX_PRECISION
@@ -616,12 +617,10 @@ class MEPGenerator:
 
     def remove_obstruction(self, segment, at_segment_start=False):
         """Remove the obstruction at the segment's named port and restore the
-        segment's pre-obstruction length / position. Returns
-        ``(removed_guid, None)`` on success or ``(None, error_msg)``.
+        segment's pre-obstruction length / position.
 
-        Order matters: delete the obstruction first so its port connection
-        vanishes, then set_depth rebuilds the segment ports cleanly.
-        """
+        Order matters: delete the obstruction before set_depth, otherwise
+        rebuilding the ports leaves a dangling port relationship."""
         obstruction = find_obstruction_at_port(segment, at_segment_start)
         if obstruction is None:
             end_label = "start" if at_segment_start else "end"
@@ -637,22 +636,15 @@ class MEPGenerator:
         segment_data = self.get_segment_data(segment)
         new_segment_length = segment_data["extrusion_depth"] + obstruction_depth
 
-        # Snapshot the GUID + start-shift amount BEFORE deletion so we still
-        # have them after the IFC entity vanishes.
+        # Snapshot the GUID before deletion — the IFC entity is about to vanish.
         obstruction_guid = obstruction.GlobalId
 
-        # Delete the obstruction first — this breaks its port connection.
         tool.Geometry.delete_ifc_object(obstruction_obj)
-
-        # Now extend the segment to absorb the obstruction's depth. set_depth
-        # rebuilds the segment's representation and (via setup_ports) recreates
-        # its ports — safe to do now that no foreign port relationship holds
-        # onto the old port instances.
         DumbProfileJoiner().set_depth(segment_obj, new_segment_length)
 
         if at_segment_start:
-            # add_obstruction shifted the segment forward by ``length`` when
-            # the obstruction was at the start — shift it back the same amount.
+            # Shift back: add_obstruction shifted the segment forward when the
+            # obstruction was at the start.
             segment_rotation = segment_obj.matrix_world.to_quaternion()
             segment_obj.location -= segment_rotation @ V(0, 0, obstruction_depth)
 
@@ -660,9 +652,7 @@ class MEPGenerator:
 
 
 def find_obstruction_at_port(segment, at_segment_start):
-    """Pure traversal: return the OBSTRUCTION fitting connected at the segment's named
-    port, or ``None``. Resolves the port-end via MEPGenerator.get_segment_data so it
-    stays consistent with add_obstruction's start/end convention."""
+    """Return the OBSTRUCTION fitting connected at the segment's named port, or ``None``."""
     if not segment.is_a("IfcFlowSegment"):
         return None
     port_key = "start_port" if at_segment_start else "end_port"
@@ -691,19 +681,13 @@ PORT_JOINED = "JOINED"  # Fitting bridges this segment to a second element — u
 def port_connection_state(segment, at_segment_start):
     """Classify a segment's named port by the shape of its connection graph.
 
-    The answer is graph-driven, not type-driven:
-
-    - ``PORT_FREE``: nothing is connected here.
-    - ``PORT_TERMINAL``: an element (typically an ``IfcFlowFitting``) is
-      connected, but none of its other ports lead to a different element.
-      The connection is a dead end.
+    - ``PORT_FREE``: nothing connected.
+    - ``PORT_TERMINAL``: an element is connected but none of its other
+      ports reach a different element (dead end).
     - ``PORT_JOINED``: an element is connected and at least one of its
-      other ports leads to a second element distinct from this segment.
-      The connection bridges two elements.
+      other ports reaches a second element (bridge).
 
-    Returns ``PORT_FREE`` defensively for non-segment inputs and for
-    segments whose named port has no ``IfcRelConnectsPorts`` relationship.
-    """
+    Returns ``PORT_FREE`` defensively for non-segment or unconnected inputs."""
     if not segment.is_a("IfcFlowSegment"):
         return PORT_FREE
     port_key = "start_port" if at_segment_start else "end_port"
@@ -1087,26 +1071,18 @@ def compute_bend_preview_polylines(
     radius: float,
     arc_resolution: int = 24,
 ):
-    """Compute the centerline polylines that visualise a bend between two
-    MEP segments WITHOUT mutating IFC or Blender state.
+    """Compute the centerline polylines visualising a bend between two MEP
+    segments WITHOUT mutating IFC or Blender state.
 
     Returns a dict with keys:
 
-    - ``"valid"`` (bool) — True iff the inputs admit a defined bend. False for
-      parallel / collinear axes, near-degenerate angles, or non-intersecting
-      lines. ``MEPAddBend`` rejects the same cases — preview matches.
-    - ``"leg_a"`` / ``"leg_b"`` (tuple[Vector, Vector] | None) — each segment's
-      leg as ``(far_endpoint, tangent_point)``. The far endpoint is the
-      segment-end opposite the bend; the tangent point is where the segment
-      meets the arc. Drawing as a polyline shows how each segment will be
-      shortened to fit the bend.
-    - ``"arc"`` (list[Vector]) — ``arc_resolution + 1`` points sampling the
-      bend arc between the two tangent points; drawing consecutive pairs
-      approximates the curve.
+    - ``"valid"`` (bool) — False for parallel / collinear / degenerate axes.
+    - ``"leg_a"`` / ``"leg_b"`` — ``(far_endpoint, tangent_point)`` per
+      segment, ``None`` when invalid.
+    - ``"arc"`` — ``arc_resolution + 1`` points sampling the bend arc.
 
-    Pure geometry. Omits profile-offset, double-bend, and rotation-difference
-    handling — those errors are deferred to validate so the preview stays
-    optimistic and surfaces an operator-level error there."""
+    Omits profile-offset, double-bend, and rotation-difference handling;
+    those errors are deferred to validate."""
     from mathutils import Quaternion
 
     start_axis = tool.Model.get_flow_segment_axis(start_object)
@@ -1301,30 +1277,17 @@ class EnableBendPreview(bpy.types.Operator):
             self.report({"ERROR"}, "Bend preview is for non-parallel segments only.")
             return {"CANCELLED"}
 
-        # Sync any uncommitted Blender translation back to IFC ObjectPlacement
-        # before the decorator reads matrix_world — otherwise the preview
-        # renders at the dragged position while finish commits against the stale
-        # IFC location.
-        import bonsai.core.geometry
+        preview_base.sync_uncommitted_moves([active, other])
 
-        for _sync_obj in (active, other):
-            if tool.Ifc.is_moved(_sync_obj):
-                bonsai.core.geometry.edit_object_placement(
-                    tool.Ifc, tool.Geometry, tool.Surveyor, obj=_sync_obj, apply_scale=False
-                )
-
-        props = context.scene.BIMPreviewProperties.bend
-        # Auto-cancel any prior preview so re-clicking join on a different pair
-        # doesn't silently commit the previous tuning as a stray fitting.
-        if props.is_active:
+        props = preview_base.get_preview_props(context, "bend")
+        # Auto-cancel any prior preview so re-clicking join on a different
+        # pair doesn't silently commit the previous tuning.
+        if props is not None and props.is_active:
             bpy.ops.bim.cancel_bend_preview()
 
         props.start_segment_id = active_element.id()
         props.end_segment_id = other_element.id()
-        # Defaults match ``MEPAddBend``'s declared FloatProperty defaults
-        # (start_length=0.1, end_length=0.1, radius=0.2 in SI). Re-seeding
-        # on each enable keeps the preview consistent with what a direct
-        # ``bim.mep_add_bend`` click would produce.
+        # SI defaults matching ``MEPAddBend``.
         props.start_length = 0.1
         props.end_length = 0.1
         props.radius = 0.2
@@ -1332,67 +1295,39 @@ class EnableBendPreview(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class FinishBendPreview(bpy.types.Operator):
-    """Commit the previewed bend: dispatch ``bim.mep_add_bend`` with the
-    tuned parameters, then exit preview mode.
+class FinishBendPreview(preview_base.BasePreviewFinishOperator):
+    """Commit the previewed bend via ``bim.mep_add_bend`` and exit preview.
 
-    Re-resolves the segment objects by IFC GlobalId (not by stored object
-    reference) so an undo / save / reload during preview doesn't crash the
-    operator. The dispatched ``MEPAddBend`` runs its own validation; if it
-    surfaces an error, preview mode stays active so the user can tune
-    further or cancel."""
+    Inherits the dispatch + state-clear lifecycle from
+    ``preview_base.BasePreviewFinishOperator``; preview state survives a
+    failed commit so the user can re-tune without re-selecting."""
 
     bl_idname = "bim.finish_bend_preview"
     bl_label = "Apply Bend"
     bl_description = "Commit the bend with the previewed parameters"
-    bl_options = {"REGISTER", "UNDO"}
 
-    def execute(self, context):
-        props = context.scene.BIMPreviewProperties.bend
-        if not props.is_active:
-            return {"CANCELLED"}
-        ifc_file = tool.Ifc.get()
-        if ifc_file is None:
-            self.report({"ERROR"}, "No IFC file loaded.")
-            return {"CANCELLED"}
-        result = bpy.ops.bim.mep_add_bend(
-            start_segment_id=props.start_segment_id,
-            end_segment_id=props.end_segment_id,
-            start_length=props.start_length,
-            end_length=props.end_length,
-            radius=props.radius,
-        )
-        # Only clear preview state on successful commit — a failed bend keeps
-        # the gizmos visible so the user can adjust without re-selecting.
-        if "FINISHED" in result:
-            props.is_active = False
-            props.start_segment_id = 0
-            props.end_segment_id = 0
-        return result
+    PREVIEW_ATTR = "bend"
+    DISPATCH_OPERATOR = "mep_add_bend"
+    DISPATCH_PROP_MAP = {
+        "start_segment_id": "start_segment_id",
+        "end_segment_id": "end_segment_id",
+        "start_length": "start_length",
+        "end_length": "end_length",
+        "radius": "radius",
+    }
+    RESET_FIELDS = (("start_segment_id", 0), ("end_segment_id", 0))
 
 
-class CancelBendPreview(bpy.types.Operator):
-    """Exit bend preview without committing.
-
-    Pure state reset — no IFC mutation occurred during preview, so nothing
-    needs unwinding. The GPU decorator and gizmo group both poll on
-    ``is_active`` and stop rendering immediately."""
+class CancelBendPreview(preview_base.BasePreviewCancelOperator):
+    """Exit bend preview without committing. Reachable from the ESC handler
+    via ``OverrideEscape``."""
 
     bl_idname = "bim.cancel_bend_preview"
     bl_label = "Cancel Bend"
     bl_description = "Discard the previewed bend"
-    bl_options = {"REGISTER", "UNDO"}
 
-    def execute(self, context):
-        props = context.scene.BIMPreviewProperties.bend
-        if not props.is_active:
-            # No active preview — ESC routed here via ``OverrideEscape`` from
-            # an idle state. Don't touch anything; tell Blender to do nothing.
-            return {"CANCELLED"}
-        props.is_active = False
-        props.start_segment_id = 0
-        props.end_segment_id = 0
-        return {"FINISHED"}
+    PREVIEW_ATTR = "bend"
+    RESET_FIELDS = (("start_segment_id", 0), ("end_segment_id", 0))
 
 
 def _bend_preview_segments(context):
@@ -1418,27 +1353,10 @@ def _bend_preview_segments(context):
 class GizmoBendPreview(bpy.types.GizmoGroup):
     """Interactive gizmo group for the bend preview flow.
 
-    Polls in when ``scene.BIMPreviewProperties.bend.is_active`` is True
-    (entered via ``bim.enable_bend_preview``). Surfaces:
-
-    - Three ``BIM_GT_gizmo_dimension`` widgets — Bonsai's custom dimension
-      widget that walls / doors / stairs use under the hood. Two are aligned
-      with each bend-fitting tangent leg (drag = ``start_length`` /
-      ``end_length``); one is anchored at the arc apex with +X pointing
-      toward the arc center (drag = ``radius``). The widget provides
-      click-to-numeric input, Ctrl-snap, and Shift-precision out of the box.
-    - Two billboarded icon gizmos (validate / cancel, ``VIEW3D_GT_validate``
-      / ``VIEW3D_GT_cancel``) anchored above the bend midpoint; click to
-      commit (``bim.finish_bend_preview``) or abort
-      (``bim.cancel_bend_preview``).
-
-    Each dimension widget uses ``move_get_cb`` / ``move_set_cb`` Python
-    callbacks that read / write the scene props directly. The setter calls
-    ``area.tag_redraw()`` on every VIEW_3D area so the GPU preview tracks
-    the value live during drag. When the geometry is degenerate (intersection
-    inside a segment), the dimensions and validate hide but the cancel icon
-    stays visible at the intersection so the user always has an exit.
-    """
+    Three dimension widgets drag start_length / end_length / radius; two
+    icon gizmos commit or cancel. When the geometry is degenerate the
+    dimensions and validate hide but cancel stays visible so the user
+    always has an exit."""
 
     bl_idname = "OBJECT_GGT_bim_bend_preview"
     bl_label = "Bend Preview Gizmos"
@@ -1481,44 +1399,15 @@ class GizmoBendPreview(bpy.types.GizmoGroup):
         default_color = tuple(prefs.decorations_colour[:3])
         highlight_color = tuple(prefs.decorator_color_selected[:3])
 
-        # Reuse BIM_GT_gizmo_dimension directly rather than inherit
-        # BaseParametricGizmoGroup: bend preview is scene-level (spans two
-        # segments and creates a new entity), so the parametric base's
-        # active-object coupling doesn't apply.
-        #
-        # The scene lookup runs inside each closure to avoid the
-        # ``StructRNA of type Scene has been removed`` crash that happens when
-        # a captured scene's RNA struct is freed on file open / undo.
-        def _props():
-            scene = bpy.context.scene
-            preview = getattr(scene, "BIMPreviewProperties", None) if scene else None
-            return preview.bend if preview is not None else None
-
-        def make_getter(attr):
-            def _get():
-                props = _props()
-                return getattr(props, attr) if props is not None else 0.0
-
-            return _get
-
-        def make_setter(attr):
-            def _set(value):
-                props = _props()
-                if props is None:
-                    return
-                # Clamp at the FloatProperty's declared min (0.001).
-                setattr(props, attr, max(0.001, float(value)))
-                # Force a redraw so the GPU preview updates live during drag.
-                for area in bpy.context.screen.areas if bpy.context.screen else ():
-                    if area.type == "VIEW_3D":
-                        area.tag_redraw()
-
-            return _set
+        # ``preview_base`` factories return closures that re-fetch the Scene
+        # per call so the gizmo survives file open / undo without referencing
+        # a freed RNA struct.
+        _props = preview_base.make_props_callback("bend")
 
         def setup_dimension(attr: str, prop_name: str, invert_delta: bool = False) -> bpy.types.Gizmo:
             gz = self.gizmos.new("BIM_GT_gizmo_dimension")
-            gz.move_get_cb = make_getter(attr)
-            gz.move_set_cb = make_setter(attr)
+            gz.move_get_cb = preview_base.make_dim_getter(_props, attr)
+            gz.move_set_cb = preview_base.make_dim_setter(_props, attr)
             # Set ``axis`` (world-space) only, NOT ``local_axis``: bend preview
             # dimensions live in world space, not in either segment's local
             # frame. Per-frame rewrites in _position_gizmos match live geometry.
@@ -2520,18 +2409,11 @@ class CancelEditingDuctSegment(_CancelEditingMEPSegmentTriad, bpy.types.Operator
 
 
 def _project_cursor_to_segment_local_z(context, *, is_pipe: bool) -> tuple[bpy.types.Object | None, float | None]:
-    """Common prefix for cursor-anchored MEP-segment operators (extend, split).
+    """Validate the active object is an MEP segment of the requested kind,
+    commit any in-progress parametric edit, and return ``(obj, cursor_local_z)``.
 
-    Validates the active object is a MEP segment of the requested kind
-    (pipe vs duct), commits any in-progress parametric edit so the
-    cursor operation lands on committed IFC state (not on top of a
-    draft), and returns ``(obj, cursor_local_z)`` ready for the operator
-    to act on. Returns ``(None, None)`` when the precondition fails —
-    callers should treat that as ``{"CANCELLED"}``.
-
-    Extracted from the two sibling operators (extend / split) which had
-    a 20-line copy-paste prefix; isolating it here keeps each operator's
-    body focused on the actual mutation."""
+    Returns ``(None, None)`` on precondition failure — callers should treat
+    that as ``{"CANCELLED"}``."""
     obj = context.active_object
     if obj is None:
         return None, None
@@ -2558,17 +2440,11 @@ def _project_cursor_to_segment_local_z(context, *, is_pipe: bool) -> tuple[bpy.t
 
 
 def _extend_segment_to_cursor(context, *, is_pipe: bool) -> set[str]:
-    """Shared body of ``bim.extend_{pipe,duct}_segment_to_cursor``. Projects
-    the 3D cursor onto the segment's local Z axis (the extrusion direction),
-    commits the projected distance as the new segment length via
-    ``DumbProfileJoiner.set_depth``.
-
-    One-shot IFC mutation, no draft session — click and the geometry is committed."""
+    """Project the 3D cursor onto the segment's local Z and commit the
+    projected distance as the new segment length. One-shot IFC mutation."""
     obj, cursor_local_z = _project_cursor_to_segment_local_z(context, is_pipe=is_pipe)
     if obj is None or cursor_local_z is None:
         return {"CANCELLED"}
-    # Segment extrudes along local +Z from origin. Projected length is the
-    # cursor's local Z; clamp to a small minimum to avoid degenerate extrusion.
     new_length = max(0.01, cursor_local_z)
     DumbProfileJoiner().set_depth(obj, new_length)
     return {"FINISHED"}
@@ -2736,18 +2612,11 @@ def split_mep_segment(obj: bpy.types.Object, cut_local_z: float) -> bpy.types.Ob
 
 
 def _split_segment_at_cursor(operator, context, *, is_pipe: bool) -> set[str]:
-    """Shared body of ``bim.split_{pipe,duct}_segment_at_cursor``.
+    """Split the active MEP segment at the cursor's projection on its axis.
 
-    Reuses ``_project_cursor_to_segment_local_z`` for the precondition
-    + active-edit commit, then delegates to ``split_mep_segment`` for
-    the IFC mutation (copy_class + truncate + reconnect). One-shot
-    operation — no draft session, no preview.
-
-    Returns ``{'FINISHED'}`` on a successful split, ``{'CANCELLED'}`` if
-    the segment is invalid, the cursor projection lands at an endpoint
-    (≤0.01m from either end), or the underlying helper declines. Reports
-    a WARNING via ``operator.report`` on the endpoint case so the user
-    sees feedback instead of an apparently-dead icon click."""
+    Returns ``{'CANCELLED'}`` if the projection lands within 0.01m of an
+    endpoint and reports a WARNING so the user sees feedback instead of an
+    apparently-dead click."""
     obj, cursor_local_z = _project_cursor_to_segment_local_z(context, is_pipe=is_pipe)
     if obj is None or cursor_local_z is None:
         return {"CANCELLED"}
@@ -2951,17 +2820,9 @@ def _n_mep_selected(n: int) -> bool:
 
 
 def _active_mep_has_connected_neighbor(obj: bpy.types.Object) -> bool:
-    """Visibility predicate for the path-select gizmo: True iff the active
-    MEP element has at least one port connected to another element.
-
-    A "network" with only one element (or with all ports free) collapses
-    to a single-member selection — clicking the gizmo would just select
-    the already-selected element, which is dead UX. Hiding the icon in
-    that case makes the affordance honest: present iff clicking will
-    actually pull in neighbours.
-
-    Cheap to check: iterates the element's own ports (typically 2-4),
-    not a full BFS — safe to run from a per-frame visibility predicate."""
+    """True iff the active MEP element has at least one port connected to
+    another element. Hides the path-select icon when clicking would yield
+    the same single-member selection."""
     element = tool.Ifc.get_entity(obj)
     if element is None or not tool.System.is_mep_element(element):
         return False
@@ -2972,26 +2833,12 @@ def _active_mep_has_connected_neighbor(obj: bpy.types.Object) -> bool:
 
 
 class GizmoMEPActions(bpy.types.GizmoGroup, gizmo.BaseIconActionGroup):
-    """Icon-action gizmos surfacing the existing MEP one-shot operators.
-
-    Polls in when the active object is an IfcFlowSegment or IfcFlowFitting
-    (any MEP element via tool.System.is_mep_element). Each icon is a click
-    target that fires one of mep.py's existing operators; the operators do
-    all validation, schema gating, and IFC mutation. The gizmo group adds
-    zero new editing state — no PropertyGroup, no EDIT_TYPES entry, no
-    enter/finish/cancel triad.
+    """Icon-action gizmos for the existing MEP one-shot operators.
 
     Most icons sit in a horizontal row above the active object's bbox top.
-    The lock icons are the exception: they are anchored at the segment's
-    start / end ports respectively, rendered at half scale so they read as
-    secondary affordances rather than competing with the row.
-
-    Visibility predicates per icon gate on selection cardinality and IFC
-    class so the icons only appear when the corresponding operator would
-    actually accept the selection. The operators' own contracts are still
-    the safety net for edge cases (matching profile families for bend,
-    same-class segments for fit).
-    """
+    Lock icons are anchored at the segment's start / end ports and rendered
+    at half scale as secondary affordances. Visibility predicates gate each
+    icon on selection cardinality and IFC class."""
 
     bl_idname = "OBJECT_GGT_bim_mep_actions"
     bl_label = "MEP Actions Gizmo"
@@ -3204,19 +3051,9 @@ class GizmoMEPActions(bpy.types.GizmoGroup, gizmo.BaseIconActionGroup):
             gz.color_highlight = warning_color
 
     def position_gizmos(self, context: bpy.types.Context) -> None:
-        """Lay out icons across three regions:
-
-        - Row above the active's bbox top — default for non-anchored configs.
-        - Segment port endpoints — for ``ENDPOINT_CONFIGS`` (lock and
-          per-port unjoin icons), rendered at half scale.
-        - Predicted bend / transition location — for ``BEND_ANCHOR_CONFIGS``,
-          stacked along the billboarded X axis so two icons read as separate
-          click targets at the same world point.
-
-        ``BaseIconActionGroup.position_gizmos`` uses ``enumerate`` to drive the
-        row index — pulling anchored icons out of that index sequence prevents
-        them from creating gaps in the row.
-        """
+        """Lay out icons across three regions: row above bbox top, segment
+        port endpoints (``ENDPOINT_CONFIGS``), and predicted bend / transition
+        location (``BEND_ANCHOR_CONFIGS``)."""
         obj = context.active_object
         if obj is None:
             return
@@ -3331,9 +3168,7 @@ class GizmoMEPActions(bpy.types.GizmoGroup, gizmo.BaseIconActionGroup):
 
     def _scale_for_config(self, name: str) -> float:
         """Per-icon scale multiplier on top of ``ICON_SCALE``. Endpoint icons
-        shrink to half (subordinate visual weight); unjoin icons get an
-        additional 1.5× boost so the destructive affordance reads as a more
-        deliberate target; everything else uses the base scale."""
+        shrink to half; unjoin icons get an additional 1.5× boost."""
         if name in self.ENDPOINT_CONFIGS:
             base = self.ICON_SCALE * self.ENDPOINT_SCALE_RATIO
         else:

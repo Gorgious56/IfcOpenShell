@@ -594,29 +594,15 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         # Static open/closed lock pairs; consumer toggles visibility. The
         # total-length pair colours each member at setup (green/red);
         # tread-lock pair stays neutral.
-        self.lock_open_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock_open",
-            self.COLOR_GREEN,
+        self.lock_open_gizmo, self.lock_closed_gizmo = self.create_icon_gizmo_lock_pair(
             "bim.toggle_stair_property",
+            open_color=self.COLOR_GREEN,
+            closed_color=self.COLOR_RED,
             property_name="total_length_lock",
         )
-        self.lock_closed_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock_closed",
-            self.COLOR_RED,
+        self.tread_lock_open_gizmo, self.tread_lock_closed_gizmo = self.create_icon_gizmo_lock_pair(
             "bim.toggle_stair_property",
-            property_name="total_length_lock",
-        )
-        tread_lock_color = (1.0, 1.0, 1.0)
-        self.tread_lock_open_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock_open",
-            tread_lock_color,
-            "bim.toggle_stair_property",
-            property_name="custom_tread_lock",
-        )
-        self.tread_lock_closed_gizmo = self.create_icon_gizmo(
-            "VIEW3D_GT_lock_closed",
-            tread_lock_color,
-            "bim.toggle_stair_property",
+            open_color=self.COLOR_NEUTRAL,
             property_name="custom_tread_lock",
         )
         self.plus_gizmo = self.create_icon_gizmo(

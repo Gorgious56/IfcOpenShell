@@ -72,7 +72,7 @@ __all__ = [  # noqa: RUF022 (unsorted `__all__`)
     "GizmoCone",
     "GizmoDimension",
     "DimensionRenderer",
-    "_TypeAccessorMixin",
+    "TypeAccessorBase",
     "CycleTypeMixin",
     "PickTypeMixin",
     "BaseParametricGizmoGroup",
@@ -1831,9 +1831,19 @@ def draw_tris_with_outline(
     custom-draw gizmos with dynamic tris (e.g. GizmoArrayLayerIndicator's
     count label). The caller supplies the per-frame matrix and the icon
     color; this routine handles the eight outline passes plus the body pass
-    and the surrounding GPU blend state."""
+    and the surrounding GPU blend + depth state.
+
+    Depth-test is enabled (``LESS_EQUAL``) for the duration of the draw so
+    icons stacked along the camera's view direction sort by world Z — the
+    closer-to-camera icon occludes the farther one even when ``self.gizmos``
+    submission order would otherwise put the wrong one on top. Within a
+    single icon, all 9 passes share the same Z so they don't fight each
+    other. The icons may now also be occluded by scene geometry closer to
+    the camera; in practice Bonsai positions them above wall tops with
+    enough lift that this is a non-issue."""
     shader = _get_static_tris_shader()
     gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("LESS_EQUAL")
     shader.bind()
     if outline_alpha > 0.0 and outline_width > 0.0:
         shader.uniform_float("color", (0.0, 0.0, 0.0, outline_alpha))
@@ -1846,6 +1856,7 @@ def draw_tris_with_outline(
     with gpu.matrix.push_pop():
         gpu.matrix.multiply_matrix(base_matrix)
         batch.draw(shader)
+    gpu.state.depth_test_set("NONE")
     gpu.state.blend_set("NONE")
 
 
@@ -1870,9 +1881,16 @@ class StaticTrisGizmoMixin:
     outline_alpha: float = _OUTLINE_DEFAULT_ALPHA
 
     def setup(self) -> None:
-        # custom_shape is still built so draw_select keeps the existing
-        # tris-shaped hit area exactly as before.
-        self.custom_shape = self.new_custom_shape("TRIS", self.tris)
+        # Hit area is the 2D bounding box of the glyph (expanded by the
+        # outline width to match the visible halo) rather than the glyph
+        # tris themselves: the icon reads as a roughly rectangular tile,
+        # and per-pixel hit-testing against the inner glyph leaves clickable-
+        # looking dead zones in the tile's corners and inside thin strokes.
+        xs = [v[0] for v in self.tris]
+        ys = [v[1] for v in self.tris]
+        pad = self.outline_width
+        bbox_tris = rect_tris(min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+        self.custom_shape = self.new_custom_shape("TRIS", bbox_tris)
 
     def draw(self, context: bpy.types.Context) -> None:
         # Icon body is forced fully opaque: any ``self.alpha`` < 1.0 would
@@ -1949,6 +1967,7 @@ class TexturedQuadGizmoMixin(StaticTrisGizmoMixin):
             color = (*self.color, 1.0)
         base_matrix = self.matrix_basis @ self.matrix_offset
         gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
         shader.bind()
         shader.uniform_sampler("image", texture)
         if self.outline_alpha > 0.0 and self.outline_width > 0.0:
@@ -1964,6 +1983,7 @@ class TexturedQuadGizmoMixin(StaticTrisGizmoMixin):
         with gpu.matrix.push_pop():
             gpu.matrix.multiply_matrix(base_matrix)
             self._quad_batch.draw(shader)
+        gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("NONE")
 
 
@@ -3621,7 +3641,7 @@ class GizmoArrayAll(StaticTrisGizmoMixin, bpy.types.Gizmo):
     )
 
     def draw(self, context: bpy.types.Context) -> None:
-        self.draw_custom_shape(self.custom_shape)
+        super().draw(context)
         if self.is_highlight:
             self._draw_containing_array_bbox(context)
 
@@ -4727,7 +4747,7 @@ class GizmoDimension(GizmoMovable):
         clear_snap_cache()
 
 
-class _TypeAccessorMixin:
+class TypeAccessorBase:
     """Shared contract for operators that resolve and write a Literal type
     attribute on a Bonsai PropertyGroup.
 
@@ -4760,7 +4780,7 @@ class _TypeAccessorMixin:
         return obj
 
 
-class CycleTypeMixin(_TypeAccessorMixin):
+class CycleTypeMixin(TypeAccessorBase):
     """Operator mixin that cycles through ``type_literal``'s values.
 
     Shift-click reverses direction."""
@@ -4786,7 +4806,7 @@ class CycleTypeMixin(_TypeAccessorMixin):
         return {"FINISHED"}
 
 
-class PickTypeMixin(_TypeAccessorMixin):
+class PickTypeMixin(TypeAccessorBase):
     """Operator mixin that opens a popup menu listing ``type_literal``'s values.
 
     Empty ``value`` ⇒ ``invoke`` opens the popup; non-empty ⇒ the user picked
@@ -4842,7 +4862,10 @@ class PickTypeMixin(_TypeAccessorMixin):
                 op.value = v
 
         context.window_manager.popup_menu(draw, title=self.bl_label, icon="MENU_PANEL")
-        return {"FINISHED"}
+        # INTERFACE (not FINISHED) keeps the menu-opening invocation out of the
+        # undo stack; the picked-value write below returns FINISHED, so the
+        # type change remains undoable as a single step.
+        return {"INTERFACE"}
 
     def _pick_type(self, context: bpy.types.Context) -> set[str]:
         if not self.value:
@@ -4855,6 +4878,7 @@ class PickTypeMixin(_TypeAccessorMixin):
             return {"CANCELLED"}
 
         if self.value not in get_args(self.type_literal):
+            self.report({"WARNING"}, f"Unknown {self.type_attr}: {self.value!r}")
             return {"CANCELLED"}
 
         props = self.props_getter(obj)

@@ -181,8 +181,8 @@ classes = (
     prop.BIMModelProperties,
     prop.BIMArrayProperties,
     prop.BIMBendPreviewProperties,
-    prop.BIMPreviewProperties,
     prop.BIMWallFilletPreviewProperties,
+    prop.BIMPreviewProperties,
     prop.BIMDuctSegmentProperties,
     prop.BIMPipeSegmentProperties,
     prop.BIMStairProperties,
@@ -245,9 +245,9 @@ classes = (
     railing.CopyRailingParameters,
     railing.AddRailing,
     railing.CancelEditingRailing,
+    railing.PickRailingTerminalType,
     railing.CycleRailingType,
     railing.FinishEditingRailing,
-    railing.PickRailingTerminalType,
     railing.FlipRailingPathOrder,
     railing.EnableEditingRailing,
     railing.GizmoRailingSchematic,
@@ -357,6 +357,12 @@ def register():
     bpy.types.VIEW3D_MT_add.prepend(ui.add_menu)
     bpy.app.handlers.load_post.append(handler.load_post)
 
+    # Install WallGizmoPreviewDecorator from load_post — registering here binds
+    # to a _RestrictContext that crashes on first redraw.
+
+    # Bend preview's ESC rides on bim.override_escape; OverrideEscape checks
+    # BIMPreviewProperties.bend.is_active before the per-object cancel branch.
+
     workspace.load_custom_icons()
 
 
@@ -372,6 +378,7 @@ def unregister():
     decorator.BendPreviewDecorator.uninstall()
     decorator.WallFilletPreviewDecorator.uninstall()
     decorator.MEPSystemPathDecorator.uninstall()
+    decorator.WallSystemPathDecorator.uninstall()
     decorator_cache.uninstall_decorator_cache_handlers()
 
     del bpy.types.Scene.BIMModelProperties

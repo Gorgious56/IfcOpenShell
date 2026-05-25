@@ -764,7 +764,6 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
             )
 
     def draw_gizmo_parameters(self, layout: bpy.types.UILayout, context: bpy.types.Context) -> None:
-        """Render one checkbox per parametric feature."""
         import bonsai.tool as tool
 
         layout.label(text="Toggle visibility of gizmos in editing mode")
@@ -1937,6 +1936,8 @@ class BIM_PT_decorators_overlay(Panel):
         row.prop(model_props, "show_wall_axis", text="Wall Axis")
         row = col.row(align=True)
         row.prop(model_props, "show_slab_direction", text="Slab Direction")
+        row = col.row(align=True)
+        row.prop(model_props, "show_paths", text="Element Paths")
         row = col.row(align=True)
         row.prop(model_props, "show_bounding_box", text="Bounding Box Dimensions")
         row = col.row(align=True)

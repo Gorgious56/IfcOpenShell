@@ -123,6 +123,10 @@ class FilledOpeningGenerator:
 
         if tool.Ifc.is_moved(voided_obj):
             bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=voided_obj)
+        # Sync the filling's IFC ObjectPlacement to the matrix_world set above,
+        # otherwise a later parametric-edit cancel restores from a stale IFC
+        # placement and snaps the filling back to its pre-fill position.
+        tool.Model.sync_object_ifc_position(filling_obj)
 
         existing_opening_occurrence = self.get_existing_opening_occurrence_if_any(filling)
 

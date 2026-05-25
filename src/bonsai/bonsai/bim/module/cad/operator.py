@@ -26,6 +26,7 @@ import mathutils
 from mathutils import Matrix, Vector
 
 import bonsai.tool as tool
+from bonsai.tool.cad import VTX_PRECISION, WELD_TOLERANCE
 
 messages = {
     "SHARED_VERTEX": "Shared Vertex, no intersection possible",
@@ -73,7 +74,7 @@ class CadTrimExtend(bpy.types.Operator):
         else:
             return self.cancel_message("select two edges!")
 
-        bmesh.ops.remove_doubles(bm, verts=list(set(edges[0].verts) | set(edges[1].verts)), dist=1e-5)
+        bmesh.ops.remove_doubles(bm, verts=list(set(edges[0].verts) | set(edges[1].verts)), dist=VTX_PRECISION)
         bm.verts.index_update()
         bm.edges.index_update()
         bmesh.update_edit_mesh(me, loop_triangles=True)
@@ -119,7 +120,7 @@ class CadMitre(bpy.types.Operator):
         else:
             return self.cancel_message("select two edges!")
 
-        bmesh.ops.remove_doubles(bm, verts=list(set(edges[0].verts) | set(edges[1].verts)), dist=1e-5)
+        bmesh.ops.remove_doubles(bm, verts=list(set(edges[0].verts) | set(edges[1].verts)), dist=VTX_PRECISION)
         bm.verts.index_update()
         bm.edges.index_update()
         bmesh.update_edit_mesh(me, loop_triangles=True)
@@ -159,7 +160,7 @@ class CadFillet(bpy.types.Operator):
         # Assume the user has selected two edges sharing a vert, but merge verts
         # just in case the vertex is coincident but not shared.
         all_verts = list(set(selected_edges[0].verts) | set(selected_edges[1].verts))
-        bmesh.ops.remove_doubles(bm, verts=all_verts, dist=1e-4)
+        bmesh.ops.remove_doubles(bm, verts=all_verts, dist=WELD_TOLERANCE)
 
         # Subdivide one of the edges to give us an extra vert to play with
         # without damaging any faces that already exist.
@@ -336,7 +337,7 @@ class CadArcFrom3Points(bpy.types.Operator):
         new_edges = [bm.edges.new((new_verts[i], new_verts[i + 1])) for i in range(len(new_verts) - 1)]
 
         bm.verts.remove(sorted_arc[1])
-        bmesh.ops.remove_doubles(bm, verts=new_verts + [sorted_arc[0], sorted_arc[2]], dist=1e-5)
+        bmesh.ops.remove_doubles(bm, verts=new_verts + [sorted_arc[0], sorted_arc[2]], dist=VTX_PRECISION)
 
         bmesh.update_edit_mesh(mesh)
         return {"FINISHED"}
@@ -736,7 +737,7 @@ class AddIfcArcIndexFillet(bpy.types.Operator):
         # just in case the vertex is coincident but not shared.
         all_verts = list(set(selected_edges[0].verts) | set(selected_edges[1].verts))
 
-        bmesh.ops.remove_doubles(bm, verts=all_verts, dist=1e-4)
+        bmesh.ops.remove_doubles(bm, verts=all_verts, dist=WELD_TOLERANCE)
 
         # Calculate the distance to slide each edge to make space for the fillet arc
         shared_vert = next(iter(set(selected_edges[0].verts) & set(selected_edges[1].verts)))

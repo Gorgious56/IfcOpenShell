@@ -653,8 +653,7 @@ class BIM_PT_railing(bpy.types.Panel):
                 row.operator("bim.enable_editing_railing", icon="GREASEPENCIL", text="")
                 row.operator("bim.copy_railing_parameters", icon="COPYDOWN", text="")
                 row.operator("bim.enable_editing_railing_path", icon="ANIM", text="")
-                # TODO: good for preview but probably should move to .is_editing == True
-                # since it's writing to ifc
+                # TODO: should only be reachable inside ``is_editing == True`` — currently writes to IFC outside the edit triad.
                 row.operator("bim.flip_railing_path_order", icon="ARROW_LEFTRIGHT", text="")
                 row.operator("bim.remove_railing", icon="X", text="")
 

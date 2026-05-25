@@ -798,30 +798,85 @@ def calc_delete_is_batch(ifc_file: ifcopenshell.file, context: bpy.types.Context
     return is_batch
 
 
+def count_implicit_array_children_in_selection(selected_objects: set[bpy.types.Object]) -> int:
+    """Children of selected array parents that aren't themselves in the selection.
+
+    For each array parent in ``selected_objects``, count its children across
+    every stacked layer that the user did NOT also select. A set dedups across
+    layers — children referenced by multiple layers count once."""
+    implicit_children: set[bpy.types.Object] = set()
+    for obj in selected_objects:
+        element = tool.Ifc.get_entity(obj)
+        if not element or not tool.Blender.Modifier.is_array(element):
+            continue
+        for child_obj in tool.Blender.Modifier.Array.get_all_children_objects(element):
+            if child_obj not in selected_objects:
+                implicit_children.add(child_obj)
+    return len(implicit_children)
+
+
+def has_blocked_array_child_in_selection(selected_objects: set[bpy.types.Object]) -> bool:
+    """True if any array child in the selection has its parent outside the selection.
+
+    Such children are silently skipped by the IFC delete pipeline; a consumer
+    can use this predicate to surface the constraint in a modal popup before
+    the destructive operation runs."""
+    for obj in selected_objects:
+        element = tool.Ifc.get_entity(obj)
+        if not element or not tool.Blender.Modifier.is_array_child(element):
+            continue
+        parent_obj = tool.Blender.Modifier.Array.get_parent_object(element)
+        if parent_obj is not None and parent_obj not in selected_objects:
+            return True
+    return False
+
+
 # Width chosen so the array warning lines fit on one line at default Blender
-# UI scale; the default invoke_props_dialog width (300) truncated them.
+# UI scale; the default invoke_props_dialog width truncated them.
 _ARRAY_DELETE_DIALOG_WIDTH = 450
 
 
 def _draw_array_warning(layout: bpy.types.UILayout, implicit_count: int, has_blocked: bool) -> None:
     """Render the array-aware delete confirmation labels.
 
-    Shared by ``OverrideDelete`` (viewport ``X``) and ``OverrideOutlinerDelete``
-    (Outliner ``X``) so both surfaces give the same warning when the selection
-    would dismantle an array or skip lone array children.
+    Shared by both delete operators (viewport + Outliner) so both surfaces
+    give the same warning when the selection would dismantle an array or
+    skip lone array children.
     """
     if implicit_count > 0:
-        plural = "s" if implicit_count != 1 else ""
-        row = layout.row()
-        row.label(
-            text=(f"Deleting this element will also delete " f"{implicit_count} other element{plural} of the array."),
+        layout.row().label(
+            text="Deleting this element will also delete the rest of the array.",
             icon="INFO",
         )
     if has_blocked:
-        row = layout.row()
-        row.label(text="Array children cannot be deleted directly.", icon="INFO")
-        row = layout.row()
-        row.label(text="Delete the array parent, or remove the array via the Array panel.")
+        layout.row().label(text="Array children cannot be deleted directly.", icon="INFO")
+        layout.row().label(text="Delete the array parent, or remove the array via the Array panel.")
+
+
+def _maybe_open_array_dialog(op, context, selected_objects):
+    """Compute array-delete constraints from ``selected_objects``, write them
+    onto ``op`` for the paired draw step to read, and open the wide dialog
+    when any apply. Returns the dialog's return value, or ``None`` when no
+    array constraints fire."""
+    op.implicit_array_children_count = count_implicit_array_children_in_selection(selected_objects)
+    op.has_blocked_array_child = has_blocked_array_child_in_selection(selected_objects)
+    if op.implicit_array_children_count == 0 and not op.has_blocked_array_child:
+        return None
+    kwargs = {"width": _ARRAY_DELETE_DIALOG_WIDTH}
+    if op.has_blocked_array_child and op.implicit_array_children_count == 0:
+        # Pure acknowledgment — no destructive consequence to confirm.
+        kwargs["confirm_text"] = "Got it"
+    return context.window_manager.invoke_props_dialog(op, **kwargs)
+
+
+def _draw_if_array_dialog(op) -> bool:
+    """Render the array warning on ``op``'s layout when ``op`` carries
+    non-zero array-delete state, and return ``True`` so the caller can
+    early-exit its draw. Returns ``False`` otherwise."""
+    if op.implicit_array_children_count > 0 or op.has_blocked_array_child:
+        _draw_array_warning(op.layout, op.implicit_array_children_count, op.has_blocked_array_child)
+        return True
+    return False
 
 
 class OverrideDelete(bpy.types.Operator):
@@ -842,8 +897,8 @@ class OverrideDelete(bpy.types.Operator):
 
     confirm: bpy.props.BoolProperty(default=True)
     is_batch: bpy.props.BoolProperty(name="Is Batch", default=False)
-    implicit_array_children_count: bpy.props.IntProperty(default=0)
-    has_blocked_array_child: bpy.props.BoolProperty(default=False)
+    implicit_array_children_count: bpy.props.IntProperty(default=0, options={"SKIP_SAVE", "HIDDEN"})
+    has_blocked_array_child: bpy.props.BoolProperty(default=False, options={"SKIP_SAVE", "HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -877,24 +932,10 @@ class OverrideDelete(bpy.types.Operator):
             return bpy.ops.object.delete("INVOKE_DEFAULT", use_global=self.use_global, confirm=self.confirm)
         else:
             self.is_batch = calc_delete_is_batch(ifc_file, context)
-            selected = set(context.selected_objects)
-            self.implicit_array_children_count = tool.Blender.Modifier.count_implicit_array_children_in_selection(
-                selected
-            )
-            self.has_blocked_array_child = tool.Blender.Modifier.has_blocked_array_child_in_selection(selected)
-            if self.implicit_array_children_count > 0 or self.has_blocked_array_child:
-                # Arrays carry few elements; a wider dialog avoids truncating
-                # the warning and we deliberately skip the batch toggle here.
-                # A modal popup ensures the user actually sees the array
-                # constraint instead of finding it buried in the status bar.
-                if self.has_blocked_array_child and self.implicit_array_children_count == 0:
-                    # Pure acknowledgment — no destructive consequence to
-                    # confirm — so the button reads as such.
-                    return context.window_manager.invoke_props_dialog(
-                        self, width=_ARRAY_DELETE_DIALOG_WIDTH, confirm_text="Got it"
-                    )
-                return context.window_manager.invoke_props_dialog(self, width=_ARRAY_DELETE_DIALOG_WIDTH)
-            elif self.is_batch:
+            array_dialog = _maybe_open_array_dialog(self, context, set(context.selected_objects))
+            if array_dialog is not None:
+                return array_dialog
+            if self.is_batch:
                 return context.window_manager.invoke_props_dialog(self)
             elif self.confirm:
                 return context.window_manager.invoke_confirm(self, event)
@@ -903,11 +944,7 @@ class OverrideDelete(bpy.types.Operator):
 
     def draw(self, context):
         assert self.layout
-        if self.implicit_array_children_count > 0 or self.has_blocked_array_child:
-            # Focus the dialog on the array constraints the user is about to
-            # face. Batch-mode + console-progress UI belong to large bulk
-            # deletes, not to array operations.
-            _draw_array_warning(self.layout, self.implicit_array_children_count, self.has_blocked_array_child)
+        if _draw_if_array_dialog(self):
             return
         row = self.layout.row()
         row.prop(self, "is_batch", text="Enable Faster Deletion")
@@ -957,12 +994,8 @@ class OverrideDelete(bpy.types.Operator):
                     self.report({"ERROR"}, lock_error_message(obj.name))
                     continue
                 if tool.Blender.Modifier.is_array_child(element):
-                    # Array parents are dismantled up-front by `process_arrays`
-                    # (after the invoke dialog confirms it with the user), so
-                    # only children of arrays whose parent is NOT in the
-                    # selection reach this guard. Blocking them keeps the
-                    # array intact; the user can pick the parent to remove
-                    # the whole array instead.
+                    # Block array children whose parent is outside the
+                    # selection — keeps the array intact.
                     self.report(
                         {"INFO"},
                         "Array children cannot be deleted directly. "
@@ -1076,11 +1109,6 @@ class OverrideDelete(bpy.types.Operator):
         ifc_file = tool.Ifc.get()
         selected_objects = set(context.selected_objects)
         array_parents: set[ifcopenshell.entity_instance] = set()
-        # Parents the user picked directly (selecting the array parent itself) are
-        # dismantled completely — every layer, every child — so the parent can then
-        # be deleted in the main loop without leaving orphaned children pointing at
-        # a dead Parent GlobalId. The invoke dialog has already confirmed this.
-        array_parents_to_fully_dismantle: set[ifcopenshell.entity_instance] = set()
         for obj in context.selected_objects:
             element = tool.Ifc.get_entity(obj)
             if not element:
@@ -1088,15 +1116,15 @@ class OverrideDelete(bpy.types.Operator):
             pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
             if not pset:
                 continue
-            parent_element = ifc_file.by_guid(pset["Parent"])
-            array_parents.add(parent_element)
-            if parent_element == element:
-                array_parents_to_fully_dismantle.add(parent_element)
+            array_parents.add(ifc_file.by_guid(pset["Parent"]))
 
         for array_parent in array_parents:
             array_parent_obj = tool.Ifc.get_object(array_parent)
             data = [(i, data) for i, data in enumerate(tool.Blender.Modifier.Array.get_modifiers_data(array_parent))]
-            full_dismantle = array_parent in array_parents_to_fully_dismantle
+            # Parents picked directly are dismantled across every layer so the
+            # parent can be deleted in the main loop without leaving children
+            # pointing at a dead Parent GlobalId.
+            full_dismantle = array_parent_obj in selected_objects
             # NOTE: there is a way to remove arrays more precisely but it's more complex
             for i, modifier_data in reversed(data):
                 children = set(tool.Blender.Modifier.Array.get_children_objects(modifier_data))
@@ -1125,8 +1153,8 @@ class OverrideOutlinerDelete(bpy.types.Operator, tool.Ifc.Operator):
     bl_options = {"REGISTER", "UNDO"}
     hierarchy: bpy.props.BoolProperty(default=False)
     is_batch: bpy.props.BoolProperty(name="Is Batch", default=False)
-    implicit_array_children_count: bpy.props.IntProperty(default=0)
-    has_blocked_array_child: bpy.props.BoolProperty(default=False)
+    implicit_array_children_count: bpy.props.IntProperty(default=0, options={"SKIP_SAVE", "HIDDEN"})
+    has_blocked_array_child: bpy.props.BoolProperty(default=False, options={"SKIP_SAVE", "HIDDEN"})
 
     @classmethod
     def poll(cls, context) -> bool:
@@ -1167,26 +1195,17 @@ class OverrideOutlinerDelete(bpy.types.Operator, tool.Ifc.Operator):
         ifc_file = tool.Ifc.get()
         if ifc_file:
             self.is_batch = calc_delete_is_batch(ifc_file, context)
-            # Resolve the outliner's selection model (collections + objects +
-            # other IDs) down to the objects the array helpers expect.
+            # Flatten the Outliner selection (collections / other IDs) to objects.
             selected = self.get_selected_ids_data(context).objects
-            self.implicit_array_children_count = tool.Blender.Modifier.count_implicit_array_children_in_selection(
-                selected
-            )
-            self.has_blocked_array_child = tool.Blender.Modifier.has_blocked_array_child_in_selection(selected)
-            if self.implicit_array_children_count > 0 or self.has_blocked_array_child:
-                if self.has_blocked_array_child and self.implicit_array_children_count == 0:
-                    return context.window_manager.invoke_props_dialog(
-                        self, width=_ARRAY_DELETE_DIALOG_WIDTH, confirm_text="Got it"
-                    )
-                return context.window_manager.invoke_props_dialog(self, width=_ARRAY_DELETE_DIALOG_WIDTH)
+            array_dialog = _maybe_open_array_dialog(self, context, selected)
+            if array_dialog is not None:
+                return array_dialog
             if self.is_batch:
                 return context.window_manager.invoke_props_dialog(self)
         return self.execute(context)
 
     def draw(self, context):
-        if self.implicit_array_children_count > 0 or self.has_blocked_array_child:
-            _draw_array_warning(self.layout, self.implicit_array_children_count, self.has_blocked_array_child)
+        if _draw_if_array_dialog(self):
             return
         row = self.layout.row()
         row.prop(self, "is_batch", text="Enable Faster Deletion")
@@ -2304,16 +2323,6 @@ class OverrideEscape(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        # Bend preview lives on the Scene (not on an active object), so the
-        # per-object ``try_canceling_editing_modifier_parameters_or_path``
-        # path below doesn't reach it. Check first — gives ESC the same
-        # exit-edit-mode affordance the per-object parametric edits already
-        # have via the cancel-op branch.
-        preview = getattr(context.scene, "BIMPreviewProperties", None)
-        bend_props = preview.bend if preview is not None else None
-        if bend_props is not None and bend_props.is_active:
-            bpy.ops.bim.cancel_bend_preview()
-            return {"FINISHED"}
         props = tool.Geometry.get_geometry_props()
         if props.mode == "ITEM":
             tool.Geometry.disable_item_mode()

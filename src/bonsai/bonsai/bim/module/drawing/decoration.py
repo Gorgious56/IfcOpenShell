@@ -44,6 +44,7 @@ import bonsai.tool as tool
 from bonsai.bim.module.drawing.data import DecoratorData, DrawingsData
 from bonsai.bim.module.drawing.helper import format_distance
 from bonsai.bim.module.drawing.shaders import add_offsets, add_verts_sequence
+from bonsai.tool.cad import BISECT_TOLERANCE, WELD_EPSILON
 
 UNSPECIAL_ELEMENT_COLOR = (0.2, 0.2, 0.2, 1)  # GREY
 
@@ -1837,13 +1838,13 @@ class CutDecorator:
         bmesh.ops.bisect_plane(
             bm_original,
             geom=geom,
-            dist=0.0001,
+            dist=BISECT_TOLERANCE,
             plane_co=plane_co,
             plane_no=plane_no,
             clear_outer=True,
             clear_inner=True,
         )
-        bmesh.ops.remove_doubles(bm_original, verts=bm_original.verts, dist=0.000001)
+        bmesh.ops.remove_doubles(bm_original, verts=bm_original.verts, dist=WELD_EPSILON)
         bmesh.ops.triangle_fill(bm_original, use_dissolve=True, edges=bm_original.edges)
 
         if not (material := ifcopenshell.util.element.get_material(element)):
@@ -1910,7 +1911,7 @@ class CutDecorator:
             co += no * layer.LayerThickness * self.unit_scale
             if i != last_i:
                 bisect = bmesh.ops.bisect_plane(
-                    bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], dist=0.0001, plane_co=co, plane_no=no
+                    bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], dist=BISECT_TOLERANCE, plane_co=co, plane_no=no
                 )
                 for geom in bisect["geom_cut"]:
                     if isinstance(geom, bmesh.types.BMVert):
@@ -1925,10 +1926,14 @@ class CutDecorator:
             bm_fill = bm_original.copy()
             if i != last_i:
                 geom = bm_fill.verts[:] + bm_fill.edges[:] + bm_fill.faces[:]
-                bmesh.ops.bisect_plane(bm_fill, geom=geom, dist=0.0001, plane_co=co, plane_no=no, clear_outer=True)
+                bmesh.ops.bisect_plane(
+                    bm_fill, geom=geom, dist=BISECT_TOLERANCE, plane_co=co, plane_no=no, clear_outer=True
+                )
             if i != 0:
                 geom = bm_fill.verts[:] + bm_fill.edges[:] + bm_fill.faces[:]
-                bmesh.ops.bisect_plane(bm_fill, geom=geom, dist=0.0001, plane_co=prev_co, plane_no=no, clear_inner=True)
+                bmesh.ops.bisect_plane(
+                    bm_fill, geom=geom, dist=BISECT_TOLERANCE, plane_co=prev_co, plane_no=no, clear_inner=True
+                )
 
             DecoratorData.fill_cache[element_id].setdefault(colour, []).append(
                 self.get_bmesh_tris(obj, bm_fill, context.scene.camera)

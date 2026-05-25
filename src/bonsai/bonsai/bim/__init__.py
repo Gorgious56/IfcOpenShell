@@ -278,15 +278,17 @@ def unregister_classes(classes_to_unregister):
 
 
 @bpy.app.handlers.persistent
-def _clear_gizmo_texture_cache_on_load(_dummy) -> None:
-    """Invalidate the gizmo PNG → GPUTexture cache when a new blend file loads.
+def _clear_gizmo_gpu_caches_on_load(_dummy) -> None:
+    """Invalidate gizmo GPU caches on blend-file load.
 
-    The cache holds references to ``bpy.types.Image`` data-blocks whose
-    backing memory is freed on file load — leaving the GPUTextures pointing
-    at stale Blender data."""
-    from bonsai.bim.module.drawing import gizmo_textures
+    Both the texture cache (PNG → GPUTexture) and the static-tris batch
+    cache (class → GPUBatch) hold GPU/Blender data-block references that
+    go stale across reloads. Clear them so the next draw rebuilds against
+    the fresh context."""
+    from bonsai.bim.module.drawing import gizmo_textures, gizmos
 
     gizmo_textures.clear_cache()
+    gizmos.clear_static_tris_cache()
 
 
 def register():
@@ -297,7 +299,7 @@ def register():
     bpy.app.handlers.redo_post.append(handler.redo_post)
     bpy.app.handlers.load_post.append(handler.load_post)
     bpy.app.handlers.load_post.append(handler.loadIfcStore)
-    bpy.app.handlers.load_post.append(_clear_gizmo_texture_cache_on_load)
+    bpy.app.handlers.load_post.append(_clear_gizmo_gpu_caches_on_load)
     bpy.types.Scene.BIMProperties = bpy.props.PointerProperty(type=prop.BIMProperties)
     bpy.types.Scene.BIMSnapProperties = bpy.props.PointerProperty(type=prop.BIMSnapProperties)
     bpy.types.Scene.BIMSnapGroups = bpy.props.PointerProperty(type=prop.BIMSnapGroups)
@@ -319,6 +321,13 @@ def register():
 
     # Delay registering classes that depend on module classes
     register_classes(late_classes)
+
+    # Pre-load textures for any TexturedQuadGizmoMixin subclass that
+    # registered above. Runs here (not from gizmo draw callbacks) so the
+    # bpy.data.images.load mutation happens in a safe context.
+    from bonsai.bim.module.drawing import gizmo_textures
+
+    gizmo_textures.preload_for_registered_gizmos()
 
     wm = bpy.context.window_manager
     if wm.keyconfigs.addon:
@@ -351,14 +360,16 @@ def unregister():
 
     bpy.utils.previews.remove(icons)
 
-    from bonsai.bim.module.drawing import gizmo_textures
+    from bonsai.bim.module.drawing import gizmo_textures, gizmos
 
     gizmo_textures.clear_cache()
+    gizmos.clear_static_tris_cache()
 
     unregister_classes(classes)
 
     bpy.app.handlers.load_post.remove(handler.load_post)
     bpy.app.handlers.load_post.remove(handler.loadIfcStore)
+    bpy.app.handlers.load_post.remove(_clear_gizmo_gpu_caches_on_load)
     del bpy.types.Scene.BIMProperties
     del bpy.types.Collection.BIMCollectionProperties
     del bpy.types.Object.BIMObjectProperties

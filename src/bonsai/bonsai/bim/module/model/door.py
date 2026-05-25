@@ -732,7 +732,7 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_door"
     finish_editing_operator = "bim.finish_editing_door"
     cancel_editing_operator = "bim.cancel_editing_door"
-    cycle_type_operator = "bim.pick_door_type"
+    pick_type_operator = "bim.pick_door_type"
 
     # Declarative dimension gizmo configuration with visibility and position
     # matrix_position lambdas replace the get_dimension_matrix_* methods

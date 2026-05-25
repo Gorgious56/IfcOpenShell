@@ -37,10 +37,14 @@ names, and the dispatch-op idname differ. This module centralises the
 cross-cutting helpers and the boilerplate base classes so adding a new
 preview triad doesn't duplicate all of it.
 
+The GPU draw-handler lifecycle for ``<X>PreviewDecorator`` lives on the
+feature-neutral ``tool.Blender.ViewportDecorator`` base, which every
+viewport decorator (preview or otherwise) inherits from.
+
 Layered design — non-preview Bonsai code can call ``get_preview_props`` /
 ``is_preview_active`` to introspect the active preview without taking on
-the bigger Operator / Gizmo / Decorator bases. The bases are purely opt-in
-for new preview triads."""
+the bigger Operator / Gizmo bases. The bases are purely opt-in for new
+preview triads."""
 
 from __future__ import annotations
 
@@ -48,7 +52,6 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 import bpy
-from bpy.types import SpaceView3D
 
 import bonsai.tool as tool
 
@@ -158,20 +161,6 @@ def sync_uncommitted_moves(objects: list) -> None:
             )
 
 
-def cancel_prior_preview(props, cancel_operator_idname: str) -> None:
-    """Dispatch a Cancel operator if a preview of this type is already
-    active. Called from Enable operators so a user who fires "enable" while
-    a prior preview is still open gets a clean restart rather than two
-    preview states layered on top of each other.
-
-    No-op when ``props`` is ``None`` or ``is_active`` is False (the common
-    case — most enable calls don't follow another preview)."""
-    if props is None or not props.is_active:
-        return
-    op = getattr(bpy.ops.bim, cancel_operator_idname)
-    op()
-
-
 # --- Base classes for Finish / Cancel operators ------------------------------
 
 
@@ -182,7 +171,11 @@ class BasePreviewFinishOperator(bpy.types.Operator):
     ``DISPATCH_OPERATOR``, ``DISPATCH_PROP_MAP``, and ``RESET_FIELDS``; the
     base class handles the shared lifecycle: read the preview props,
     early-return if inactive or no IFC, dispatch via ``bpy.ops.bim.<op>``
-    with kwargs gathered from the props, clear the state on FINISHED."""
+    with kwargs gathered from the props, clear the state on FINISHED.
+
+    ``RESET_FIELDS`` is a tuple of ``(field_name, reset_value)`` pairs so
+    drafts can mix integer IDs, floats (radii), enums, etc. without the
+    base needing to know each field's type."""
 
     bl_options = {"REGISTER", "UNDO"}
 
@@ -191,7 +184,7 @@ class BasePreviewFinishOperator(bpy.types.Operator):
     PREVIEW_ATTR: ClassVar[str]
     DISPATCH_OPERATOR: ClassVar[str]
     DISPATCH_PROP_MAP: ClassVar[dict[str, str]]
-    RESET_FIELDS: ClassVar[tuple[str, ...]]
+    RESET_FIELDS: ClassVar[tuple[tuple[str, Any], ...]]
 
     def execute(self, context: bpy.types.Context):
         props = get_preview_props(context, self.PREVIEW_ATTR)
@@ -208,8 +201,8 @@ class BasePreviewFinishOperator(bpy.types.Operator):
         # the gizmos visible so the user can re-tune or cancel.
         if "FINISHED" in result:
             props.is_active = False
-            for field in self.RESET_FIELDS:
-                setattr(props, field, 0)
+            for field, reset_value in self.RESET_FIELDS:
+                setattr(props, field, reset_value)
         return result
 
 
@@ -218,12 +211,12 @@ class BasePreviewCancelOperator(bpy.types.Operator):
 
     Pure state reset — preview itself never mutates IFC, so cancel just
     clears the draft fields. Subclasses set ``PREVIEW_ATTR`` and
-    ``RESET_FIELDS`` (the integer fields to zero alongside ``is_active``)."""
+    ``RESET_FIELDS`` (tuple of ``(field_name, reset_value)`` pairs)."""
 
     bl_options = {"REGISTER", "UNDO"}
 
     PREVIEW_ATTR: ClassVar[str]
-    RESET_FIELDS: ClassVar[tuple[str, ...]]
+    RESET_FIELDS: ClassVar[tuple[tuple[str, Any], ...]]
 
     def execute(self, context: bpy.types.Context):
         props = get_preview_props(context, self.PREVIEW_ATTR)
@@ -233,50 +226,6 @@ class BasePreviewCancelOperator(bpy.types.Operator):
             # other ESC handler is next.
             return {"CANCELLED"}
         props.is_active = False
-        for field in self.RESET_FIELDS:
-            setattr(props, field, 0)
+        for field, reset_value in self.RESET_FIELDS:
+            setattr(props, field, reset_value)
         return {"FINISHED"}
-
-
-# --- Base class for GPU preview decorators -----------------------------------
-
-
-class BasePreviewDecorator:
-    """Skeleton for ``<X>PreviewDecorator`` GPU draw handlers.
-
-    Subclasses implement ``draw(self, context)``. The base provides the
-    shared ``install`` / ``uninstall`` lifecycle. ``__init_subclass__``
-    gives each subclass its OWN ``is_installed`` / ``handlers`` class
-    attributes — without this, all decorators would share one slot and
-    only the last-installed could be uninstalled cleanly."""
-
-    is_installed: bool
-    handlers: list
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        # Per-subclass install state. Defining these here (rather than at
-        # the base class) prevents accidental sharing across decorators.
-        cls.is_installed = False
-        cls.handlers = []
-
-    @classmethod
-    def install(cls, context: bpy.types.Context) -> None:
-        if cls.is_installed:
-            cls.uninstall()
-        handler = cls()
-        cls.handlers.append(SpaceView3D.draw_handler_add(handler.draw, (context,), "WINDOW", "POST_VIEW"))
-        cls.is_installed = True
-
-    @classmethod
-    def uninstall(cls) -> None:
-        for h in cls.handlers:
-            try:
-                SpaceView3D.draw_handler_remove(h, "WINDOW")
-            except ValueError:
-                pass
-        cls.handlers.clear()
-        cls.is_installed = False
-
-    def draw(self, context: bpy.types.Context) -> None:
-        raise NotImplementedError

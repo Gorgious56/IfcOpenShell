@@ -37,6 +37,12 @@ from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.data import RoofData, refresh
 from bonsai.bim.module.model.decorator import ProfileDecorator
 from bonsai.bim.parametric_lifecycle import PathPreservingEditMixin
+from bonsai.tool.cad import WELD_TOLERANCE
+
+# Roof generation tolerances.
+_DISSOLVE_ANGLE_RAD = radians(5)  # bmesh limit-dissolve angle for coplanar face merge
+_RAFTER_ANGLE_TOLERANCE = radians(1)  # equal-angle test for rafter pairing
+_RIDGE_TEST_OFFSET = 0.01  # small nudge for inside/outside ridge-line classification
 
 # reference:
 # https://ifc43-docs.standards.buildingsmart.org/IFC/RELEASE/IFC4x3/HTML/lexical/IfcRoof.htm
@@ -52,13 +58,13 @@ def bm_mesh_clean_up(bm: bmesh.types.BMesh) -> None:
     bmesh.ops.delete(bm, geom=bm.faces[:], context="FACES_ONLY")
     bmesh.ops.dissolve_limit(
         bm,
-        angle_limit=0.0872665,
+        angle_limit=_DISSOLVE_ANGLE_RAD,
         use_dissolve_boundaries=False,
         delimit={"NORMAL"},
         edges=bm.edges[:],
         verts=bm.verts[:],
     )
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
 
 class GenerateHippedRoof(bpy.types.Operator, tool.Ifc.Operator):
@@ -262,18 +268,20 @@ def generate_hipped_roof_bmesh(
                     edge_midpoint.z = ridge_vert.co.z
                     poke = bmesh.ops.poke(bm, faces=[edge.link_faces[0]])
                     other_ridge_vert = poke["verts"][0]
-                    other_ridge_vert.co = ridge_vert.co + (edge_midpoint - ridge_vert.co).normalized() * 0.01
+                    other_ridge_vert.co = (
+                        ridge_vert.co + (edge_midpoint - ridge_vert.co).normalized() * _RIDGE_TEST_OFFSET
+                    )
                     ridge_vert, other_ridge_vert = other_ridge_vert, ridge_vert
 
                 face_center = (face_verts[0].co + face_verts[1].co + face_verts[2].co) / 3
                 x_axis = (edge.verts[1].co - edge.verts[0].co).normalized()
                 z_axis = Vector((0, 0, -1))
                 y_axis = z_axis.cross(x_axis)
-                positive = edge.verts[0].co + (y_axis * 0.01)
-                negative = edge.verts[0].co - (y_axis * 0.01)
+                positive = edge.verts[0].co + (y_axis * _RIDGE_TEST_OFFSET)
+                negative = edge.verts[0].co - (y_axis * _RIDGE_TEST_OFFSET)
                 if (face_center - positive).length < (face_center - negative).length:
                     y_axis = -y_axis
-                    x_axis = y_axis.cross(z_axis)  # Recalculate X axis to make rotation sign consistent
+                    x_axis = y_axis.cross(z_axis)
                 rotation_quaternion = Quaternion(x_axis, edge_angle)
                 plane_no = rotation_quaternion @ z_axis
 
@@ -286,7 +294,7 @@ def generate_hipped_roof_bmesh(
                     else:
                         ridge_vert.co = intersect
 
-                if tool.Cad.is_x(edge_angle, pi / 2, tolerance=radians(1)):
+                if tool.Cad.is_x(edge_angle, pi / 2, tolerance=_RAFTER_ANGLE_TOLERANCE):
                     footprint_edges.remove(edge)
                     edges_to_delete.add(edge)
                     gable_edges.update(
@@ -302,7 +310,7 @@ def generate_hipped_roof_bmesh(
     cutting_planes = {}
     bm.faces.ensure_lookup_table()
 
-    if not tool.Cad.is_x(rafter_edge_angle, 0, tolerance=radians(1)):
+    if not tool.Cad.is_x(rafter_edge_angle, 0, tolerance=_RAFTER_ANGLE_TOLERANCE):
         for e in footprint_edges:
             face = e.link_faces[0]
             planes = []
@@ -314,12 +322,12 @@ def generate_hipped_roof_bmesh(
             x_axis = (v2 - v1).normalized()
             z_axis = Vector((0, 0, -1))
             y_axis = z_axis.cross(x_axis)
-            positive = v1 + (y_axis * 0.01)
-            negative = v1 - (y_axis * 0.01)
+            positive = v1 + (y_axis * _RIDGE_TEST_OFFSET)
+            negative = v1 - (y_axis * _RIDGE_TEST_OFFSET)
             plane_no = y_axis
             if (face_center - positive).length < (face_center - negative).length:
                 plane_no = -y_axis
-                x_axis = plane_no.cross(z_axis)  # Recalculate X axis to make rotation sign consistent
+                x_axis = plane_no.cross(z_axis)
             rotation_quaternion = Quaternion(x_axis, rafter_edge_angle)
             plane_no = rotation_quaternion @ plane_no
             planes.append((v1, plane_no))
@@ -381,7 +389,7 @@ def generate_hipped_roof_bmesh(
                     g.tag = True
             verts = set()
             [verts.update(f.verts) for f in bm.faces if f.tag]
-            bmesh.ops.remove_doubles(bm, verts=list(verts), dist=1e-4)
+            bmesh.ops.remove_doubles(bm, verts=list(verts), dist=WELD_TOLERANCE)
 
         for f in bm.faces:
             f.tag = False
@@ -389,7 +397,7 @@ def generate_hipped_roof_bmesh(
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
     # Merge fragments and remove internal faces.
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
     faces_to_delete = set()
     for face in [f for f in bm.faces]:
         is_internal = True
@@ -433,7 +441,7 @@ def update_roof_modifier_ifc_data(context: bpy.types.Context) -> None:
             element.PredefinedType = "GABLE_ROOF" if roof_is_gabled() else "HIP_ROOF"
     elif ifc_class in ("IfcSlab", "IfcSlabType"):
         element.PredefinedType = "ROOF"
-    elif ifc_class in ("IfcCoveringType", "IfcCoveringType"):
+    elif ifc_class in ("IfcCovering", "IfcCoveringType"):
         element.PredefinedType = "ROOFING"
 
     tool.Model.add_body_representation(obj)
@@ -635,7 +643,7 @@ class _RoofEditMixin(PathPreservingEditMixin):
         update_roof_modifier_ifc_data(context)
 
     @classmethod
-    def _update_modifier_bmesh(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
+    def _restore_viewport_after_cancel(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
         update_roof_modifier_bmesh(obj)
 
 
@@ -669,6 +677,9 @@ class FinishEditingRoof(_RoofEditMixin, bpy.types.Operator, tool.Ifc.Operator):
 # Fixed horizontal run for the slope gizmo: the draggable value is the
 # vertical rise at this distance from the anchor, in the rise/run convention.
 _ROOF_SLOPE_REFERENCE_RUN = 1.0
+# One degree shy of vertical; avoids tan() blow-up when the user drags the
+# rise handle past the gizmo's anchor.
+_ROOF_MAX_SLOPE_ANGLE = pi / 2 - 0.001
 
 
 class CycleRoofGenerationMethod(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
@@ -678,8 +689,8 @@ class CycleRoofGenerationMethod(bpy.types.Operator, tool.Ifc.Operator, gizmo.Cyc
     bl_label = "Cycle Roof Generation Method"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = "is_roof"
-    props_getter = "get_roof_props"
+    element_checker = tool.Blender.Modifier.is_roof
+    props_getter = tool.Model.get_roof_props
     type_literal = tool.Model.RoofGenerationMethod
     type_attr = "generation_method"
 
@@ -716,7 +727,7 @@ class GizmoRoofEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
             visibility_condition=lambda p: p.generation_method == "ANGLE",
             compute_value=lambda p: tan(p.angle) * _ROOF_SLOPE_REFERENCE_RUN,
             apply_value=lambda p, rise: setattr(
-                p, "angle", min(pi / 2 - 0.001, max(0.0, atan2(rise, _ROOF_SLOPE_REFERENCE_RUN)))
+                p, "angle", min(_ROOF_MAX_SLOPE_ANGLE, max(0.0, atan2(rise, _ROOF_SLOPE_REFERENCE_RUN)))
             ),
             text_formatter=lambda p, rise: (f"{tool.Unit.format_distance(rise)} ({degrees(p.angle):.1f}°)"),
         ),
@@ -730,7 +741,7 @@ class GizmoRoofEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         ),
     ]
 
-    props_getter = "get_roof_props"
+    props_getter = tool.Model.get_roof_props
     gizmo_pref_name = "roof"
 
     @classmethod

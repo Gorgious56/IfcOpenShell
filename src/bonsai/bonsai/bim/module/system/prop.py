@@ -106,7 +106,12 @@ def get_available_ports_for_connection(
         if tool.System.get_connected_port(ifc_port) is not None or ifc_port in active_object_ports:
             continue
 
-        port_object = tool.Ifc.get_object(tool.System.get_port_relating_element(ifc_port))
+        relating_element = tool.System.get_port_relating_element(ifc_port)
+        if relating_element is None:
+            continue
+        port_object = tool.Ifc.get_object(relating_element)
+        if port_object is None:
+            continue
         suggestion = f"{port_object.name} > {port.name}"
         items.append((port.name, suggestion, ""))
 

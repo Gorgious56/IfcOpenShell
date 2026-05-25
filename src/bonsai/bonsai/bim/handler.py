@@ -20,7 +20,7 @@
 
 import os
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Union
 
 import bpy
@@ -29,12 +29,14 @@ import ifcopenshell.util.element
 import ifcopenshell.util.representation
 import ifcopenshell.util.unit
 from bpy.app.handlers import persistent
-from mathutils import Vector
 
 import bonsai.bim
 import bonsai.core.model as core_model
 import bonsai.tool as tool
-from bonsai.bim.decorator_cache import install_decorator_cache_handlers
+from bonsai.bim.decorator_cache import (
+    install_decorator_cache_handlers,
+    uninstall_decorator_cache_handlers,
+)
 from bonsai.bim.ifc import IfcStore
 from bonsai.bim.module.aggregate.decorator import AggregateDecorator
 from bonsai.bim.module.georeference.decorator import GeoreferenceDecorator
@@ -50,6 +52,7 @@ from bonsai.bim.module.model.decorator import (
     WallAxisDecorator,
     WallFilletPreviewDecorator,
     WallGizmoPreviewDecorator,
+    WallSystemPathDecorator,
 )
 from bonsai.bim.module.nest.decorator import NestDecorator
 
@@ -181,17 +184,12 @@ def update_bim_tool_props():
     if not extrusion:
         return
 
-    def get_x_angle(extrusion: ifcopenshell.entity_instance) -> float:
-        x, y, z = extrusion.ExtrudedDirection.DirectionRatios
-        x_angle = Vector((0, 1)).angle_signed(Vector((y, z)))
-        return x_angle
-
     si_conversion = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
     if not AuthoringData.is_loaded:
         AuthoringData.load()
 
     if AuthoringData.data["active_material_usage"] == "LAYER2":
-        x_angle = get_x_angle(extrusion)
+        x_angle = tool.Model.get_existing_x_angle(extrusion)
         axis = tool.Model.get_wall_axis(obj)["reference"]
         props.extrusion_depth = core_model.vertical_height_from_extrusion_depth(
             extrusion.Depth * si_conversion, x_angle
@@ -200,8 +198,7 @@ def update_bim_tool_props():
         props.x_angle = x_angle
 
     elif AuthoringData.data["active_material_usage"] == "LAYER3":
-        x_angle = get_x_angle(extrusion)
-        props.x_angle = x_angle
+        props.x_angle = tool.Model.get_existing_x_angle(extrusion)
 
     elif AuthoringData.data["active_material_usage"] == "PROFILE":
         props.extrusion_depth = extrusion.Depth * si_conversion
@@ -386,6 +383,16 @@ def subscribe_to_viewport_shading_changes():
             )
 
 
+def heal_inconsistent_array_edit_state(objects: Iterable[bpy.types.Object]) -> None:
+    """Clear ``is_editing`` when ``editing_item_index`` is unset.
+
+    Invariant: ``is_editing=True`` requires ``editing_item_index >= 0``."""
+    for obj in objects:
+        array_props = obj.BIMArrayProperties
+        if array_props.is_editing and array_props.editing_item_index == -1:
+            array_props.is_editing = False
+
+
 @persistent
 def load_post(scene):
     global global_subscription_owner
@@ -397,6 +404,9 @@ def load_post(scene):
     ifcopenshell.api.owner.settings.get_user = get_user
     ifcopenshell.api.owner.settings.get_application = get_application
     AuthoringData.type_thumbnails = {}
+
+    tool.Parametric.heal_stale_edit_flags()
+    heal_inconsistent_array_edit_state(bpy.data.objects)
 
     preferences = tool.Blender.get_addon_preferences()
     if not preferences.should_setup_toolbar:
@@ -430,6 +440,7 @@ def load_post(scene):
     aggregate_props = tool.Aggregate.get_aggregate_props()
     nest_props = tool.Nest.get_nest_props()
     model_props = tool.Model.get_model_props()
+    uninstall_decorator_cache_handlers()
     GeoreferenceDecorator.uninstall()
     AggregateDecorator.uninstall()
     NestDecorator.uninstall()
@@ -439,6 +450,7 @@ def load_post(scene):
     MEPSegmentExtendPreviewDecorator.uninstall()
     BendPreviewDecorator.uninstall()
     MEPSystemPathDecorator.uninstall()
+    WallSystemPathDecorator.uninstall()
     if georeference_props.should_visualise:
         GeoreferenceDecorator.install(bpy.context)
     if aggregate_props.aggregate_decorator:
@@ -449,34 +461,18 @@ def load_post(scene):
         WallAxisDecorator.install(bpy.context)
     if model_props.show_slab_direction:
         SlabDirectionDecorator.install(bpy.context)
-    install_decorator_cache_handlers()
     if model_props.show_bounding_box:
         BoundingBoxDecorator.install(bpy.context)
-    if getattr(model_props, "show_mep_path", False):
-        # Faint axis-line overlay tracing the selected MEP element's
-        # connected distribution system. Self-gates on the toggle every
-        # redraw; only installed when the user has flipped show_mep_path
-        # on, so the cost is zero when off.
+    if getattr(model_props, "show_paths", False):
         MEPSystemPathDecorator.install(bpy.context)
-    # Faint preview lines for wall click-to-act gizmos. Always-on (no scene
-    # toggle); the handler self-gates on the gizmo addon-pref each draw.
+        WallSystemPathDecorator.install(bpy.context)
     WallGizmoPreviewDecorator.install(bpy.context)
-    # Bounding-box preview at each future instance while the array triad
-    # edit is active. Self-gates on ``BIMArrayProperties.is_editing``.
     ArrayPreviewDecorator.install(bpy.context)
-    # Parent + sibling highlight when an array child is selected. Self-gates
-    # on ``is_array_child(active_element)``.
     ArraySelectionHighlightDecorator.install(bpy.context)
-    # Faint preview line for the MEP-segment extend-to-cursor gizmo. Always-on;
-    # self-gates on per-feature ``extend`` toggle in gizmo preferences.
     MEPSegmentExtendPreviewDecorator.install(bpy.context)
-    # Bend-creation preview: leg projections + arc polyline drawn while
-    # ``scene.BIMBendPreviewProperties.is_active`` (entered via
-    # ``bim.enable_bend_preview``). Always-installed; the draw callback's
-    # first action is the is_active check, so cost is one attribute read
-    # per redraw when no bend is being previewed.
     BendPreviewDecorator.install(bpy.context)
     WallFilletPreviewDecorator.install(bpy.context)
+    install_decorator_cache_handlers()
 
     if preferences.should_use_snap and (scene := bpy.context.scene):
         # Snapping is off by default in Blender, but in BIM, it's more useful to be on

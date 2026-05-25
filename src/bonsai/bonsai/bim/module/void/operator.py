@@ -24,6 +24,7 @@ import ifcopenshell.util.representation
 
 import bonsai.bim.handler
 import bonsai.core.geometry
+import bonsai.core.product
 import bonsai.core.root
 import bonsai.tool as tool
 from bonsai.bim.module.model.opening import FilledOpeningGenerator
@@ -40,6 +41,12 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
         "SHIFT+CLICK to align other selected objects' Z rotation to the active before applying."
     )
 
+    align_z: bpy.props.BoolProperty(
+        name="Align Z Rotation",
+        description="Align other selected objects' Z rotation to the active before cutting the opening",
+        default=False,
+    )
+
     @classmethod
     def poll(cls, context):
         if len(context.selected_objects) < 2:
@@ -48,25 +55,22 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
         return True
 
     def invoke(self, context, event):
-        # SHIFT+click: orient the non-active selection to match the active's
-        # Z rotation first, so a fill (door/window) clicked onto a rotated
-        # wall lands flush with the wall before the opening is cut. Poll-
-        # guard the chained op: AddOpening.poll allows no active_object but
-        # CopyZRotationToSelected.poll requires one — skip silently rather
-        # than crash if we're in that gap.
-        #
-        # The chained op commits its own IFC transaction before this one,
-        # so SHIFT+click lands as TWO undo steps (opening, then rotation).
-        # Each step is independently meaningful, so the granularity is a
-        # feature, not a defect — Ctrl+Z reverts only the cut, not the
-        # alignment.
-        if event.type == "LEFTMOUSE" and event.shift:
-            if bpy.ops.bim.copy_z_rotation_to_selected.poll():  # ty: ignore[missing-argument]
-                bpy.ops.bim.copy_z_rotation_to_selected()
+        self.align_z = event.type == "LEFTMOUSE" and event.shift
         return self.execute(context)
 
     def _execute(self, context):
         selected_objects = context.selected_objects
+        if self.align_z and (active := context.active_object) is not None:
+            targets = [obj for obj in selected_objects if obj is not active]
+            if targets:
+                bonsai.core.product.copy_z_rotation_to_selected(
+                    tool.Ifc,
+                    tool.Geometry,
+                    tool.Surveyor,
+                    active=active,
+                    targets=targets,
+                )
+
         target_object = selected_objects[0]
 
         opening_objects = [obj for obj in selected_objects if obj != target_object]

@@ -24,16 +24,24 @@ Decorators include the token in their cache key and rebuild on bump."""
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Generic, TypeVar
 
 import bpy
 
+T = TypeVar("T")
+
 _DECORATOR_CACHE_TOKEN = 0
-_INSTALLED_HOOKS: tuple[Any, ...] = ()
 
 
 def get_decorator_cache_token() -> int:
     return _DECORATOR_CACHE_TOKEN
+
+
+def reset_for_test() -> None:
+    """Test-only: reset the cache token to 0 so bump-count assertions are stable."""
+    global _DECORATOR_CACHE_TOKEN
+    _DECORATOR_CACHE_TOKEN = 0
 
 
 @bpy.app.handlers.persistent
@@ -55,19 +63,37 @@ def _hooks() -> tuple[Any, ...]:
 
 def install_decorator_cache_handlers() -> None:
     """Append the bump handler to each hook; idempotent."""
-    global _INSTALLED_HOOKS
-    hooks = _hooks()
-    for hook in hooks:
+    for hook in _hooks():
         if _bump_decorator_cache_token not in hook:
             hook.append(_bump_decorator_cache_token)
-    _INSTALLED_HOOKS = hooks
 
 
 def uninstall_decorator_cache_handlers() -> None:
-    global _INSTALLED_HOOKS
-    for hook in _INSTALLED_HOOKS:
+    for hook in _hooks():
         try:
             hook.remove(_bump_decorator_cache_token)
         except ValueError:
             pass
-    _INSTALLED_HOOKS = ()
+
+
+class TokenCache(Generic[T]):
+    """Memoise a single value keyed on ``(caller_key, get_decorator_cache_token())``.
+
+    The token component invalidates the cache on depsgraph / undo / redo / load,
+    so cached ``bpy.types.Object`` references can't outlive the underlying ID
+    blocks. Holds exactly one entry — last key wins."""
+
+    __slots__ = ("_key", "_value")
+
+    def __init__(self) -> None:
+        self._key: tuple[Any, int] | None = None
+        self._value: T | None = None
+
+    def get_or_compute(self, key: Any, compute: Callable[[], T]) -> T:
+        token_key = (key, _DECORATOR_CACHE_TOKEN)
+        if token_key == self._key:
+            return self._value  # type: ignore[return-value]
+        value = compute()
+        self._key = token_key
+        self._value = value
+        return value

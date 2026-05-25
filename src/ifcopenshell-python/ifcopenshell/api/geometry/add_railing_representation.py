@@ -18,13 +18,15 @@
 
 from dataclasses import dataclass, field
 from math import cos, pi, radians, sin, tan
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import numpy as np
-from typing_extensions import assert_never
 
 import ifcopenshell.util.unit
 from ifcopenshell.util.shape_builder import (
+    NP_XY,
+    NP_YX,
+    NP_Z,
     PRECISION,
     SequenceOfVectors,
     ShapeBuilder,
@@ -100,10 +102,6 @@ class WallMountedHandrailGeometry:
     supports: list[RailingSupport] = field(default_factory=list)
 
 
-# numpy indexing helpers (3D coords).
-_NP_Z = 2
-_NP_XY = slice(2)
-_NP_YX = [1, 0]
 _Z_DOWN = V(0, 0, -1)
 _ARC_MIDDLE_POINT_COS = sin(radians(45))
 
@@ -169,7 +167,7 @@ def _get_fillet_points(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray, radius: f
 
 def _make_support(point: np.ndarray, railing_direction: np.ndarray, dims: _RailingDims) -> RailingSupport:
     """Build a pure-geometry support description from a point + railing direction."""
-    ortho_dir = railing_direction[_NP_YX] * (1, -1)
+    ortho_dir = railing_direction[NP_YX] * (1, -1)
     ortho_dir = np_normalized(np_to_3d(ortho_dir))
     arc_center = point + ortho_dir * dims.support_length
     support_points = V(
@@ -179,7 +177,7 @@ def _make_support(point: np.ndarray, railing_direction: np.ndarray, dims: _Raili
             arc_center + _Z_DOWN * dims.support_length,
         ]
     )
-    angle = np_angle_signed((0, 1), ortho_dir[_NP_XY])
+    angle = np_angle_signed((0, 1), ortho_dir[NP_XY])
     return RailingSupport(
         arc_polyline=support_points,
         arc_radius=dims.support_arc_radius,
@@ -295,6 +293,116 @@ def _collect_supports(coords: np.ndarray, manual_supports: bool, dims: _RailingD
     return supports
 
 
+# Per-cap-type builders. Each takes the cap-frame inputs (precomputed by
+# ``_add_cap``) and returns ``(cap_coords, new_arc_points)``. The shared
+# orientation flip and final ``np.vstack`` live in ``_add_cap`` so the
+# builders stay focused on the geometric shape of their cap.
+_CapBuilder = Callable[
+    [np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, "_RailingDims"],
+    tuple[list[np.ndarray], list[np.ndarray]],
+]
+
+
+def _cap_180(
+    railing_coords_for_cap: np.ndarray,
+    start_point: np.ndarray,
+    cap_dir: np.ndarray,
+    ortho_dir: np.ndarray,
+    local_z_down: np.ndarray,
+    dims: "_RailingDims",
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    arc_point = start_point + cap_dir * dims.terminal_radius + dims.terminal_radius * local_z_down
+    cap_coords = [arc_point, start_point + dims.terminal_radius * 2 * local_z_down]
+    return cap_coords, [arc_point]
+
+
+def _cap_to_end_post(
+    railing_coords_for_cap: np.ndarray,
+    start_point: np.ndarray,
+    cap_dir: np.ndarray,
+    ortho_dir: np.ndarray,
+    local_z_down: np.ndarray,
+    dims: "_RailingDims",
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    arc_point = start_point + cap_dir * dims.terminal_radius + dims.terminal_radius * local_z_down
+    end_point = railing_coords_for_cap[-2].copy()
+    end_point[NP_Z] -= dims.terminal_radius * 2
+    cap_coords = [arc_point, start_point + dims.terminal_radius * 2 * local_z_down, end_point]
+    return cap_coords, [arc_point]
+
+
+def _cap_to_wall(
+    railing_coords_for_cap: np.ndarray,
+    start_point: np.ndarray,
+    cap_dir: np.ndarray,
+    ortho_dir: np.ndarray,
+    local_z_down: np.ndarray,
+    dims: "_RailingDims",
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    arc_point = (
+        start_point
+        + cap_dir * dims.clear_width * _ARC_MIDDLE_POINT_COS
+        + ortho_dir * dims.clear_width * (1 - _ARC_MIDDLE_POINT_COS)
+    )
+    cap_coords = [arc_point, start_point + ortho_dir * dims.clear_width + cap_dir * dims.clear_width]
+    return cap_coords, [arc_point]
+
+
+def _cap_to_floor(
+    railing_coords_for_cap: np.ndarray,
+    start_point: np.ndarray,
+    cap_dir: np.ndarray,
+    ortho_dir: np.ndarray,
+    local_z_down: np.ndarray,
+    dims: "_RailingDims",
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    arc_point = (
+        start_point
+        + cap_dir * dims.terminal_radius * _ARC_MIDDLE_POINT_COS
+        + _Z_DOWN * dims.terminal_radius * (1 - _ARC_MIDDLE_POINT_COS)
+    )
+    arc_end = start_point + cap_dir * dims.terminal_radius + dims.terminal_radius * _Z_DOWN
+    cap_coords = [
+        arc_point,
+        arc_end,
+        arc_end + _Z_DOWN * (dims.height_below_handrail - dims.terminal_radius),
+    ]
+    return cap_coords, [arc_point]
+
+
+def _cap_to_end_post_and_floor(
+    railing_coords_for_cap: np.ndarray,
+    start_point: np.ndarray,
+    cap_dir: np.ndarray,
+    ortho_dir: np.ndarray,
+    local_z_down: np.ndarray,
+    dims: "_RailingDims",
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    first_arc_end = start_point + cap_dir * dims.terminal_radius + dims.terminal_radius * local_z_down
+    first_arc_coords = _get_fillet_points(
+        start_point, start_point + cap_dir * dims.terminal_radius, first_arc_end, dims.terminal_radius
+    )
+    end_point = railing_coords_for_cap[-2].copy()
+    end_point[NP_Z] -= dims.height_below_handrail
+    second_arc_coords = _get_fillet_points(
+        first_arc_end, first_arc_end + local_z_down * dims.terminal_radius, end_point, dims.terminal_radius
+    )
+    cap_coords = [start_point] + first_arc_coords + second_arc_coords + [end_point]
+    return cap_coords, [first_arc_coords[1], second_arc_coords[1]]
+
+
+# Dispatch table for handrail terminal caps. "NONE" is handled by ``_add_cap``
+# as an early return — every other cap type appends real geometry to the
+# polyline, so the dispatch slot would have an awkward empty-vstack contract.
+_CAP_BUILDERS: dict[TERMINAL_TYPE, _CapBuilder] = {
+    "180": _cap_180,
+    "TO_END_POST": _cap_to_end_post,
+    "TO_WALL": _cap_to_wall,
+    "TO_FLOOR": _cap_to_floor,
+    "TO_END_POST_AND_FLOOR": _cap_to_end_post_and_floor,
+}
+
+
 def _add_cap(
     railing_coords: np.ndarray,
     arc_points_list: list[np.ndarray],
@@ -312,67 +420,16 @@ def _add_cap(
     arc_points_list = arc_points_list[::-1] if start else arc_points_list
 
     start_point: np.ndarray = railing_coords_for_cap[-1]
-    cap_dir = railing_coords_for_cap[-1] - railing_coords_for_cap[-2]
-    cap_dir = np_normalized(cap_dir)
-    ortho_dir = np_to_3d(cap_dir[_NP_YX] * (1, -1))
-    ortho_dir = np_normalized(ortho_dir)
+    cap_dir = np_normalized(railing_coords_for_cap[-1] - railing_coords_for_cap[-2])
+    ortho_dir = np_normalized(np_to_3d(cap_dir[NP_YX] * (1, -1)))
     local_z_down = np.cross(cap_dir, ortho_dir)
     if start:
         ortho_dir = -ortho_dir
 
-    cap_type = dims.cap_type
-    terminal_radius = dims.terminal_radius
-
-    if cap_type in ("180", "TO_END_POST"):
-        arc_point = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
-        arc_points_list.append(arc_point)
-        cap_coords = [arc_point, start_point + terminal_radius * 2 * local_z_down]
-
-        if cap_type == "TO_END_POST":
-            end_point = railing_coords_for_cap[-2].copy()
-            end_point[_NP_Z] -= terminal_radius * 2
-            cap_coords.append(end_point)
-
-    elif cap_type == "TO_WALL":
-        arc_point = (
-            start_point
-            + cap_dir * dims.clear_width * _ARC_MIDDLE_POINT_COS
-            + ortho_dir * dims.clear_width * (1 - _ARC_MIDDLE_POINT_COS)
-        )
-        arc_points_list.append(arc_point)
-        cap_coords = [arc_point, start_point + ortho_dir * dims.clear_width + cap_dir * dims.clear_width]
-
-    elif cap_type == "TO_FLOOR":
-        arc_point = (
-            start_point
-            + cap_dir * terminal_radius * _ARC_MIDDLE_POINT_COS
-            + _Z_DOWN * terminal_radius * (1 - _ARC_MIDDLE_POINT_COS)
-        )
-        arc_points_list.append(arc_point)
-        arc_end = start_point + cap_dir * terminal_radius + terminal_radius * _Z_DOWN
-        cap_coords = [
-            arc_point,
-            arc_end,
-            arc_end + _Z_DOWN * (dims.height_below_handrail - terminal_radius),
-        ]
-
-    elif cap_type == "TO_END_POST_AND_FLOOR":
-        first_arc_end = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
-        first_arc_coords = _get_fillet_points(
-            start_point, start_point + cap_dir * terminal_radius, first_arc_end, terminal_radius
-        )
-        arc_points_list.append(first_arc_coords[1])
-
-        end_point = railing_coords_for_cap[-2].copy()
-        end_point[_NP_Z] -= dims.height_below_handrail
-        second_arc_coords = _get_fillet_points(
-            first_arc_end, first_arc_end + local_z_down * terminal_radius, end_point, terminal_radius
-        )
-        arc_points_list.append(second_arc_coords[1])
-        cap_coords = [start_point] + first_arc_coords + second_arc_coords + [end_point]
-    else:
-        assert_never(cap_type)
-
+    cap_coords, new_arc_points = _CAP_BUILDERS[dims.cap_type](
+        railing_coords_for_cap, start_point, cap_dir, ortho_dir, local_z_down, dims
+    )
+    arc_points_list.extend(new_arc_points)
     railing_coords = np.vstack((railing_coords_for_cap, cap_coords))
 
     if start:
@@ -490,12 +547,23 @@ def compute_wall_mounted_handrail_geometry(
     )
 
 
+def _resolve_default_mm(value: Optional[float], default_mm: float, unit_scale: float) -> float:
+    """Resolve an optional millimetre-defaulted parameter into project units.
+
+    Callers pass ``value`` as the user-supplied override (or ``None``) and
+    ``default_mm`` as the integer millimetre default; the result is in project
+    units (``mm/1000 / unit_scale``).
+    """
+    if value is not None:
+        return value
+    return mm(default_mm) / unit_scale
+
+
 def add_railing_representation(
     file: ifcopenshell.file,
     *,  # keywords only as this API implementation is probably not final
     # IfcGeometricRepresentationContext
     context: ifcopenshell.entity_instance,
-    railing_type: Literal["WALL_MOUNTED_HANDRAIL"] = "WALL_MOUNTED_HANDRAIL",
     railing_path: SequenceOfVectors,
     use_manual_supports: bool = False,
     support_spacing: Optional[float] = None,
@@ -510,7 +578,6 @@ def add_railing_representation(
     Units are expected to be in IFC project units.
 
     :param context: IfcGeometricRepresentationContext for the representation.
-    :param railing_type: Type of the railing. Defaults to "WALL_MOUNTED_HANDRAIL".
     :param railing_path: A list of points coordinates for the railing path,
         coordinates are expected to be at the top of the railing, not at the center.
         If not provided, default path [(0, 0, 1), (1, 0, 1), (2, 0, 1)] (in meters) will be used
@@ -527,22 +594,15 @@ def add_railing_representation(
         will be automatically calculated for you.
     :return: IfcShapeRepresentation for a railing.
     """
-    if railing_type != "WALL_MOUNTED_HANDRAIL":
-        raise Exception('Only "WALL_MOUNTED_HANDRAIL" railing_type is supported at the moment.')
-
     if unit_scale is None:
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(file)
 
     if railing_path is None:
         railing_path = V([(0, 0, 1), (1, 0, 1), (2, 0, 1)]) / unit_scale
-    if support_spacing is None:
-        support_spacing = mm(DEFAULT_SUPPORT_SPACING_MM) / unit_scale
-    if railing_diameter is None:
-        railing_diameter = mm(DEFAULT_RAILING_DIAMETER_MM) / unit_scale
-    if clear_width is None:
-        clear_width = mm(DEFAULT_CLEAR_WIDTH_MM) / unit_scale
-    if height is None:
-        height = mm(DEFAULT_HEIGHT_MM) / unit_scale
+    support_spacing = _resolve_default_mm(support_spacing, DEFAULT_SUPPORT_SPACING_MM, unit_scale)
+    railing_diameter = _resolve_default_mm(railing_diameter, DEFAULT_RAILING_DIAMETER_MM, unit_scale)
+    clear_width = _resolve_default_mm(clear_width, DEFAULT_CLEAR_WIDTH_MM, unit_scale)
+    height = _resolve_default_mm(height, DEFAULT_HEIGHT_MM, unit_scale)
 
     geometry = compute_wall_mounted_handrail_geometry(
         railing_path=railing_path,

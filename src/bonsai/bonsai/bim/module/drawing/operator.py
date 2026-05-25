@@ -76,6 +76,7 @@ from bonsai.bim.module.drawing.prop import (
 )
 from bonsai.bim.module.drawing.ui import get_current_product_for_element_values
 from bonsai.bim.prop import StrProperty
+from bonsai.tool.cad import BISECT_TOLERANCE, WELD_EPSILON
 
 if TYPE_CHECKING:
     from bpy.stub_internal import rna_enums
@@ -706,9 +707,15 @@ class CreateDrawing(bpy.types.Operator):
             plane_no = camera_matrix.col[2].xyz
             geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
             bmesh.ops.bisect_plane(
-                bm, geom=geom, dist=0.0001, plane_co=plane_co, plane_no=plane_no, clear_outer=True, clear_inner=True
+                bm,
+                geom=geom,
+                dist=BISECT_TOLERANCE,
+                plane_co=plane_co,
+                plane_no=plane_no,
+                clear_outer=True,
+                clear_inner=True,
             )
-            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.000001)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_EPSILON)
             bmesh.ops.triangle_fill(bm, use_dissolve=True, edges=bm.edges)
 
             prev_co = None
@@ -737,11 +744,13 @@ class CreateDrawing(bpy.types.Operator):
                 bm_fill = bm.copy()
                 if i != last_i:
                     geom = bm_fill.verts[:] + bm_fill.edges[:] + bm_fill.faces[:]
-                    bmesh.ops.bisect_plane(bm_fill, geom=geom, dist=0.0001, plane_co=co, plane_no=no, clear_outer=True)
+                    bmesh.ops.bisect_plane(
+                        bm_fill, geom=geom, dist=BISECT_TOLERANCE, plane_co=co, plane_no=no, clear_outer=True
+                    )
                 if i != 0:
                     geom = bm_fill.verts[:] + bm_fill.edges[:] + bm_fill.faces[:]
                     bmesh.ops.bisect_plane(
-                        bm_fill, geom=geom, dist=0.0001, plane_co=prev_co, plane_no=no, clear_inner=True
+                        bm_fill, geom=geom, dist=BISECT_TOLERANCE, plane_co=prev_co, plane_no=no, clear_inner=True
                     )
 
                 bm_fill.verts.ensure_lookup_table()
@@ -1363,7 +1372,7 @@ class CreateDrawing(bpy.types.Operator):
 
         bm = bmesh.new()
         bm.from_mesh(obj.data)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.000001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_EPSILON)
         for edge in bm.edges:
             if not edge.is_manifold:
                 bm.free()

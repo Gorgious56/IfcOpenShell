@@ -192,12 +192,12 @@ class AggregateDecorator:
                 continue
 
             aggregates_list = tool.Aggregate.get_aggregates_recursively(element)
-            if props.in_aggregate_mode and props.editing_aggregate:
-                index = aggregates_list.index(tool.Ifc.get_entity(props.editing_aggregate))
-                if index > 0:
-                    aggregate = aggregates_list[index - 1]
-            else:
-                aggregate = aggregates_list[-1]
+            editing_aggregate_entity = (
+                tool.Ifc.get_entity(props.editing_aggregate)
+                if props.in_aggregate_mode and props.editing_aggregate
+                else None
+            )
+            aggregate = tool.Aggregate.get_highlight_ancestor(aggregates_list, editing_aggregate_entity)
             if aggregate:
                 aggregates.append(tool.Ifc.get_object(aggregate))
 

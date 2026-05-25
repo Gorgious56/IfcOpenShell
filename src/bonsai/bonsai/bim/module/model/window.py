@@ -592,7 +592,7 @@ class GizmoWindowEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     enable_editing_operator = "bim.enable_editing_window"
     finish_editing_operator = "bim.finish_editing_window"
     cancel_editing_operator = "bim.cancel_editing_window"
-    cycle_type_operator = "bim.pick_window_type"
+    pick_type_operator = "bim.pick_window_type"
 
     # matrix_position lambdas replace the get_dimension_matrix_* methods
     dimension_gizmo_props = [

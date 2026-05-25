@@ -235,7 +235,7 @@ class CopyToContainer(bpy.types.Operator, tool.Ifc.Operator):
         # containers = tool.Spatial.get_selected_containers()
         containers = [tool.Ifc.get().by_id(self.container)]
         # Track decompositions so they can be recreated after the operation
-        relationships = tool.Root.get_decomposition_relationships(objs)
+        relationships = tool.Duplicate.get_decomposition_relationships(objs)
         old_to_new = {}
         for obj in objs:
             result_objs = core.copy_to_container(tool.Ifc, tool.Collector, tool.Spatial, obj=obj, containers=containers)
@@ -243,7 +243,7 @@ class CopyToContainer(bpy.types.Operator, tool.Ifc.Operator):
                 old_to_new[tool.Ifc.get_entity(obj)] = result_objs
 
         # Recreate decompositions
-        tool.Root.recreate_decompositions(relationships, old_to_new)
+        tool.Duplicate.recreate_decompositions(relationships, old_to_new)
         bonsai.bim.handler.refresh_ui_data()
 
 

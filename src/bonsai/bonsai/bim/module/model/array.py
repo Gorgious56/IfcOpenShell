@@ -32,33 +32,12 @@ from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 
 
 def _wipe_array_children(layers: list) -> None:
-    """Delete every existing array child across all layers and clear the
-    ``children`` GUID lists in-place. Forces ``tool.Model.regenerate_array``
-    to recreate every instance fresh from the parent — necessary because
-    the regenerator preserves the geometry of any child already referenced
-    in ``layer["children"]`` (only its transform updates). Without this
-    wipe, parent-side geometry changes (door dimensions, wall extrusion,
-    etc.) made between array commits don't propagate to the children.
+    """Delete every existing array child and clear ``children`` GUID lists.
 
-    Mutates ``layers`` so the caller's subsequent ``regenerate_array``
-    call sees the cleared lists and treats every instance as new.
-
-    **Cost trade-off — GUID churn**: every wipe deletes the IFC child entities
-    and re-duplicates them, yielding new ``GlobalId``\\s. Any external
-    reference to the previous GUIDs goes stale: BCF topic-element links,
-    drawing annotations targeting specific instances, IDS reports, downstream
-    tools that already imported the IFC file, etc. The bbox heuristic in
-    ``_parent_geometry_changed`` mitigates frequency (the wipe is skipped
-    when geometry hasn't changed); it doesn't mitigate severity when the
-    wipe does fire. A future refinement could update existing children's
-    representations in place — that's a change to
-    ``tool.Model.regenerate_array`` rather than this helper, larger scope —
-    defer until someone reports the GUID churn as a real workflow break."""
+    Rebuilding mints fresh GlobalIds, so external references (BCF, IDS, etc.)
+    to the old GUIDs go stale. The bbox heuristic skips the wipe when the
+    parent's geometry is unchanged."""
     for layer in layers:
-        # ``children`` is only ever appended to by ``tool.Model.regenerate_array``
-        # ([tool/model.py:1143](src/bonsai/bonsai/tool/model.py#L1143)) with
-        # fresh GlobalIds, so the list never contains duplicates — no need
-        # to wrap in ``set()`` defensively.
         for child_guid in layer.get("children", []):
             try:
                 child_element = tool.Ifc.get().by_guid(child_guid)
@@ -78,31 +57,16 @@ def _bbox_dims(bound_box) -> tuple[float, float, float]:
     return (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
 
 
+_BBOX_EQUALITY_EPS = 1e-5
+
+
 def _parent_geometry_changed(parent_obj, layers: list) -> bool:
-    """Cheap heuristic for "does the parent's geometry differ from the
-    children's, so a wipe-and-rebuild is needed?".
-
-    Compares the parent's bounding-box dimensions against the FIRST resolvable
-    child across all layers. Bonsai duplicates the parent's bbox when it
-    creates a child, so right after a fresh regen the dims match. Any
-    subsequent parametric edit on the parent that changes a dimension
-    (door height, wall length, …) breaks the equality.
-
-    Returns ``True`` (= wipe needed) when:
-    - the parent has no bound_box (defensive — unknown state, force wipe)
-    - the first resolvable child's bbox dims differ from the parent's
-
-    Returns ``False`` (= safe to skip wipe) when:
-    - no child resolvable (nothing to wipe, regenerate will create from scratch)
-    - dims match within ``EPS``
-
-    Misses edits that preserve bbox dimensions (e.g. a decorative shape
-    change inside the same envelope). For those the user can still force a
-    wipe via the panel's "Regenerate Array" button."""
+    """Cheap heuristic: True when the parent's bbox differs from the first resolvable child's,
+    indicating a parametric edit since the last regen. Misses edits that preserve bbox dimensions
+    (e.g. shape changes within the same envelope); those need a manual "Regenerate Array"."""
     if not parent_obj.bound_box:
         return True
     parent_dims = _bbox_dims(parent_obj.bound_box)
-    EPS = 1e-5
     for layer in layers:
         for child_guid in layer.get("children", []):
             try:
@@ -113,7 +77,7 @@ def _parent_geometry_changed(parent_obj, layers: list) -> bool:
             if child_obj is None or not child_obj.bound_box:
                 continue
             child_dims = _bbox_dims(child_obj.bound_box)
-            return any(abs(a - b) > EPS for a, b in zip(parent_dims, child_dims))
+            return any(abs(a - b) > _BBOX_EQUALITY_EPS for a, b in zip(parent_dims, child_dims))
     return False
 
 
@@ -291,19 +255,11 @@ class EditArray(bpy.types.Operator, tool.Ifc.Operator):
 
 
 class _ArrayEditMixin:
-    """Element-wide array edit triad — per-layer scope.
+    """Array edit triad scoped to one layer at a time.
 
-    Why: the parametric registry's contract is element-wide (one boolean
-    ``is_editing`` per object). Bonsai's array stores a list of layers in the
-    BBIM_Array pset, so the triad pairs ``is_editing: bool`` (registry contract,
-    "something is being edited") with ``editing_item_index: int`` (which layer).
-    The Enable operator accepts an ``item`` argument; Finish / Cancel read the
-    stored index back from the props so the same triad commits / discards the
-    correct layer regardless of how many other layers exist.
-
-    Commit-on-Finish: ``apply_value`` callbacks (gizmos) mutate props in place
-    during drag; no IFC write happens until Finish. Cancel rehydrates props
-    from the current pset so the discarded draft never reaches IFC."""
+    ``is_editing`` is paired with ``editing_item_index`` so Finish/Cancel
+    know which layer to commit/discard. Gizmo drag mutates props in place;
+    IFC writes happen only at Finish."""
 
     pset_name = "BBIM_Array"
 
@@ -343,28 +299,8 @@ class _ArrayEditMixin:
 
     @classmethod
     def _set_children_visibility(cls, element, hidden: bool) -> None:
-        """Toggle visibility of every existing array child across all layers.
-
-        Why hide during edit: the real children sit at their last-committed
-        positions while ``ArrayPreviewDecorator`` draws ghost bboxes at the
-        current draft positions. As soon as the user drags an offset the two
-        diverge and the viewport reads as cluttered / unclear. Hiding the
-        real children leaves "parent + preview ghosts" — one source of truth
-        for where the array WILL land.
-
-        Finish / Cancel reverses this (``hidden=False``). If the user saves
-        mid-edit, the registry's save-time auto-commit fires Finish which
-        also unhides — so the visibility flag doesn't leak into the .blend.
-
-        **Residual-risk note**: ``hide_set(True)`` persists to the ``.blend``
-        file. Normal save flow routes through ``tool.Parametric.commit_pending_edits()``
-        which fires ``bim.finish_editing_array`` → unhides before save. A
-        crash mid-edit, or a Blender auto-save while ``is_editing=True`` AND
-        ``commit_pending_edits`` is skipped (config / harness failure),
-        leaves the children hidden on next load. Mitigation if it ever
-        surfaces in practice: a ``load_post`` handler scanning for
-        ``BIMArrayProperties.is_editing=True`` and force-cancelling, mirroring
-        the pattern in [bim/handler.py:load_post](src/bonsai/bonsai/bim/handler.py)."""
+        """Hide array children during edit so only the preview ghosts show.
+        Auto-commit unhides on save; load-time heal clears stale flags."""
         layers = cls._read_layers(element)
         for layer in layers:
             for child_guid in layer.get("children", []):
@@ -378,14 +314,10 @@ class _ArrayEditMixin:
 
     @classmethod
     def _enable_one(cls, obj: bpy.types.Object, item: int = 0) -> None:
-        """Enter array editing for layer ``item``. No-op if the index is out
-        of range — keeps the operator safe to call from stale gizmo bindings
-        (e.g. a layer was deleted via the panel after the gizmo was last drawn).
+        """Enter array editing for layer ``item``; no-op for out-of-range index.
 
         If ``props.relating_array_object`` points at another array parent,
-        seed the draft props from THAT object's matching layer instead — the
-        "copy array config from another object" affordance also exposed by
-        the per-item panel flow."""
+        seed the draft props from that object's matching layer."""
         resolved = cls._resolve(obj)
         if resolved is None:
             return
@@ -426,9 +358,8 @@ class _ArrayEditMixin:
 
     @classmethod
     def _finish_one(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
-        """Commit the in-progress edit to the layer recorded in
-        ``editing_item_index``. Drifts (layer removed mid-edit) clear the
-        flag and abort without writing."""
+        """Commit the in-progress edit to ``editing_item_index``'s layer.
+        Drift (layer removed mid-edit) clears the flag and aborts."""
         resolved = cls._resolve(obj)
         if resolved is None:
             return
@@ -436,8 +367,6 @@ class _ArrayEditMixin:
         layers = cls._read_layers(element)
         item = props.editing_item_index
         if item < 0 or item >= len(layers):
-            # Drift safeguard: stored index points at a layer that no longer
-            # exists. Clear flags and abort — the draft is unrecoverable.
             props.is_editing = False
             props.editing_item_index = -1
             return
@@ -715,14 +644,11 @@ class SelectAllArrayObjects(bpy.types.Operator):
 
 
 class ArrayParentGizmoClick(bpy.types.Operator):
-    """Modifier-aware dispatcher for the parent-tree gizmo on array children.
+    """Dispatcher for the parent-tree gizmo on array children.
 
-    - Click: select the array's parent (the editable source).
-    - Shift+Click: select every instance of the array (parent + all children).
-    - Ctrl+Click: select every child instance (parent excluded).
-
-    Routes to ``bim.select_array_parent`` / ``bim.select_all_array_objects``
-    for the first two modes; the children-only mode is handled inline."""
+    - Click: select the array's parent.
+    - Shift+Click: select parent + all children.
+    - Ctrl+Click: select all children, excluding the parent."""
 
     bl_idname = "bim.array_parent_gizmo_click"
     bl_label = "Select Array Parent / Family"
@@ -768,6 +694,9 @@ class ArrayParentGizmoClick(bpy.types.Operator):
         # child of that parent's array without the parent itself.
         obj = context.active_object
         element = tool.Ifc.get_entity(obj)
+        if element is None:
+            self.report({"ERROR"}, "Active object is not IFC-linked.")
+            return {"CANCELLED"}
         array_pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
         if not array_pset:
             self.report({"ERROR"}, "Object is not part of an array.")
@@ -809,6 +738,9 @@ class EditArrayFromChild(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         element = tool.Ifc.get_entity(obj)
+        if element is None:
+            self.report({"ERROR"}, "Active object is not IFC-linked.")
+            return {"CANCELLED"}
         array_pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
         if not array_pset:
             self.report({"ERROR"}, "Object is not part of an array.")
@@ -881,31 +813,14 @@ class Input3DCursorZArray(bpy.types.Operator):
 
 
 class AddArrayFromFeatureEdit(bpy.types.Operator, tool.Ifc.Operator):
-    """Commit any in-progress parametric feature edit and add an array with
-    Blender-vanilla defaults (count=2, offset along the chosen axis = the
-    object's bbox extent along that axis).
+    """Commit any in-progress feature edit and add an array with
+    gizmo-friendly defaults (count=2, offset = bbox extent along the axis).
 
-    Modifier-aware: plain click adds along X (default), Shift along Y, Ctrl
-    along Z. Picked up by ``invoke`` from the click event when the operator
-    fires through INVOKE_DEFAULT (the gizmo-button binding path). Callers
-    that want a fixed axis can pass ``axis="X"`` via EXEC_DEFAULT to bypass
-    the invoke modifier read (used by ``ArrayGizmoClick`` for per-layer
-    Shift+click, where Shift already has a different meaning).
+    Modifier-aware: plain click → X, Shift → Y, Ctrl → Z. Callers can pass
+    ``axis="X"`` via EXEC_DEFAULT to bypass the modifier read.
 
-    Inherits ``tool.Ifc.Operator`` so the three chained sub-operators
-    (feature finish + ``bim.add_array`` + ``bim.enable_editing_array``) all
-    run inside one transaction — one undo step instead of three. The nested
-    ``tool.Ifc.Operator`` calls detect the existing top-level transaction
-    (via ``IfcStore.current_transaction`` in
-    [bim/ifc.py:486](src/bonsai/bonsai/bim/ifc.py#L486)) and join it rather
-    than opening their own.
-
-    Why a separate operator: ``bim.add_array``'s default kwargs stay
-    backward-compatible (count=1, offsets=0) so existing panel + script callers
-    keep their behaviour. This operator wraps it with the sensible defaults
-    needed for the gizmo entry-point — the user sees one ghost child next to
-    the parent immediately, and all three offset arrows have non-zero length
-    so they're interactable from the first click."""
+    All three chained operators (feature finish + add_array + enable_editing)
+    run inside one transaction for a single undo step."""
 
     bl_idname = "bim.add_array_from_feature_edit"
     bl_label = "Add Array"
@@ -1198,13 +1113,8 @@ class AdjustArrayCount(bpy.types.Operator):
 
 
 class GizmoArrayEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
-    """3D-viewport gizmos for the element-wide array edit triad.
-
-    Surfaces only when the array has exactly one layer (matches the triad scope
-    in ``_ArrayEditMixin``). Gizmos: X / Y / Z offset drag handles, +/- icons,
-    method toggle, and a clickable ``xN`` count label (``GizmoArrayCount``)
-    that doubles as the enter-array-edit entry point from idle state. Drag
-    mutates ``props`` only — Finish commits IFC and runs ``regenerate_array``."""
+    """Viewport gizmos for the array edit triad (single-layer arrays only).
+    Drag/+/- mutate draft props in place; commit happens at Finish."""
 
     bl_idname = "OBJECT_GGT_bim_array_edition"
     bl_label = "Array Editing Gizmo"
@@ -1306,7 +1216,7 @@ class GizmoArrayEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
         ),
     ]
 
-    props_getter = "get_array_props"
+    props_getter = tool.Model.get_array_props
     gizmo_pref_name = "array"
 
     @staticmethod

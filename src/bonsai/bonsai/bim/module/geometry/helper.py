@@ -27,6 +27,8 @@ import mathutils
 from ifcopenshell.util.shape_builder import ShapeBuilder
 from mathutils import Matrix, Vector, geometry
 
+from bonsai.tool.cad import WELD_TOLERANCE
+
 T = TypeVar("T")
 
 
@@ -44,7 +46,7 @@ class Helper:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.dissolve_limit(bm, angle_limit=pi / 180 * 1, verts=bm.verts, edges=bm.edges)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
         bm.faces.ensure_lookup_table()
         face = None
@@ -68,7 +70,7 @@ class Helper:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.dissolve_limit(bm, angle_limit=pi / 180 * 1, verts=bm.verts, edges=bm.edges)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
         bm.faces.ensure_lookup_table()
         potential_faces = []
@@ -96,7 +98,7 @@ class Helper:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.dissolve_limit(bm, angle_limit=pi / 180 * 1, verts=bm.verts, edges=bm.edges)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
         bm.faces.ensure_lookup_table()
         potential_faces = []
@@ -136,7 +138,7 @@ class Helper:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.dissolve_limit(bm, angle_limit=pi / 180 * 1, verts=bm.verts, edges=bm.edges)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
         bm.faces.ensure_lookup_table()
         potential_faces = []
@@ -233,7 +235,7 @@ class Helper:
         bm = bmesh.new()
         bm.from_mesh(mesh)
         bmesh.ops.dissolve_limit(bm, angle_limit=pi / 180 * 1, verts=bm.verts, edges=bm.edges)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
         bm.faces.ensure_lookup_table()
         faces = bm.faces
