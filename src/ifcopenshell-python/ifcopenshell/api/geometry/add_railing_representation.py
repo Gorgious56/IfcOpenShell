@@ -63,7 +63,7 @@ DEFAULT_CLEAR_WIDTH_MM = 40
 DEFAULT_HEIGHT_MM = 1000
 
 
-@dataclass
+@dataclass(slots=True)
 class RailingSupport:
     """Pure-geometry description of a single wall-mount support.
 
@@ -84,14 +84,14 @@ class RailingSupport:
     disk_z_rotation: float  # rotation around Z applied to the disk's "Y" extrude axis
 
 
-@dataclass
+@dataclass(slots=True)
 class WallMountedHandrailGeometry:
     """Pure-geometry description of a wall-mounted handrail.
 
     Decoupled from any IFC entity creation. The shared data structure is
-    consumed by :func:`add_railing_representation` (which wraps it as an
-    ``IfcShapeRepresentation``) and by viewport-only previews in authoring
-    add-ons that need to update mesh state without mutating the IFC file.
+    consumed by the IFC-representation wrapper and by viewport-only previews
+    in authoring add-ons that need to update mesh state without mutating the
+    IFC file.
 
     All values are in IFC project units.
     """
@@ -293,9 +293,9 @@ def _collect_supports(coords: np.ndarray, manual_supports: bool, dims: _RailingD
     return supports
 
 
-# Per-cap-type builders. Each takes the cap-frame inputs (precomputed by
-# ``_add_cap``) and returns ``(cap_coords, new_arc_points)``. The shared
-# orientation flip and final ``np.vstack`` live in ``_add_cap`` so the
+# Per-cap-type builders. Each takes the cap-frame inputs (precomputed by the
+# dispatcher) and returns ``(cap_coords, new_arc_points)``. The shared
+# orientation flip and final ``np.vstack`` live in the dispatcher so the
 # builders stay focused on the geometric shape of their cap.
 _CapBuilder = Callable[
     [np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, "_RailingDims"],
@@ -391,9 +391,10 @@ def _cap_to_end_post_and_floor(
     return cap_coords, [first_arc_coords[1], second_arc_coords[1]]
 
 
-# Dispatch table for handrail terminal caps. "NONE" is handled by ``_add_cap``
-# as an early return — every other cap type appends real geometry to the
-# polyline, so the dispatch slot would have an awkward empty-vstack contract.
+# Dispatch table for handrail terminal caps. "NONE" stays out of this table:
+# every other cap type appends real geometry to the polyline, so a "NONE" slot
+# would need an awkward empty-vstack contract — the dispatcher early-returns
+# unchanged instead.
 _CAP_BUILDERS: dict[TERMINAL_TYPE, _CapBuilder] = {
     "180": _cap_180,
     "TO_END_POST": _cap_to_end_post,
@@ -471,10 +472,10 @@ def compute_wall_mounted_handrail_geometry(
 ) -> WallMountedHandrailGeometry:
     """Compute pure geometric data for a wall-mounted handrail.
 
-    The result can be wrapped into an ``IfcShapeRepresentation`` by
-    :func:`add_railing_representation`, or converted directly to a Blender
-    bmesh (or any other viewport mesh) for a live preview that does not
-    mutate the IFC file.
+    The result can be wrapped into an ``IfcShapeRepresentation`` by the
+    railing-representation API, or converted directly to a Blender bmesh
+    (or any other viewport mesh) for a live preview that does not mutate
+    the IFC file.
 
     Geometric inputs (``railing_path``, ``support_spacing``,
     ``railing_diameter``, ``clear_width``, ``height``) are expected in IFC

@@ -331,4 +331,3 @@ class TestAddRailingRepresentation(test.bootstrap.IFC4):
         assert len(representation.Items) >= 3
         # Final item must be the handrail itself (a swept-disk solid)
         assert representation.Items[-1].is_a("IfcSweptDiskSolid")
-
