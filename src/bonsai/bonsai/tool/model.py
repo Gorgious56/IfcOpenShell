@@ -2043,6 +2043,8 @@ class Model(bonsai.core.tool.Model):
 
         bm = bmesh.new()
         bm.from_mesh(mesh)
+        # Looser than auto_detect_curves' VTX_PRECISION: profiles must close into
+        # a single loop, so nearly-coincident endpoints should snap together.
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
         bmesh.ops.delete(bm, geom=bm.faces, context="FACES_ONLY")
 

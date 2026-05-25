@@ -26,14 +26,9 @@ properties; Finish + Cancel route through ``ifcopenshell.api.feature``).
 `PathPreservingEditMixin` — railing, roof (path_data preserved across edit;
 only general kwargs are user-editable).
 
-Stair and Wall stay standalone — their lifecycles diverge in ways that don't
-fit either mixin without optional escape hatches (Stair has a unique
-``update_ifc_stair_props`` post-Finish step + a separate ``get_props_kwargs_for_ifc_export``;
-Wall is validation-first, snapshot-driven, no preview regen in operators).
-
-This module sits separately from `bonsai.tool.Parametric` (the registry +
-auto-commit) because it imports ``bonsai.tool`` freely, while the registry
-itself must stay light — ``tool/blender.py`` consumes the registry at module load."""
+This module hosts the heavyweight mixins that import ``bonsai.tool`` freely.
+The lightweight parametric registry consumed at addon-enable time must stay
+free of such imports and lives separately."""
 
 from __future__ import annotations
 
@@ -43,9 +38,7 @@ from typing import TYPE_CHECKING, ClassVar
 import bpy
 import ifcopenshell.api.pset
 import ifcopenshell.util.element
-import ifcopenshell.util.placement
 import ifcopenshell.util.representation
-import ifcopenshell.util.unit
 
 import bonsai.core.geometry
 import bonsai.tool as tool
@@ -64,18 +57,15 @@ class _ParametricEditMixinBase:
         ``_get_props(obj)``: PropertyGroup accessor
         ``_iter_targets(context)``: list of objects to act on (default: ``[active_object]``)
 
-    Subclasses that set ``handle_placement_drift = True`` opt their Enable /
-    Finish / Cancel hooks into the matrix_world drift triad — pre-edit drift
-    commits to IFC on Enable, in-edit drag commits on Finish, and Cancel snaps
-    the object back to the committed IFC placement. Without this, an in-edit
-    drag silently disappears on Finish, or an uncommitted move snaps back on
-    Cancel.
+    Drift handling is built in: pre-edit matrix_world drift commits to IFC on
+    Enable, in-edit drag commits on Finish, and Cancel restores the committed
+    IFC placement. This prevents an uncommitted drag from disappearing on
+    Finish or snapping back on Cancel.
 
     Operator subclasses call one of ``_enable_targets`` / ``_finish_targets`` /
     ``_cancel_targets`` from their ``_execute`` method."""
 
     pset_name: ClassVar[str]
-    handle_placement_drift: ClassVar[bool] = False
 
     @classmethod
     def _iter_targets(cls, context: bpy.types.Context) -> list[bpy.types.Object]:
@@ -104,27 +94,24 @@ class _ParametricEditMixinBase:
 
     @classmethod
     def _handle_drift_on_enable(cls, obj: bpy.types.Object) -> None:
-        if cls.handle_placement_drift:
-            tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
+        tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
 
     @classmethod
     def _handle_drift_on_finish(cls, obj: bpy.types.Object) -> None:
-        if cls.handle_placement_drift:
-            tool.Geometry.commit_placement_if_moved(obj)
+        tool.Geometry.commit_placement_if_moved(obj)
 
     @classmethod
     def _handle_drift_on_cancel(cls, obj: bpy.types.Object, element: entity_instance) -> None:
-        if not cls.handle_placement_drift:
-            return
         if not tool.Ifc.is_moved(obj):
             return
         if element.ObjectPlacement is None:
+            # Nothing to restore from. Re-baseline the checksum so a later
+            # Finish does not commit the cancelled drag — without this,
+            # ``edit_object_placement`` would silently create an ObjectPlacement
+            # on an element whose schema model intentionally lacks one.
+            tool.Geometry.record_object_position(obj)
             return
-        matrix_np = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement).copy()
-        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
-        matrix_np[:3, 3] *= unit_scale
-        obj.matrix_world = tool.Loader.apply_blender_offset_to_matrix_world(obj, matrix_np)
-        tool.Geometry.record_object_position(obj)
+        tool.Geometry.restore_placement_from_ifc(obj, element)
 
 
 class FeatureModifierEditMixin(_ParametricEditMixinBase):
@@ -145,8 +132,6 @@ class FeatureModifierEditMixin(_ParametricEditMixinBase):
         Read BBIM_<Type> pset JSON → unwrap → restore draft props →
         ``switch_representation`` to the Body representation →
         ``is_editing = False``."""
-
-    handle_placement_drift: ClassVar[bool] = True
 
     @classmethod
     def _update_modifier_representation(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
@@ -246,8 +231,6 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         rebuilds the bmesh preview, but subclasses may load a different
         representation entirely) → ``is_editing = False``."""
 
-    handle_placement_drift: ClassVar[bool] = True
-
     @classmethod
     def _post_load_data(cls, data: dict) -> dict:
         """Hook: optionally transform the pset data dict after loading and before
@@ -300,16 +283,13 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         stored = pset_data["data_dict"]
         data = props.get_general_kwargs(convert_to_project_units=True)
         data["path_data"] = stored["path_data"]
-        # Skip the IFC commit when the draft is identical to the stored pset:
+        # Skip the pset commit when the draft is identical to the stored pset:
         # an Enable → Finish-without-changes cycle should not pollute the
-        # representation list or burn an undo entry. Drift commit still runs —
-        # matrix_world drift is independent of pset content.
-        if data == stored:
-            cls._handle_drift_on_finish(obj)
-            props.is_editing = False
-            return
-        cls._update_pset(element, data)
-        cls._update_modifier_ifc_data(obj, context)
+        # representation list or burn an undo entry. Drift commit still runs
+        # unconditionally — matrix_world drift is independent of pset content.
+        if data != stored:
+            cls._update_pset(element, data)
+            cls._update_modifier_ifc_data(obj, context)
         cls._handle_drift_on_finish(obj)
         # Set only on success: if any IFC op above raised, the user's draft survives for retry.
         props.is_editing = False

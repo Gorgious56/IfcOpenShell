@@ -120,6 +120,20 @@ class Geometry(bonsai.core.tool.Geometry):
             cache.remove(element.GlobalId)
 
     @classmethod
+    def has_axis_representation(cls, element: ifcopenshell.entity_instance) -> bool:
+        """True if the element carries a shape representation whose
+        RepresentationIdentifier is 'Axis'. Elements without one cannot be
+        projected to an unambiguous 1D path; callers that draw schematic axis
+        overlays must skip them rather than fall back to mesh-derived geometry."""
+        product_rep = getattr(element, "Representation", None)
+        if product_rep is None:
+            return False
+        for rep in product_rep.Representations:
+            if getattr(rep, "RepresentationIdentifier", None) == "Axis":
+                return True
+        return False
+
+    @classmethod
     def clear_modifiers(cls, obj: bpy.types.Object) -> None:
         for modifier in obj.modifiers:
             obj.modifiers.remove(modifier)
@@ -1165,14 +1179,34 @@ class Geometry(bonsai.core.tool.Geometry):
 
     @classmethod
     def commit_placement_if_moved(cls, obj: bpy.types.Object, *, apply_scale: bool = True) -> None:
-        """Sync ``obj``'s Blender matrix_world to its IFC ``ObjectPlacement`` when the
-        location/rotation checksum recorded by ``record_object_position`` no longer
-        matches the current matrix_world. No-op when the object hasn't drifted."""
+        """Write ``obj.matrix_world`` back to its IFC ``ObjectPlacement`` when the
+        object has drifted since its last placement commit.
+
+        Scope: drop-in only when the gate is exactly ``is_moved(obj)``. Call sites
+        whose gate is wider (e.g. ``is_moved OR is_scaled``) or already enforced
+        upstream (inside an ``if is_moved:`` block) should call
+        ``edit_object_placement`` directly to avoid the redundant inner check."""
         if not tool.Ifc.is_moved(obj):
             return
         bonsai.core.geometry.edit_object_placement(
             tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=apply_scale
         )
+
+    @classmethod
+    def restore_placement_from_ifc(cls, obj: bpy.types.Object, element: ifcopenshell.entity_instance) -> None:
+        """Snap ``obj.matrix_world`` back to ``element``'s committed IFC placement,
+        then re-baseline the drift checksum so ``tool.Ifc.is_moved(obj)`` returns
+        False afterwards.
+
+        Precondition: ``element.ObjectPlacement`` must not be None. Callers in a
+        cancel-style flow that want a "restore-or-clear-drift" semantic must gate
+        on ObjectPlacement themselves and call ``record_object_position`` directly
+        in the no-placement branch."""
+        matrix_np = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement).copy()
+        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
+        matrix_np[:3, 3] *= unit_scale
+        obj.matrix_world = tool.Loader.apply_blender_offset_to_matrix_world(obj, matrix_np)
+        cls.record_object_position(obj)
 
     @classmethod
     def remove_connection(cls, connection: ifcopenshell.entity_instance) -> None:

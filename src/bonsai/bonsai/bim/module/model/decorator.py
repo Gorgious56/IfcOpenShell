@@ -2426,7 +2426,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
             return
         seg_a = _wall_axis_world_segment_from_geom(selected[0], geom_a)
         seg_b = _wall_axis_world_segment_from_geom(selected[1], geom_b)
-        parallel_threshold = GizmoWallJoinIntersection.PARALLEL_DOT_THRESHOLD
+        parallel_threshold = core_model.PARALLEL_DOT_THRESHOLD
         collinear_tolerance = GizmoWallJoinIntersection.COLLINEAR_LINE_TOLERANCE
         # Only the "intersect" state shows preview lines — joined / collinear /
         # parallel each have their own gizmo icons but no extension preview.
@@ -2593,6 +2593,12 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         base_z = mw.translation.z
         current_top_z = base_z + height
         cursor_z = context.scene.cursor.location.z
+        # Match the extend-Z operator's validity gate: new height must be > 0,
+        # i.e. cursor strictly above the wall base. A click below the base
+        # cancels with a WARNING; drawing the preview through the floor would
+        # invite a click that can't succeed.
+        if cursor_z <= base_z:
+            return
         if abs(cursor_z - current_top_z) < 1e-6:
             return
         start_xy = mw @ Vector((anchor_x, 0.0, 0.0))
@@ -3010,9 +3016,12 @@ class MEPSystemPathDecorator(tool.Blender.ViewportDecorator):
         start_element = None
         for obj in context.selected_objects or []:
             element = tool.Ifc.get_entity(obj)
-            if element is not None and tool.System.is_mep_element(element):
-                start_element = element
-                break
+            if element is None or not tool.System.is_mep_element(element):
+                continue
+            if not tool.Geometry.has_axis_representation(element):
+                continue
+            start_element = element
+            break
         if start_element is None:
             self._cached_start_guid = None
             self._cached_walk = []
@@ -3069,6 +3078,8 @@ class MEPSystemPathDecorator(tool.Blender.ViewportDecorator):
         lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
         port_positions: list[tuple[float, float, float]] = []
         for element in connected:
+            if not tool.Geometry.has_axis_representation(element):
+                continue
             if element.is_a("IfcFlowSegment"):
                 obj = tool.Ifc.get_object(element)
                 if obj is None:
@@ -3165,9 +3176,12 @@ class WallSystemPathDecorator(tool.Blender.ViewportDecorator):
         start_element = None
         for obj in context.selected_objects or []:
             element = tool.Ifc.get_entity(obj)
-            if element is not None and element.is_a("IfcWall"):
-                start_element = element
-                break
+            if element is None or not element.is_a("IfcWall"):
+                continue
+            if not tool.Geometry.has_axis_representation(element):
+                continue
+            start_element = element
+            break
         if start_element is None:
             self._cached_start_guid = None
             self._cached_walk = []

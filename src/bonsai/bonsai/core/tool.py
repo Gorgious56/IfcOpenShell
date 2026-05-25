@@ -455,6 +455,7 @@ class Geometry:
     def get_representation_name(cls, representation): pass
     def get_styles(cls, obj): pass
     def get_total_representation_items(cls, obj): pass
+    def has_axis_representation(cls, element): pass
     def has_data_users(cls, data): pass
     def has_material_style_override(cls, obj): pass
     def has_material_styles(cls, element): pass

@@ -393,8 +393,7 @@ def heal_inconsistent_array_edit_state(objects: Iterable[bpy.types.Object]) -> N
             array_props.is_editing = False
 
 
-@persistent
-def load_post(scene):
+def _apply_save_file_invariants() -> None:
     global global_subscription_owner
     active_object_key = bpy.types.LayerObjects, "active"
     bpy.msgbus.subscribe_rna(
@@ -408,6 +407,12 @@ def load_post(scene):
     tool.Parametric.heal_stale_edit_flags()
     heal_inconsistent_array_edit_state(bpy.data.objects)
 
+    if tool.Ifc.get() and bpy.data.is_saved:
+        props = tool.Blender.get_bim_props()
+        props.has_blend_warning = True
+
+
+def _apply_user_preferences() -> None:
     preferences = tool.Blender.get_addon_preferences()
     if not preferences.should_setup_toolbar:
         tool.Blender.unregister_toolbar()
@@ -431,49 +436,6 @@ def load_post(scene):
         tool.Blender.override_scene_panel(panel)
     tool.Blender.setup_tabs()
 
-    if tool.Ifc.get() and bpy.data.is_saved:
-        props = tool.Blender.get_bim_props()
-        props.has_blend_warning = True
-
-    # Bonsai overlays
-    georeference_props = tool.Georeference.get_georeference_props()
-    aggregate_props = tool.Aggregate.get_aggregate_props()
-    nest_props = tool.Nest.get_nest_props()
-    model_props = tool.Model.get_model_props()
-    uninstall_decorator_cache_handlers()
-    GeoreferenceDecorator.uninstall()
-    AggregateDecorator.uninstall()
-    NestDecorator.uninstall()
-    WallAxisDecorator.uninstall()
-    SlabDirectionDecorator.uninstall()
-    WallGizmoPreviewDecorator.uninstall()
-    MEPSegmentExtendPreviewDecorator.uninstall()
-    BendPreviewDecorator.uninstall()
-    MEPSystemPathDecorator.uninstall()
-    WallSystemPathDecorator.uninstall()
-    if georeference_props.should_visualise:
-        GeoreferenceDecorator.install(bpy.context)
-    if aggregate_props.aggregate_decorator:
-        AggregateDecorator.install(bpy.context)
-    if nest_props.nest_decorator:
-        NestDecorator.install(bpy.context)
-    if model_props.show_wall_axis:
-        WallAxisDecorator.install(bpy.context)
-    if model_props.show_slab_direction:
-        SlabDirectionDecorator.install(bpy.context)
-    if model_props.show_bounding_box:
-        BoundingBoxDecorator.install(bpy.context)
-    if getattr(model_props, "show_paths", False):
-        MEPSystemPathDecorator.install(bpy.context)
-        WallSystemPathDecorator.install(bpy.context)
-    WallGizmoPreviewDecorator.install(bpy.context)
-    ArrayPreviewDecorator.install(bpy.context)
-    ArraySelectionHighlightDecorator.install(bpy.context)
-    MEPSegmentExtendPreviewDecorator.install(bpy.context)
-    BendPreviewDecorator.install(bpy.context)
-    WallFilletPreviewDecorator.install(bpy.context)
-    install_decorator_cache_handlers()
-
     if preferences.should_use_snap and (scene := bpy.context.scene):
         # Snapping is off by default in Blender, but in BIM, it's more useful to be on
         scene.tool_settings.use_snap = True
@@ -481,3 +443,40 @@ def load_post(scene):
         scene.tool_settings.snap_elements_base = {"EDGE", "EDGE_PERPENDICULAR", "VERTEX", "EDGE_MIDPOINT", "FACE"}
 
     tool.Blender.sync_old_preferences()
+
+
+def _install_viewport_overlays() -> None:
+    georeference_props = tool.Georeference.get_georeference_props()
+    aggregate_props = tool.Aggregate.get_aggregate_props()
+    nest_props = tool.Nest.get_nest_props()
+    model_props = tool.Model.get_model_props()
+    uninstall_decorator_cache_handlers()
+    try:
+        tool.Blender.ViewportDecorator.sync_all(
+            bpy.context,
+            {
+                GeoreferenceDecorator: georeference_props.should_visualise,
+                AggregateDecorator: aggregate_props.aggregate_decorator,
+                NestDecorator: nest_props.nest_decorator,
+                WallAxisDecorator: model_props.show_wall_axis,
+                SlabDirectionDecorator: model_props.show_slab_direction,
+                BoundingBoxDecorator: model_props.show_bounding_box,
+                MEPSystemPathDecorator: model_props.show_paths,
+                WallSystemPathDecorator: model_props.show_paths,
+                WallGizmoPreviewDecorator: True,
+                ArrayPreviewDecorator: True,
+                ArraySelectionHighlightDecorator: True,
+                MEPSegmentExtendPreviewDecorator: True,
+                BendPreviewDecorator: True,
+                WallFilletPreviewDecorator: True,
+            },
+        )
+    finally:
+        install_decorator_cache_handlers()
+
+
+@persistent
+def load_post(scene):
+    _apply_save_file_invariants()
+    _apply_user_preferences()
+    _install_viewport_overlays()

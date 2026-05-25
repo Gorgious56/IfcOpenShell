@@ -37,10 +37,10 @@ if TYPE_CHECKING:
 # Arc sample count for fillet preview polylines. 24 samples produces a visually
 # smooth arc at common viewport scales without bloating the GPU batch.
 FILLET_DEFAULT_ARC_RESOLUTION = 24
-# Dot-product floor for treating two segments as parallel. cos(2°) ≈ 0.9994 —
-# below this the projected intersection is too sensitive to floating-point
-# noise to be useful as a fillet apex.
-_FILLET_PARALLEL_DOT_THRESHOLD = 0.9994
+# Dot-product floor for treating two wall-axis segments as parallel — below
+# this the projected intersection is too sensitive to floating-point noise
+# to be useful as a junction apex. Calibrated to ~2° from parallel.
+PARALLEL_DOT_THRESHOLD = 0.9994
 
 
 def unjoin_walls(
@@ -220,7 +220,7 @@ def project_axis_intersection(
     Each segment is a pair of 3-tuples. Returns the intersection as a 3-tuple
     (Z is the average of the four input Zs, for visual placement) or ``None`` if
     the segments are parallel within ``parallel_threshold`` (a dot-product magnitude
-    threshold — e.g. ``cos(2°) ≈ 0.9994`` treats walls within 2° of parallel as parallel)."""
+    threshold — see ``PARALLEL_DOT_THRESHOLD`` for the calibrated value)."""
     p1, p2 = seg_a
     p3, p4 = seg_b
     d1x, d1y = p2[0] - p1[0], p2[1] - p1[1]
@@ -372,14 +372,14 @@ def length_and_height_from_extrusion(
 def are_axes_collinear(
     seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
-    parallel_threshold: float = 0.9994,
+    parallel_threshold: float = PARALLEL_DOT_THRESHOLD,
     line_tolerance: float = 0.05,
 ) -> bool:
     """True if both axis segments lie on the same infinite line in plan.
 
-    Two conditions: directions must be (anti-)parallel within ``parallel_threshold``
-    (``cos(2°) ≈ 0.9994``), AND any endpoint of B must lie on A's infinite line
-    within ``line_tolerance``. Plan-only (Z ignored)."""
+    Two conditions: directions must be (anti-)parallel within ``parallel_threshold``,
+    AND any endpoint of B must lie on A's infinite line within ``line_tolerance``.
+    Plan-only (Z ignored)."""
     d1x, d1y = seg_a[1][0] - seg_a[0][0], seg_a[1][1] - seg_a[0][1]
     d2x, d2y = seg_b[1][0] - seg_b[0][0], seg_b[1][1] - seg_b[0][1]
     d1_len = (d1x * d1x + d1y * d1y) ** 0.5
@@ -421,7 +421,7 @@ def compute_path_connection_location(
     self_conn_type: str,
     seg_other: tuple[tuple[float, float, float], tuple[float, float, float]],
     other_conn_type: str,
-    parallel_threshold: float = 0.9994,
+    parallel_threshold: float = PARALLEL_DOT_THRESHOLD,
 ) -> tuple[float, float, float]:
     """World-space location of a single ``IfcRelConnectsPathElements`` between
     two wall axes.
@@ -481,7 +481,7 @@ def compute_fillet_polylines(
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
     radius: float,
     arc_resolution: int = FILLET_DEFAULT_ARC_RESOLUTION,
-    parallel_threshold: float = _FILLET_PARALLEL_DOT_THRESHOLD,
+    parallel_threshold: float = PARALLEL_DOT_THRESHOLD,
 ) -> dict:
     """Preview polylines for a circular fillet at the junction of two axes.
 

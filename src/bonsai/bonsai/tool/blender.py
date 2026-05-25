@@ -30,7 +30,7 @@ import sys
 import tempfile
 import traceback
 import types
-from collections.abc import Callable, Generator, Iterable, Sequence, Sized
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Sized
 from datetime import datetime
 from functools import cache, lru_cache
 from pathlib import Path
@@ -498,6 +498,23 @@ class Blender(bonsai.core.tool.Blender):
             cls.handlers.clear()
             cls.is_installed = False
 
+        @classmethod
+        def sync_all(
+            cls,
+            context: bpy.types.Context,
+            enabled: Mapping[type[ViewportDecorator], bool],
+        ) -> None:
+            """Drive each listed decorator to its desired install state in one call.
+
+            Each entry whose value is ``True`` ends up installed; each entry whose
+            value is ``False`` ends up uninstalled. Pass ``True`` for always-on
+            overlays so they survive subsequent file loads."""
+            for decorator_cls, should_install in enabled.items():
+                if should_install:
+                    decorator_cls.install(context)
+                else:
+                    decorator_cls.uninstall()
+
     @classmethod
     def is_view_top_down(cls, context: bpy.types.Context, threshold: float = 0.9659) -> bool:
         """True when the viewport camera is looking ~straight down (or up) the world Z axis.
@@ -514,6 +531,22 @@ class Blender(bonsai.core.tool.Blender):
             return False
         view_forward = Vector(rv3d.view_matrix.inverted().col[2][:3]).normalized()
         return abs(view_forward.z) > threshold
+
+    @classmethod
+    def top_down_factor(cls, context: bpy.types.Context, threshold: float = 0.9659) -> float:
+        """Continuous 0–1 ramp matching ``is_view_top_down``'s cone: 0 outside the
+        cone, ramping linearly to 1 at strict alignment with world Z. Callers that
+        want a proportional effect (an icon-stack lift growing as the view
+        approaches plan) use this in place of the boolean to avoid a one-frame
+        visual jump as the camera crosses the threshold."""
+        rv3d = context.region_data
+        if rv3d is None:
+            return 0.0
+        view_forward = Vector(rv3d.view_matrix.inverted().col[2][:3]).normalized()
+        alignment = abs(view_forward.z)
+        if alignment <= threshold:
+            return 0.0
+        return (alignment - threshold) / (1.0 - threshold)
 
     @classmethod
     def get_screen_up_world(cls, context: bpy.types.Context) -> Vector:

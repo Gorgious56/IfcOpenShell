@@ -1818,23 +1818,22 @@ _OUTLINE_DEFAULT_WIDTH = 0.03
 _OUTLINE_DEFAULT_ALPHA = 0.4
 
 
-def draw_tris_with_outline(
+def _draw_outline_and_body(
+    shader: "gpu.types.GPUShader",
     batch: "gpu.types.GPUBatch",
     base_matrix: Matrix,
     color: tuple[float, float, float, float],
-    outline_width: float = _OUTLINE_DEFAULT_WIDTH,
-    outline_alpha: float = _OUTLINE_DEFAULT_ALPHA,
+    outline_width: float,
+    outline_alpha: float,
 ) -> None:
-    """Renders ``batch`` as an opaque tris body with an 8-way dark halo behind.
+    """Renders 8 outline passes (semi-transparent black, offset by
+    ``outline_width`` in the cardinal + diagonal unit directions) followed
+    by the body pass at ``color``, wrapped in ALPHA blend state.
 
-    Shared between StaticTrisGizmoMixin and custom-draw gizmos with dynamic
-    tris. Wraps the draw in ``LESS_EQUAL`` depth-test so overlapping icons
-    sort by camera distance; in exchange, foreground scene geometry can
-    occlude icons (Bonsai mitigates with per-feature Z-lift offsets)."""
-    shader = _get_static_tris_shader()
+    Caller must bind the shader and configure any sampler / texture
+    uniforms before calling. The ``color`` uniform is set internally for
+    each pass — caller's ``color`` uniform is overwritten."""
     gpu.state.blend_set("ALPHA")
-    gpu.state.depth_test_set("LESS_EQUAL")
-    shader.bind()
     if outline_alpha > 0.0 and outline_width > 0.0:
         shader.uniform_float("color", (0.0, 0.0, 0.0, outline_alpha))
         for dx, dy in _OUTLINE_DIRECTIONS_8:
@@ -1846,8 +1845,25 @@ def draw_tris_with_outline(
     with gpu.matrix.push_pop():
         gpu.matrix.multiply_matrix(base_matrix)
         batch.draw(shader)
-    gpu.state.depth_test_set("NONE")
     gpu.state.blend_set("NONE")
+
+
+def draw_tris_with_outline(
+    batch: "gpu.types.GPUBatch",
+    base_matrix: Matrix,
+    color: tuple[float, float, float, float],
+    outline_width: float = _OUTLINE_DEFAULT_WIDTH,
+    outline_alpha: float = _OUTLINE_DEFAULT_ALPHA,
+) -> None:
+    """Renders ``batch`` as an opaque tris body with an 8-way dark halo behind.
+
+    Shared between StaticTrisGizmoMixin and custom-draw gizmos with dynamic
+    tris. The caller supplies the per-frame matrix and the icon color; this
+    routine handles shader binding, the eight outline passes, the body
+    pass, and the surrounding GPU blend state."""
+    shader = _get_static_tris_shader()
+    shader.bind()
+    _draw_outline_and_body(shader, batch, base_matrix, color, outline_width, outline_alpha)
 
 
 class StaticTrisGizmoMixin:
@@ -1869,18 +1885,22 @@ class StaticTrisGizmoMixin:
     # so 0.4 per pass produces a near-opaque inner ring (~0.98 cumulative)
     # and a clearly visible outer fade (single-pass 0.4 at the dilation edge).
     outline_alpha: float = _OUTLINE_DEFAULT_ALPHA
+    # When True, hit shape is the glyph's 2D bounding box (plus ``outline_width``
+    # padding) — clickable surface matches the visible tile, no dead zones.
+    # Subclasses used in tight stacks (where adjacent icons sit closer than the
+    # bbox extent) should set this False so each icon's hit area stays inside
+    # its glyph and adjacent icons don't steal each other's clicks.
+    hit_uses_bbox: bool = True
 
     def setup(self) -> None:
-        # Hit area is the 2D bounding box of the glyph (expanded by the
-        # outline width to match the visible halo) rather than the glyph
-        # tris themselves: the icon reads as a roughly rectangular tile,
-        # and per-pixel hit-testing against the inner glyph leaves clickable-
-        # looking dead zones in the tile's corners and inside thin strokes.
-        xs = [v[0] for v in self.tris]
-        ys = [v[1] for v in self.tris]
-        pad = self.outline_width
-        bbox_tris = rect_tris(min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
-        self.custom_shape = self.new_custom_shape("TRIS", bbox_tris)
+        if self.hit_uses_bbox:
+            xs = [v[0] for v in self.tris]
+            ys = [v[1] for v in self.tris]
+            pad = self.outline_width
+            hit_tris = rect_tris(min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+        else:
+            hit_tris = self.tris
+        self.custom_shape = self.new_custom_shape("TRIS", hit_tris)
 
     def draw(self, context: bpy.types.Context) -> None:
         # Icon body is forced fully opaque: any ``self.alpha`` < 1.0 would
@@ -1955,26 +1975,16 @@ class TexturedQuadGizmoMixin(StaticTrisGizmoMixin):
             color = (*self.color_highlight, 1.0)
         else:
             color = (*self.color, 1.0)
-        base_matrix = self.matrix_basis @ self.matrix_offset
-        gpu.state.blend_set("ALPHA")
-        gpu.state.depth_test_set("LESS_EQUAL")
         shader.bind()
         shader.uniform_sampler("image", texture)
-        if self.outline_alpha > 0.0 and self.outline_width > 0.0:
-            shader.uniform_float("color", (0.0, 0.0, 0.0, self.outline_alpha))
-            for dx, dy in _OUTLINE_DIRECTIONS_8:
-                offset_matrix = base_matrix @ Matrix.Translation(
-                    (dx * self.outline_width, dy * self.outline_width, 0.0)
-                )
-                with gpu.matrix.push_pop():
-                    gpu.matrix.multiply_matrix(offset_matrix)
-                    self._quad_batch.draw(shader)
-        shader.uniform_float("color", color)
-        with gpu.matrix.push_pop():
-            gpu.matrix.multiply_matrix(base_matrix)
-            self._quad_batch.draw(shader)
-        gpu.state.depth_test_set("NONE")
-        gpu.state.blend_set("NONE")
+        _draw_outline_and_body(
+            shader,
+            self._quad_batch,
+            self.matrix_basis @ self.matrix_offset,
+            color,
+            self.outline_width,
+            self.outline_alpha,
+        )
 
 
 def get_camera_direction(context: bpy.types.Context, position: Vector) -> Vector | None:
@@ -3285,6 +3295,9 @@ class GizmoFillet(StaticTrisGizmoMixin, bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_fillet"
     __slots__ = ("custom_shape",)
     tris = FILLET_TRIS_DEFAULT
+    # Stacked at ICON_STACK_OFFSET_Y above join in GizmoWallJoinIntersection;
+    # full-bbox hit overlaps the sibling icons' bboxes and steals their clicks.
+    hit_uses_bbox = False
 
 
 def _wall_corner_icon_tris() -> tuple[tuple[float, float, float], ...]:
@@ -3313,23 +3326,39 @@ class GizmoWallCornerIcon(StaticTrisGizmoMixin, bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_wall_corner"
     __slots__ = ("custom_shape",)
     tris = WALL_CORNER_TRIS_DEFAULT
+    hit_uses_bbox = False  # tight stack in GizmoWallJoinIntersection — see GizmoFillet
 
 
 def _wall_tee_icon_tris() -> tuple[tuple[float, float, float], ...]:
-    """Filled T-junction glyph — through wall A, branching wall B butts
-    into its side at right angles."""
-    wall_a_lo_y = -0.28
-    wall_a_hi_y = -0.18
-    wall_a_left = -0.45
-    wall_a_right = 0.45
-    # Branching wall B touches but doesn't cross wall A's top edge.
-    wall_b_left = -0.05
-    wall_b_right = 0.05
-    wall_b_top = 0.45
+    """Filled side-T glyph (⊣ orientation) for extending one wall into
+    another's side. The through wall (vertical bar, right edge) carries a
+    branching wall (horizontal bar) butting into its midline — visually
+    distinguishes 'extend wall to wall' from the L-corner 'join' glyph by
+    *where* the bars meet (middle vs corner)."""
+    # Match the wall-corner bbox + bar thickness so the icon row reads at
+    # one visual weight.
+    bar_lo_y = -0.28
+    bar_top = 0.45
+    through_inner_x = 0.18
+    through_outer_x = 0.28
+    branch_left = -0.45
+    # Branching bar centered on the through-bar's midline so the vertical
+    # extends equally above and below — reads as a balanced ⊣.
+    branch_mid_y = (bar_lo_y + bar_top) / 2
+    branch_half_thickness = 0.05
 
     tris: list[tuple[float, float, float]] = []
-    tris.extend(rect_tris(wall_a_left, wall_a_lo_y, wall_a_right, wall_a_hi_y))
-    tris.extend(rect_tris(wall_b_left, wall_a_hi_y, wall_b_right, wall_b_top))
+    tris.extend(rect_tris(through_inner_x, bar_lo_y, through_outer_x, bar_top))
+    # Branching bar's right edge stops at the through-bar's inner edge so the
+    # bars touch without overlapping.
+    tris.extend(
+        rect_tris(
+            branch_left,
+            branch_mid_y - branch_half_thickness,
+            through_inner_x,
+            branch_mid_y + branch_half_thickness,
+        )
+    )
     return tuple(tris)
 
 
@@ -3342,6 +3371,7 @@ class GizmoWallTeeIcon(StaticTrisGizmoMixin, bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_wall_tee"
     __slots__ = ("custom_shape",)
     tris = WALL_TEE_TRIS_DEFAULT
+    hit_uses_bbox = False  # tight stack in GizmoWallJoinIntersection — see GizmoFillet
 
 
 class GizmoPen(StaticTrisGizmoMixin, bpy.types.Gizmo):
