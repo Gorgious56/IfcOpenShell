@@ -71,9 +71,9 @@ def make_obj(*, session_uid=None, selected=True, **attrs):
     ``make_obj()`` without a spurious uid. ``selected`` wires ``select_get()``
     to return the given boolean. Extra attrs are set as plain attributes.
 
-    A bare ``Mock()`` is used deliberately — ``Mock(spec=bpy.types.Object)``
-    rejects ``select_get`` because Blender's C-registered methods are not
-    exposed to Python introspection."""
+    A bare ``Mock()`` is required because ``Mock(spec=bpy.types.Object)``
+    rejects ``select_get`` — Blender's C-registered methods aren't exposed
+    to Python introspection."""
     obj = Mock()
     if session_uid is not None:
         obj.session_uid = session_uid
@@ -99,11 +99,18 @@ def make_element(step_id=None, *, ifc_class=None, **attrs):
     return element
 
 
-def make_context(*, active=None, selected=()):
-    """``SimpleNamespace`` stub with the two ``poll()`` reads: ``active_object``
-    and ``selected_objects``. ``selected`` is materialised to a list so tests
-    can iterate without re-walking a generator."""
-    return SimpleNamespace(active_object=active, selected_objects=list(selected))
+def make_context(*, active=None, selected=(), scene=None):
+    """``SimpleNamespace`` stub with the ``poll()`` reads tests exercise:
+    ``active_object``, ``selected_objects``, and ``scene``. ``selected`` is
+    materialised to a list so tests can iterate without re-walking a generator.
+    ``scene`` defaults to an empty namespace so guards that walk
+    ``context.scene.BIMPreviewProperties`` (via ``getattr(..., default=None)``)
+    treat the preview as inactive — pass a custom namespace to activate."""
+    return SimpleNamespace(
+        active_object=active,
+        selected_objects=list(selected),
+        scene=scene if scene is not None else SimpleNamespace(),
+    )
 
 
 def make_ifc_file(elements_by_guid: dict | None = None) -> MagicMock:

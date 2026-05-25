@@ -1500,12 +1500,6 @@ class Model(bonsai.core.tool.Model):
         ifcopenshell.api.geometry.edit_object_placement(tool.Ifc.get(), product=element, matrix=matrix, is_si=True)
 
     @classmethod
-    def sync_object_ifc_position(cls, obj: bpy.types.Object) -> None:
-        """make sure IFC position will be in sync with the Blender object position, if object was moved in Blender"""
-        if tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
-
-    @classmethod
     def get_element_matrix(cls, element: ifcopenshell.entity_instance, keep_local: bool = False) -> Matrix:
         placement = element.ObjectPlacement
         if keep_local:
@@ -2884,18 +2878,15 @@ class Model(bonsai.core.tool.Model):
         queue: set[tuple[ifcopenshell.entity_instance, bpy.types.Object]] = set()
         for wall in walls:
             element = tool.Ifc.get_entity(wall)
-            if tool.Ifc.is_moved(wall):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall)
+            tool.Geometry.commit_placement_if_moved(wall)
             queue.add((element, wall))
             for rel in getattr(element, "ConnectedTo", []):
                 obj = tool.Ifc.get_object(rel.RelatedElement)
-                if tool.Ifc.is_moved(obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+                tool.Geometry.commit_placement_if_moved(obj)
                 queue.add((rel.RelatedElement, obj))
             for rel in getattr(element, "ConnectedFrom", []):
                 obj = tool.Ifc.get_object(rel.RelatingElement)
-                if tool.Ifc.is_moved(obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+                tool.Geometry.commit_placement_if_moved(obj)
                 queue.add((rel.RelatingElement, obj))
         for element, wall in queue:
             if tool.Model.get_usage_type(element) == "LAYER2" and wall:

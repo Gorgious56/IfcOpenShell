@@ -43,7 +43,7 @@ pytestmark = pytest.mark.model
 
 @pytest.fixture(autouse=True)
 def _reset_cache_token():
-    decorator_cache._DECORATOR_CACHE_TOKEN = 0
+    decorator_cache.reset_for_test()
     yield
 
 
@@ -62,7 +62,7 @@ def patched_draw_env():
                 patch.object(
                     tool.Model,
                     "get_model_props",
-                    return_value=SimpleNamespace(show_mep_path=show),
+                    return_value=SimpleNamespace(show_paths=show),
                 )
             )
             stack.enter_context(patch.object(tool.Ifc, "get", return_value=Mock(name="ifc_file")))
@@ -148,9 +148,9 @@ def test_geometry_cache_misses_when_token_bumps(patched_draw_env, monkeypatch):
 
 
 def test_geometry_cache_misses_on_selection_change(patched_draw_env, monkeypatch):
-    """A new BFS walk (selection change) produces a different list identity.
-    The geometry-cache key uses ``is connected`` so the new walk forces
-    a rebuild even when the token is unchanged."""
+    """A new selection changes the start GUID; the geometry-cache key includes
+    ``start_guid`` so the new walk forces a rebuild even when the token is
+    unchanged."""
     decorator = MEPSystemPathDecorator()
     element_a = Mock()
     element_a.GlobalId = "guid-a"
@@ -181,7 +181,7 @@ def test_geometry_cache_misses_on_selection_change(patched_draw_env, monkeypatch
     assert build.call_count == 2, "selection change must rebuild geometry"
 
 
-def test_show_mep_path_off_short_circuits(patched_draw_env, monkeypatch):
+def test_show_paths_off_short_circuits(patched_draw_env, monkeypatch):
     """When the toggle is off, draw() must return before doing any work.
     Cheap gate — one attribute read per redraw."""
     decorator = MEPSystemPathDecorator()

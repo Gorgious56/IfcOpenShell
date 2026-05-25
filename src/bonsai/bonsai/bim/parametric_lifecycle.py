@@ -24,7 +24,16 @@
 properties; Finish + Cancel route through ``ifcopenshell.api.feature``).
 
 `PathPreservingEditMixin` — railing, roof (path_data preserved across edit;
-only general kwargs are user-editable)."""
+only general kwargs are user-editable).
+
+Stair and Wall stay standalone — their lifecycles diverge in ways that don't
+fit either mixin without optional escape hatches (Stair has a unique
+``update_ifc_stair_props`` post-Finish step + a separate ``get_props_kwargs_for_ifc_export``;
+Wall is validation-first, snapshot-driven, no preview regen in operators).
+
+This module sits separately from `bonsai.tool.Parametric` (the registry +
+auto-commit) because it imports ``bonsai.tool`` freely, while the registry
+itself must stay light — ``tool/blender.py`` consumes the registry at module load."""
 
 from __future__ import annotations
 
@@ -55,10 +64,18 @@ class _ParametricEditMixinBase:
         ``_get_props(obj)``: PropertyGroup accessor
         ``_iter_targets(context)``: list of objects to act on (default: ``[active_object]``)
 
+    Subclasses that set ``handle_placement_drift = True`` opt their Enable /
+    Finish / Cancel hooks into the matrix_world drift triad — pre-edit drift
+    commits to IFC on Enable, in-edit drag commits on Finish, and Cancel snaps
+    the object back to the committed IFC placement. Without this, an in-edit
+    drag silently disappears on Finish, or an uncommitted move snaps back on
+    Cancel.
+
     Operator subclasses call one of ``_enable_targets`` / ``_finish_targets`` /
     ``_cancel_targets`` from their ``_execute`` method."""
 
     pset_name: ClassVar[str]
+    handle_placement_drift: ClassVar[bool] = False
 
     @classmethod
     def _iter_targets(cls, context: bpy.types.Context) -> list[bpy.types.Object]:
@@ -85,6 +102,30 @@ class _ParametricEditMixinBase:
             return None
         return element, cls._get_props(obj)
 
+    @classmethod
+    def _handle_drift_on_enable(cls, obj: bpy.types.Object) -> None:
+        if cls.handle_placement_drift:
+            tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
+
+    @classmethod
+    def _handle_drift_on_finish(cls, obj: bpy.types.Object) -> None:
+        if cls.handle_placement_drift:
+            tool.Geometry.commit_placement_if_moved(obj)
+
+    @classmethod
+    def _handle_drift_on_cancel(cls, obj: bpy.types.Object, element: entity_instance) -> None:
+        if not cls.handle_placement_drift:
+            return
+        if not tool.Ifc.is_moved(obj):
+            return
+        if element.ObjectPlacement is None:
+            return
+        matrix_np = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement).copy()
+        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
+        matrix_np[:3, 3] *= unit_scale
+        obj.matrix_world = tool.Loader.apply_blender_offset_to_matrix_world(obj, matrix_np)
+        tool.Geometry.record_object_position(obj)
+
 
 class FeatureModifierEditMixin(_ParametricEditMixinBase):
     """Lifecycle for door- and window-style parametric modifier operators.
@@ -105,23 +146,12 @@ class FeatureModifierEditMixin(_ParametricEditMixinBase):
         ``switch_representation`` to the Body representation →
         ``is_editing = False``."""
 
+    handle_placement_drift: ClassVar[bool] = True
+
     @classmethod
     def _update_modifier_representation(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
         """Hook: call the per-type ``update_<type>_modifier_representation``."""
         raise NotImplementedError
-
-    @staticmethod
-    def _restore_placement_from_ifc(obj: bpy.types.Object, element: entity_instance) -> None:
-        """Snap ``obj.matrix_world`` back to the element's committed IFC placement.
-
-        No-op when the element has no ``ObjectPlacement``."""
-        if element.ObjectPlacement is None:
-            return
-        matrix_np = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement).copy()
-        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
-        matrix_np[:3, 3] *= unit_scale
-        obj.matrix_world = tool.Loader.apply_blender_offset_to_matrix_world(obj, matrix_np)
-        tool.Geometry.record_object_position(obj)
 
     @classmethod
     def _enable_one(cls, obj: bpy.types.Object) -> None:
@@ -129,12 +159,7 @@ class FeatureModifierEditMixin(_ParametricEditMixinBase):
         if resolved is None:
             return
         element, props = resolved
-        # Commit pre-edit matrix_world drift to IFC: cancel restores from IFC,
-        # so an uncommitted drift would snap back on cancel.
-        if tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(
-                tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=False
-            )
+        cls._handle_drift_on_enable(obj)
         data = json.loads(ifcopenshell.util.element.get_pset(element, cls.pset_name, "Data"))
         data.update(data.pop("lining_properties"))
         data.update(data.pop("panel_properties"))
@@ -160,10 +185,7 @@ class FeatureModifierEditMixin(_ParametricEditMixinBase):
         pset = tool.Pset.get_element_pset(element, cls.pset_name)
         data_text = tool.Ifc.get().createIfcText(json.dumps(data, default=list))
         ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=pset, properties={"Data": data_text})
-        # Pset write does not cover placement; without this, an in-edit drag
-        # would be dropped on Finish.
-        if tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+        cls._handle_drift_on_finish(obj)
         # Set only on success: if any IFC op above raised, the user's draft survives for retry.
         props.is_editing = False
 
@@ -179,9 +201,7 @@ class FeatureModifierEditMixin(_ParametricEditMixinBase):
         props.set_props_kwargs_from_ifc_data(data)
         body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
         bonsai.core.geometry.switch_representation(tool.Ifc, tool.Geometry, obj=obj, representation=body)
-        # Cancel must revert matrix_world too, not just the draft pset.
-        if tool.Ifc.is_moved(obj):
-            cls._restore_placement_from_ifc(obj, element)
+        cls._handle_drift_on_cancel(obj, element)
         props.is_editing = False
 
     def _enable_targets(self, context: bpy.types.Context) -> set[str]:
@@ -226,6 +246,8 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         rebuilds the bmesh preview, but subclasses may load a different
         representation entirely) → ``is_editing = False``."""
 
+    handle_placement_drift: ClassVar[bool] = True
+
     @classmethod
     def _post_load_data(cls, data: dict) -> dict:
         """Hook: optionally transform the pset data dict after loading and before
@@ -262,6 +284,7 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         if resolved is None:
             return
         _element, props = resolved
+        cls._handle_drift_on_enable(obj)
         data = tool.Model.get_modeling_bbim_pset_data(obj, cls.pset_name)["data_dict"]
         data = cls._post_load_data(data)
         props.set_props_kwargs_from_ifc_data(data)
@@ -279,12 +302,15 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         data["path_data"] = stored["path_data"]
         # Skip the IFC commit when the draft is identical to the stored pset:
         # an Enable → Finish-without-changes cycle should not pollute the
-        # representation list or burn an undo entry.
+        # representation list or burn an undo entry. Drift commit still runs —
+        # matrix_world drift is independent of pset content.
         if data == stored:
+            cls._handle_drift_on_finish(obj)
             props.is_editing = False
             return
         cls._update_pset(element, data)
         cls._update_modifier_ifc_data(obj, context)
+        cls._handle_drift_on_finish(obj)
         # Set only on success: if any IFC op above raised, the user's draft survives for retry.
         props.is_editing = False
 
@@ -293,7 +319,7 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         resolved = cls._resolve(obj)
         if resolved is None:
             return
-        _element, props = resolved
+        element, props = resolved
         pset_data = tool.Model.get_modeling_bbim_pset_data(obj, cls.pset_name)
         stored = pset_data["data_dict"]
         draft = props.get_general_kwargs(convert_to_project_units=True)
@@ -307,6 +333,7 @@ class PathPreservingEditMixin(_ParametricEditMixinBase):
         # representation rather than rebuild a preview mesh).
         if not nothing_changed:
             cls._restore_viewport_after_cancel(obj, context)
+        cls._handle_drift_on_cancel(obj, element)
         props.is_editing = False
 
     def _enable_targets(self, context: bpy.types.Context) -> set[str]:

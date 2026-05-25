@@ -154,8 +154,8 @@ def test_every_wall_mutating_caller_pairs_with_resync():
 def test_wall_gizmo_z_routes_through_slope_aware_helper():
     """Forward-compat guard for the slope-aware Z conversion class of bug.
 
-    The two wall gizmo positioning functions (``_update_cursor_gizmos`` for
-    the scissors / extend icons, ``_update_icon_row_extras`` for the
+    The two wall gizmo positioning functions (``_position_cursor_anchored_gizmos``
+    for the scissors / extend icons, ``_position_icon_row_extras`` for the
     validate / cancel / rotate / baseline / toggle-openings row) must both
     convert ``props.height`` (vertical / world-Z height) into a wall-local Z
     via ``core.extrusion_depth_from_vertical_height`` before composing
@@ -170,7 +170,7 @@ def test_wall_gizmo_z_routes_through_slope_aware_helper():
     from bonsai.bim.module.model import wall as wall_module
 
     REQUIRED_HELPER = "extrusion_depth_from_vertical_height"
-    REQUIRED_CALLERS = {"_update_cursor_gizmos", "_update_icon_row_extras"}
+    REQUIRED_CALLERS = {"_position_cursor_anchored_gizmos", "_position_icon_row_extras"}
 
     source = inspect.getsource(wall_module)
     tree = ast.parse(source)

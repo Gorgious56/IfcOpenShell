@@ -114,8 +114,7 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
                 continue
 
             # Sync placement before feature.add_feature.
-            if tool.Ifc.is_moved(obj1):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj1)
+            tool.Geometry.commit_placement_if_moved(obj1)
 
             has_visible_openings = False
             for opening in [r.RelatedOpeningElement for r in element1.HasOpenings]:
@@ -150,8 +149,7 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
                 )
             ifcopenshell.api.feature.add_feature(tool.Ifc.get(), feature=element2, element=element1)
 
-            if tool.Ifc.is_moved(obj2):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj2)
+            tool.Geometry.commit_placement_if_moved(obj2)
 
             voided_objs = [obj1]
             for subelement in tool.Aggregate.get_parts_recursively(voided_element):
@@ -173,10 +171,7 @@ class AddOpening(bpy.types.Operator, tool.Ifc.Operator):
                         else:
                             bpy.ops.bim.update_representation(obj=voided_obj.name)
 
-                    if tool.Ifc.is_moved(voided_obj):
-                        bonsai.core.geometry.edit_object_placement(
-                            tool.Ifc, tool.Geometry, tool.Surveyor, obj=voided_obj
-                        )
+                    tool.Geometry.commit_placement_if_moved(voided_obj)
 
                     representation = tool.Geometry.get_active_representation(voided_obj)
                     assert representation

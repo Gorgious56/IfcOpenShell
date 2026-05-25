@@ -25,7 +25,6 @@ import bpy
 import ifcopenshell.api.feature
 import ifcopenshell.util.representation
 
-import bonsai.core.geometry
 import bonsai.core.tool
 import bonsai.tool as tool
 
@@ -54,15 +53,13 @@ class Feature(bonsai.core.tool.Feature):
             feature_element = tool.Ifc.get_entity(feature_obj)
 
             # Sync placement before feature.add_feature.
-            if tool.Ifc.is_moved(featured_obj):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=featured_obj)
+            tool.Geometry.commit_placement_if_moved(featured_obj)
 
             element_had_openings = tool.Geometry.has_openings(featured_element)
             body_context = ifcopenshell.util.representation.get_context(tool.Ifc.get(), "Model", "Body")
             ifcopenshell.api.feature.add_feature(tool.Ifc.get(), feature=feature_element, element=featured_element)
 
-            if tool.Ifc.is_moved(feature_obj):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=feature_obj)
+            tool.Geometry.commit_placement_if_moved(feature_obj)
 
         voided_objs = [featured_obj]
         for subelement in tool.Aggregate.get_parts_recursively(featured_element):
@@ -79,8 +76,7 @@ class Feature(bonsai.core.tool.Feature):
                     else:
                         bpy.ops.bim.update_representation(obj=voided_obj.name)
 
-                if tool.Ifc.is_moved(voided_obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=voided_obj)
+                tool.Geometry.commit_placement_if_moved(voided_obj)
 
                 tool.Geometry.reload_representation(voided_obj)
             tool.Geometry.lock_scale(voided_obj)

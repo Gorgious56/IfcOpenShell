@@ -71,7 +71,7 @@ def _run_unjoin_single_poll(*, prefs_on, selection_len, is_wall, usage_type):
     for p in patches:
         p.start()
     try:
-        return GizmoWallUnjoinSingle.poll(SimpleNamespace())
+        return GizmoWallUnjoinSingle.poll(SimpleNamespace(scene=SimpleNamespace()))
     finally:
         for p in patches:
             p.stop()

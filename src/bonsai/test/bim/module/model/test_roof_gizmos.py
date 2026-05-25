@@ -127,10 +127,12 @@ def test_slope_apply_value_clamps_at_near_vertical():
     """Slopes approaching 90° are clamped just below to avoid a vertical
     extrusion that would degenerate the bisect step in
     ``generate_hipped_roof_bmesh``."""
+    from bonsai.bim.module.model.roof import _ROOF_MAX_SLOPE_ANGLE
+
     cfg = _get_config("angle")
     props = SimpleNamespace(angle=0.0)
     cfg.apply_value(props, 1e9)  # absurdly steep
-    assert props.angle == pytest.approx(math.pi / 2 - 0.001)
+    assert props.angle == pytest.approx(_ROOF_MAX_SLOPE_ANGLE)
 
 
 # ----------------------------------------------------------------------------
@@ -150,8 +152,8 @@ def test_cycle_operator_class_metadata():
     from bonsai.bim.module.model.roof import CycleRoofGenerationMethod
 
     assert CycleRoofGenerationMethod.bl_idname == "bim.cycle_roof_generation_method"
-    assert CycleRoofGenerationMethod.element_checker == "is_roof"
-    assert CycleRoofGenerationMethod.props_getter == "get_roof_props"
+    assert CycleRoofGenerationMethod.element_checker == tool.Blender.Modifier.is_roof
+    assert CycleRoofGenerationMethod.props_getter == tool.Model.get_roof_props
     assert CycleRoofGenerationMethod.type_attr == "generation_method"
     # The Literal resolves to ("HEIGHT", "ANGLE") — the mixin calls
     # ``get_args(type_literal)`` to enumerate the cycle.
@@ -167,43 +169,51 @@ def test_cycle_operator_wired_on_gizmo_group():
     assert GizmoRoofEdition.cycle_type_operator == CycleRoofGenerationMethod.bl_idname
 
 
-def _cycle_stub_self(*, reverse: bool):
+def _cycle_stub_self(*, reverse: bool, props, element_is_target: bool = True):
     """Build a stub ``self`` for ``CycleTypeMixin._cycle_type``.
 
     ``bpy.types.Operator`` subclasses can't be ``__init__``-ed outside of
     Blender's registration path (``bpy_struct.__new__`` rejects a bare
     call). Calling the unbound mixin method with a stub ``self`` that
-    mirrors the four class attributes the method reads is the cleanest
-    way to exercise the cycle logic without launching a registered
-    operator instance."""
+    mirrors the class attributes the method reads is the cleanest way to
+    exercise the cycle logic without launching a registered operator
+    instance.
+
+    ``element_checker`` and ``props_getter`` are captured by the cycle
+    operator at class-definition time, so global ``tool.*`` patches at
+    test time can't intercept them — the stub injects callables directly
+    instead. ``_resolve_target`` is bound from ``TypeAccessorBase`` so
+    the cycle method's call into it dispatches against the stub
+    attributes."""
+    from types import MethodType
+
+    from bonsai.bim.module.drawing.gizmos import TypeAccessorBase
     from bonsai.bim.module.model.roof import CycleRoofGenerationMethod
 
-    return SimpleNamespace(
+    stub = SimpleNamespace(
         reverse=reverse,
         skip_element_check=False,
-        element_checker=CycleRoofGenerationMethod.element_checker,
-        props_getter=CycleRoofGenerationMethod.props_getter,
+        element_checker=lambda _elem: element_is_target,
+        props_getter=lambda _obj: props,
         type_literal=CycleRoofGenerationMethod.type_literal,
         type_attr=CycleRoofGenerationMethod.type_attr,
     )
+    stub._resolve_target = MethodType(TypeAccessorBase._resolve_target, stub)
+    return stub
 
 
 def test_cycle_type_advances_forward():
     """``_cycle_type`` advances the prop value to the next item in the
-    Literal. Patches the four tool entry points the mixin reads so the
-    method runs without a live IFC fixture."""
+    Literal. The stub injects ``element_checker`` / ``props_getter``
+    directly so the method runs without a live IFC fixture."""
     from bonsai import tool
     from bonsai.bim.module.drawing import gizmos as gizmo_module
 
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())
 
-    with (
-        patch.object(tool.Ifc, "get_entity", return_value=object()),
-        patch.object(tool.Blender.Modifier, "is_roof", return_value=True),
-        patch.object(tool.Model, "get_roof_props", return_value=props),
-    ):
-        result = gizmo_module.CycleTypeMixin._cycle_type(_cycle_stub_self(reverse=False), context)
+    with patch.object(tool.Ifc, "get_entity", return_value=object()):
+        result = gizmo_module.CycleTypeMixin._cycle_type(_cycle_stub_self(reverse=False, props=props), context)
     assert result == {"FINISHED"}
     assert props.generation_method == "ANGLE"
 
@@ -217,12 +227,8 @@ def test_cycle_type_reverse_walks_backward():
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())
 
-    with (
-        patch.object(tool.Ifc, "get_entity", return_value=object()),
-        patch.object(tool.Blender.Modifier, "is_roof", return_value=True),
-        patch.object(tool.Model, "get_roof_props", return_value=props),
-    ):
-        gizmo_module.CycleTypeMixin._cycle_type(_cycle_stub_self(reverse=True), context)
+    with patch.object(tool.Ifc, "get_entity", return_value=object()):
+        gizmo_module.CycleTypeMixin._cycle_type(_cycle_stub_self(reverse=True, props=props), context)
     assert props.generation_method == "ANGLE"  # wrapped from HEIGHT backward
 
 
@@ -236,12 +242,11 @@ def test_cycle_type_cancels_when_active_is_not_a_roof():
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())
 
-    with (
-        patch.object(tool.Ifc, "get_entity", return_value=object()),
-        patch.object(tool.Blender.Modifier, "is_roof", return_value=False),
-        patch.object(tool.Model, "get_roof_props", return_value=props),
-    ):
-        result = gizmo_module.CycleTypeMixin._cycle_type(_cycle_stub_self(reverse=False), context)
+    with patch.object(tool.Ifc, "get_entity", return_value=object()):
+        result = gizmo_module.CycleTypeMixin._cycle_type(
+            _cycle_stub_self(reverse=False, props=props, element_is_target=False),
+            context,
+        )
     assert result == {"CANCELLED"}
     assert props.generation_method == "HEIGHT"
 

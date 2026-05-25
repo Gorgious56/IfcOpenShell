@@ -171,7 +171,7 @@ class DumbSlabGenerator:
             representation=representation,
         )
         obj.matrix_world = obj.matrix_world @ Matrix.Rotation(self.x_angle, 4, "X")
-        tool.Model.sync_object_ifc_position(obj)
+        tool.Geometry.commit_placement_if_moved(obj)
 
         if self.footprint_context:
             extrusion = tool.Model.get_extrusion(representation)

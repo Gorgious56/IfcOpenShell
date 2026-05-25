@@ -80,8 +80,8 @@ def _build_poll_callbacks(selected, active_kind, other_kind):
     (production: parametric LAYER2); slab/roof use ``is_a`` on the fake
     entity so the broadened class-based predicate is exercised."""
     sentinels = {kind: _FakeIfcEntity(_IFC_CLASS_BY_KIND[kind]) for kind in _IFC_CLASS_BY_KIND}
-    # The "plain" sentinel intentionally lacks HasOpenings so the hasattr
-    # guard branch is reachable from the corresponding poll test.
+    # The "plain" sentinel lacks HasOpenings so the hasattr guard branch
+    # is reachable from the corresponding poll test.
     sentinels["plain"] = _FakeIfcEntity(_IFC_CLASS_BY_KIND["plain"], has_openings=False)
 
     def entity_for(kind):
@@ -384,3 +384,86 @@ class TestAddOpeningIntegrationOnSlab(NewFile):
         assert len(slab.HasOpenings) == 1
         opening = slab.HasOpenings[0].RelatedOpeningElement
         assert opening.is_a("IfcOpeningElement")
+
+
+class TestAddOpeningPollOnForeignAuthoredSlab(NewFile):
+    def test_poll_resolves_true_for_slab_without_layer3_usage(self):
+        """An ``IfcSlab`` loaded from a non-Bonsai IFC carries no
+        ``IfcMaterialLayerSetUsage``, so ``tool.Blender.Modifier.is_slab``
+        rejects it — yet the gizmo's widened predicate accepts any
+        ``IfcSlab`` because the positioner only reads the bound box.
+        This pins the bare-class branch through the full ``poll`` path
+        with real bpy + ifcopenshell state."""
+        import ifcopenshell.api.material
+
+        from bonsai.bim.module.model.host_add_opening_gizmo import (
+            GizmoHostAddOpening,
+            is_supported_host,
+        )
+
+        tool.Project.get_project_props().template_file = "IFC4 Demo Template.ifc"
+        bpy.ops.bim.create_project()
+        ifc_file = tool.Ifc.get()
+        slab_type = ifc_file.by_type("IfcSlabType")[0]
+        bpy.ops.bim.add_occurrence(relating_type_id=slab_type.id())
+        slab = ifc_file.by_type("IfcSlab")[0]
+        slab_obj = tool.Ifc.get_object(slab)
+        assert isinstance(slab_obj, bpy.types.Object)
+
+        # Strip every material association so the slab has no direct
+        # LayerSetUsage and nothing to inherit from the type. The slab is
+        # now a foreign-authored IFC class in everything but provenance.
+        ifcopenshell.api.material.unassign_material(ifc_file, products=[slab, slab_type])
+        assert tool.Blender.Modifier.is_slab(slab) is False
+        assert is_supported_host(slab) is True
+
+        void_obj = bpy.data.objects.new("VoidMesh", bpy.data.meshes.new("VoidMesh"))
+        bpy.context.scene.collection.objects.link(void_obj)
+        void_obj.matrix_world = void_obj.matrix_world.copy()
+        void_obj.matrix_world.translation = (
+            slab_obj.matrix_world.translation.x,
+            slab_obj.matrix_world.translation.y,
+            slab_obj.matrix_world.translation.z + 1.0,
+        )
+
+        tool.Blender.set_objects_selection(bpy.context, slab_obj, (slab_obj, void_obj))
+        assert GizmoHostAddOpening.poll(bpy.context) is True
+
+
+class TestAddOpeningPollOnForeignAuthoredRoof(NewFile):
+    def test_poll_resolves_true_for_roof_without_bbim_pset(self):
+        """A mesh-bodied ``IfcRoof`` promoted from a raw Blender mesh
+        carries no ``BBIM_Roof`` pset, so ``tool.Blender.Modifier.is_roof``
+        rejects it — yet the gizmo's widened predicate accepts any
+        ``IfcRoof`` because the positioner only reads the bound box. This
+        fixture mirrors how a foreign IFC roof loads (geometry + IFC
+        identity, no parametric markers)."""
+        from bonsai.bim.module.model.host_add_opening_gizmo import (
+            GizmoHostAddOpening,
+            is_supported_host,
+        )
+
+        tool.Project.get_project_props().template_file = "IFC4 Demo Template.ifc"
+        bpy.ops.bim.create_project()
+
+        bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 0))
+        roof_obj = bpy.context.active_object
+        assert roof_obj is not None
+        tool.Root.get_root_props().ifc_product = "IfcElement"
+        bpy.ops.bim.assign_class(ifc_class="IfcRoof")
+        roof = tool.Ifc.get_entity(roof_obj)
+        assert roof is not None and roof.is_a("IfcRoof")
+        assert tool.Blender.Modifier.is_roof(roof) is False
+        assert is_supported_host(roof) is True
+
+        void_obj = bpy.data.objects.new("VoidMesh", bpy.data.meshes.new("VoidMesh"))
+        bpy.context.scene.collection.objects.link(void_obj)
+        void_obj.matrix_world = void_obj.matrix_world.copy()
+        void_obj.matrix_world.translation = (
+            roof_obj.matrix_world.translation.x,
+            roof_obj.matrix_world.translation.y,
+            roof_obj.matrix_world.translation.z + 1.0,
+        )
+
+        tool.Blender.set_objects_selection(bpy.context, roof_obj, (roof_obj, void_obj))
+        assert GizmoHostAddOpening.poll(bpy.context) is True

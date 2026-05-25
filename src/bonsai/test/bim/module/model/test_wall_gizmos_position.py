@@ -25,7 +25,7 @@ Three concerns, each pinned by its own helper + tests:
 
 - ``GizmoWallJoinIntersection.position_gizmos`` — four-icon visibility and
   top-down vs perspective stacking.
-- ``GizmoWallEdition._update_cursor_gizmos`` — cursor-anchored extend / split
+- ``_position_cursor_anchored_gizmos`` — cursor-anchored extend / split
   icons; world-Z stacking that collapses to a screen-up offset in plan view;
   slope correction so the split icon lands on the slanted wall top.
 - ``WallGizmoPreviewDecorator`` — ``_extended_wall_index`` hover-discrimination
@@ -55,11 +55,11 @@ pytestmark = pytest.mark.wall
 
 
 def _make_position_gizmos_self():
-    """Build a stub instance for `GizmoWallJoinIntersection.position_gizmos()`.
+    """Build a stub instance for ``GizmoWallJoinIntersection.position_gizmos()``.
 
-    Mirrors the attributes the method touches: the four icon gizmos (each a
-    namespace with a writable `hide` flag and `matrix_basis` slot), the two
-    class-level thresholds, and a `_hide_all()` helper bound to the stub."""
+    Carries the four icon gizmos (each a namespace with writable ``hide``
+    and ``matrix_basis``), the two class-level thresholds, and a
+    ``_hide_all()`` helper bound to the stub."""
     from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
 
     def _icon():
@@ -70,8 +70,11 @@ def _make_position_gizmos_self():
         merge_icon=_icon(),
         join_icon=_icon(),
         extend_to_wall_icon=_icon(),
+        fillet_icon=_icon(),
         PARALLEL_DOT_THRESHOLD=GizmoWallJoinIntersection.PARALLEL_DOT_THRESHOLD,
         COLLINEAR_LINE_TOLERANCE=GizmoWallJoinIntersection.COLLINEAR_LINE_TOLERANCE,
+        ICON_STACK_OFFSET_Y=GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y,
+        ICON_TOP_LIFT=GizmoWallJoinIntersection.ICON_TOP_LIFT,
     )
 
     def _hide_all():
@@ -79,6 +82,7 @@ def _make_position_gizmos_self():
         stub.merge_icon.hide = True
         stub.join_icon.hide = True
         stub.extend_to_wall_icon.hide = True
+        stub.fillet_icon.hide = True
 
     stub._hide_all = _hide_all
     return stub
@@ -135,6 +139,7 @@ def _run_position_gizmos(seg_a, seg_b, top_down=False, screen_up=(0.0, 1.0, 0.0)
         patch.object(wall_module, "_wall_axis_world_segment_from_geom", side_effect=axis_world_segment),
         patch.object(wall_module, "_are_walls_joined", return_value=False),
         patch.object(wall_module, "_are_walls_collinear", return_value=False),
+        patch.object(wall_module, "_is_fillet_corner_wall", return_value=False),
         patch.object(tool.Wall, "read_geometry", side_effect=read_wall_geometry),
         patch.object(tool.Blender, "is_view_top_down", return_value=top_down),
         patch.object(tool.Blender, "get_screen_up_world", return_value=Vector(screen_up)),
@@ -204,8 +209,9 @@ def test_position_gizmos_hides_all_for_parallel_walls():
 
 
 def test_position_gizmos_stacks_along_screen_up_in_top_down_view():
-    """Plan view: join + extend icons share floor Z and separate along screen-up."""
-    from bonsai.bim.module.drawing.gizmos import BaseParametricGizmoGroup
+    """Plan view: join + extend share their XY anchor and separate along screen-up
+    by the group's own ``ICON_STACK_OFFSET_Y``."""
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
 
     self_stub = _run_position_gizmos(
         seg_a=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
@@ -215,26 +221,34 @@ def test_position_gizmos_stacks_along_screen_up_in_top_down_view():
     )
     join_pos = self_stub.join_icon.matrix_basis.translation
     extend_pos = self_stub.extend_to_wall_icon.matrix_basis.translation
-    # Z gap collapses — both icons live on the same on-screen depth in plan view.
     assert join_pos.z == pytest.approx(extend_pos.z)
-    delta = extend_pos - join_pos
-    assert delta.y == pytest.approx(BaseParametricGizmoGroup.SCREEN_STACK_OFFSET)
+    delta = join_pos - extend_pos
+    assert delta.y == pytest.approx(GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y)
     assert delta.x == pytest.approx(0.0)
 
 
-def test_position_gizmos_keeps_z_stacking_in_perspective_view():
-    """Non-top-down view: extend icon sits one wall-height above the join icon."""
+def test_position_gizmos_stacks_along_screen_up_in_perspective_view():
+    """Non-top-down view: both icons anchor at the taller wall's top + ``ICON_TOP_LIFT``
+    and separate along screen-up — the previous Z-stacking design (extend lifted by
+    one wall-height above join) was replaced with uniform screen-up stacking so the
+    icons read as a single XY column from any camera angle."""
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
     self_stub = _run_position_gizmos(
         seg_a=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
         seg_b=((50.0, 50.0, 0.0), (50.0, 51.0, 0.0)),
         top_down=False,
+        screen_up=(0.0, 1.0, 0.0),
     )
     join_pos = self_stub.join_icon.matrix_basis.translation
     extend_pos = self_stub.extend_to_wall_icon.matrix_basis.translation
-    # Helper geom["height"] is 3.0; extend rises by that amount on top of the join Z.
-    assert extend_pos.z - join_pos.z == pytest.approx(3.0)
-    assert extend_pos.x == pytest.approx(join_pos.x)
-    assert extend_pos.y == pytest.approx(join_pos.y)
+    # geom["height"] is 3.0, so both icons sit at 3.0 + ICON_TOP_LIFT.
+    expected_z = 3.0 + GizmoWallJoinIntersection.ICON_TOP_LIFT
+    assert join_pos.z == pytest.approx(expected_z)
+    assert extend_pos.z == pytest.approx(expected_z)
+    delta = join_pos - extend_pos
+    assert delta.y == pytest.approx(GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y)
+    assert delta.x == pytest.approx(0.0)
 
 
 # GizmoWallExtendVertically position_gizmos is unconditional — the top-down
@@ -246,14 +260,14 @@ def test_position_gizmos_keeps_z_stacking_in_perspective_view():
 # Cursor-anchored gizmos on a single-wall selection — top-down stacking
 # ----------------------------------------------------------------------------
 #
-# GizmoWallEdition._update_cursor_gizmos stacks extend-X / extend-Z / split
+# _position_cursor_anchored_gizmos stacks extend-X / extend-Z / split
 # along world Z at the cursor's projected X. In plan view those Z slots collapse
 # on-screen and every cursor icon lands on top of the others; the positioning
 # code switches to a screen-up stack in that case.
 
 
 def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0, 1.0, 0.0)):
-    """Drive ``GizmoWallEdition._update_cursor_gizmos`` with a stub ``self``.
+    """Drive ``_position_cursor_anchored_gizmos`` with a stub ``self``.
 
     Returns the three icon stubs (extend_x, extend_z, split) so callers can
     inspect positions and visibility independently."""
@@ -270,7 +284,6 @@ def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0
     extend_z = _icon()
     split = _icon()
 
-    gizmo_prefs = SimpleNamespace(extend=True, extend_height=True, scissors=True)
     props = SimpleNamespace(anchor_x=0.0, length=2.0, height=3.0, x_angle=0.0)
 
     self_stub = SimpleNamespace(
@@ -279,7 +292,6 @@ def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0
         split_gizmo=split,
         CURSOR_STACK_OFFSET=wall_module.GizmoWallEdition.CURSOR_STACK_OFFSET,
         _frame_billboard_rot=Matrix.Identity(4),
-        get_gizmo_prefs=lambda: gizmo_prefs,
         is_gizmo_hidden_by_modal=lambda gz: False,
     )
     cursor = SimpleNamespace(location=Vector(cursor_local))
@@ -293,7 +305,7 @@ def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0
     for p in patches:
         p.start()
     try:
-        wall_module.GizmoWallEdition._update_cursor_gizmos(self_stub, context, Matrix.Identity(4), props)
+        wall_module._position_cursor_anchored_gizmos(self_stub, context, Matrix.Identity(4), props)
     finally:
         for p in patches:
             p.stop()
@@ -468,7 +480,7 @@ def test_lookup_active_instance_returns_none_for_dead_weakref():
 
 
 # ----------------------------------------------------------------------------
-# _update_cursor_gizmos — split-gizmo slope correction
+# _position_cursor_anchored_gizmos — split-gizmo slope correction
 # ----------------------------------------------------------------------------
 #
 # ``props.height`` is the *vertical* (world-Z) wall height. When the wall is
@@ -480,7 +492,7 @@ def test_lookup_active_instance_returns_none_for_dead_weakref():
 
 
 def _drive_update_cursor_gizmos(*, x_angle, height):
-    """Invoke ``GizmoWallEdition._update_cursor_gizmos`` with the minimal stub
+    """Invoke ``_position_cursor_anchored_gizmos`` with the minimal stub
     and a single-candidate (scissors-only) gizmo prefs config, so the assertion
     isolates split-gizmo placement from the cursor-stack bumping cascade."""
     from mathutils import Matrix, Vector
@@ -492,14 +504,12 @@ def _drive_update_cursor_gizmos(*, x_angle, height):
     split_gizmo = SimpleNamespace(hide=True, matrix_basis=None)
     extend_x_gizmo = SimpleNamespace(hide=True, matrix_basis=None)
     extend_z_gizmo = SimpleNamespace(hide=True, matrix_basis=None)
-    prefs = SimpleNamespace(extend=False, extend_height=False, scissors=True)
     self_stub = SimpleNamespace(
         split_gizmo=split_gizmo,
         extend_x_gizmo=extend_x_gizmo,
         extend_z_gizmo=extend_z_gizmo,
         _frame_billboard_rot=Matrix.Identity(4),
         CURSOR_STACK_OFFSET=wall_module.GizmoWallEdition.CURSOR_STACK_OFFSET,
-        get_gizmo_prefs=lambda: prefs,
         is_gizmo_hidden_by_modal=lambda gz: False,
     )
 
@@ -519,7 +529,7 @@ def _drive_update_cursor_gizmos(*, x_angle, height):
     for p in patches:
         p.start()
     try:
-        wall_module.GizmoWallEdition._update_cursor_gizmos(self_stub, context, mw, props)
+        wall_module._position_cursor_anchored_gizmos(self_stub, context, mw, props)
     finally:
         for p in patches:
             p.stop()

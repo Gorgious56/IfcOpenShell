@@ -266,8 +266,7 @@ class OverrideOriginSet(bpy.types.Operator, tool.Ifc.Operator):
             element = tool.Ifc.get_entity(obj)
             if not element:
                 continue
-            if tool.Ifc.is_moved(obj):
-                core.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+            tool.Geometry.commit_placement_if_moved(obj)
             representation = tool.Geometry.get_active_representation(obj)
             if not representation:
                 continue

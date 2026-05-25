@@ -1164,6 +1164,17 @@ class Geometry(bonsai.core.tool.Geometry):
         props.rotation_checksum = repr(tool.Blender.np_array_legacy(obj.matrix_world.to_3x3()).tobytes())
 
     @classmethod
+    def commit_placement_if_moved(cls, obj: bpy.types.Object, *, apply_scale: bool = True) -> None:
+        """Sync ``obj``'s Blender matrix_world to its IFC ``ObjectPlacement`` when the
+        location/rotation checksum recorded by ``record_object_position`` no longer
+        matches the current matrix_world. No-op when the object hasn't drifted."""
+        if not tool.Ifc.is_moved(obj):
+            return
+        bonsai.core.geometry.edit_object_placement(
+            tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=apply_scale
+        )
+
+    @classmethod
     def remove_connection(cls, connection: ifcopenshell.entity_instance) -> None:
         tool.Ifc.get().remove(connection)
 
@@ -2167,10 +2178,7 @@ class Geometry(bonsai.core.tool.Geometry):
             keep_data_linked = linked and not element and not is_tracked_opening
 
             # Prior to duplicating, sync the object placement to make decomposition recreation more stable.
-            if tool.Ifc.is_moved(obj):
-                bonsai.core.geometry.edit_object_placement(
-                    tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=False
-                )
+            cls.commit_placement_if_moved(obj, apply_scale=False)
 
             new_obj = obj.copy()
             temp_data = None

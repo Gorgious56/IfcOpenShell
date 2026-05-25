@@ -150,15 +150,8 @@ def sync_uncommitted_moves(objects: list) -> None:
     commit lands at the stale IFC position — a confusing "where did my
     preview go?" experience. Both bend and fillet enable paths call this
     on the relevant pair just before activating the preview."""
-    # Local import: ``bonsai.core.geometry`` pulls in ``tool.Geometry``
-    # which can cycle with the model module at addon enable.
-    import bonsai.core.geometry
-
     for obj in objects:
-        if tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(
-                tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj, apply_scale=False
-            )
+        tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
 
 
 # --- Base classes for Finish / Cancel operators ------------------------------

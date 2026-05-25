@@ -100,7 +100,7 @@ class System(bonsai.core.tool.System):
         # make sure obj.dimensions and .matrix_world has valid data
         bpy.context.view_layer.update()
         # need to make sure .ObjectPlacement is also updated when we're going to add ports
-        tool.Model.sync_object_ifc_position(obj)
+        tool.Geometry.commit_placement_if_moved(obj)
 
         mep_element = tool.Ifc.get_entity(obj)
         bbox = tool.Blender.get_object_bounding_box(obj)

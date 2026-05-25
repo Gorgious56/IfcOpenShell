@@ -20,12 +20,12 @@
 
 """Offset arithmetic for the filling (Door / Window) wall-offset dimension gizmos.
 
-The four ``set_wall_offset_*`` helpers are the apply-side of the gizmos and
-must translate ``obj.matrix_world`` so the corresponding ``get_wall_offset_*``
-reads back the new value — i.e. drag a left-offset to 2.0 m, then reading
-``get_wall_offset_left`` must return ~2.0 m. The tests below pin that
-round-trip, the rotated/flipped filling case (the add-opening flow may 180° a
-filling onto the wall's opposite face), and the visibility predicate."""
+The apply path (``_set_offset``) must translate ``obj.matrix_world`` so the
+corresponding read path (``_get_offset``) reads back the new value — i.e.
+drag a left-offset to 2.0 m, then reading the left offset must return ~2.0 m.
+The tests below pin that round-trip, the rotated/flipped filling case (the
+add-opening flow may 180° a filling onto the wall's opposite face), and the
+visibility predicate."""
 
 from math import pi
 from unittest import mock
@@ -76,16 +76,24 @@ def _patch_host_wall(wall_matrix, length, height, geom_gen=1, host_present=True,
     return mock.patch.multiple(
         subject.tool,
         Ifc=mock.MagicMock(
+            spec=subject.tool.Ifc,
             get_entity=mock.Mock(return_value=mock.Mock(name="IfcDoor")),
             get_object=mock.Mock(return_value=wall_obj if host_present else None),
         ),
-        Spatial=mock.MagicMock(get_host_wall=mock.Mock(return_value=host_wall)),
+        Spatial=mock.MagicMock(
+            spec=subject.tool.Spatial,
+            get_host_wall=mock.Mock(return_value=host_wall),
+        ),
         Wall=mock.MagicMock(
+            spec=subject.tool.Wall,
             get_length_and_height=mock.Mock(return_value=(length, height) if host_present else None),
             get_axis_local_extent=mock.Mock(return_value=(0.0, length) if host_present else None),
             get_x_angle=mock.Mock(return_value=x_angle if host_present else None),
         ),
-        Parametric=mock.MagicMock(get_geom_generation=mock.Mock(return_value=geom_gen)),
+        Parametric=mock.MagicMock(
+            spec=subject.tool.Parametric,
+            get_geom_generation=mock.Mock(return_value=geom_gen),
+        ),
     )
 
 
@@ -128,15 +136,15 @@ def test_get_wall_offset_left_for_filling_at_known_x():
     Filling's left edge is at wall-X 1.5 → offset_left = 1.5."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_left(props) == pytest.approx(1.5)
+        assert subject._get_offset(props, subject._LEFT) == pytest.approx(1.5)
 
 
 def test_get_wall_offset_right_complements_left_plus_width():
     """offset_left + overall_width + offset_right == wall length."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        left = subject.get_wall_offset_left(props)
-        right = subject.get_wall_offset_right(props)
+        left = subject._get_offset(props, subject._LEFT)
+        right = subject._get_offset(props, subject._RIGHT)
     assert left + props.overall_width + right == pytest.approx(5.0)
 
 
@@ -144,15 +152,15 @@ def test_get_wall_offset_bottom_for_filling_at_sill_height():
     """Wall base at world Z=0; filling origin at wall-local Z=0.5 → sill at 0.5 m."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_bottom(props) == pytest.approx(0.5)
+        assert subject._get_offset(props, subject._BOTTOM) == pytest.approx(0.5)
 
 
 def test_get_wall_offset_top_complements_bottom_plus_height():
     """offset_bottom + overall_height + offset_top == wall height."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        bottom = subject.get_wall_offset_bottom(props)
-        top = subject.get_wall_offset_top(props)
+        bottom = subject._get_offset(props, subject._BOTTOM)
+        top = subject._get_offset(props, subject._TOP)
     assert bottom + props.overall_height + top == pytest.approx(3.0)
 
 
@@ -171,7 +179,7 @@ def test_get_wall_offset_bottom_for_slanted_wall():
 
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.9)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0, x_angle=math.radians(15)):
-        assert subject.get_wall_offset_bottom(props) == pytest.approx(0.9)
+        assert subject._get_offset(props, subject._BOTTOM) == pytest.approx(0.9)
 
 
 def test_set_wall_offset_bottom_round_trips_for_slanted_wall():
@@ -183,8 +191,8 @@ def test_set_wall_offset_bottom_round_trips_for_slanted_wall():
 
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0, x_angle=math.radians(15)):
-        subject.set_wall_offset_bottom(props, 1.2)
-        assert subject.get_wall_offset_bottom(props) == pytest.approx(1.2)
+        subject._set_offset(props, subject._BOTTOM, 1.2)
+        assert subject._get_offset(props, subject._BOTTOM) == pytest.approx(1.2)
 
 
 # ----------------------------------------------------------------------
@@ -201,7 +209,7 @@ def test_get_wall_offset_left_handles_flipped_filling():
     filling_matrix = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi, 4, "Z")
     props, _ = _make_props(filling_matrix, overall_width=1.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_left(props) == pytest.approx(0.5)
+        assert subject._get_offset(props, subject._LEFT) == pytest.approx(0.5)
 
 
 def test_get_wall_offset_right_handles_flipped_filling():
@@ -210,7 +218,7 @@ def test_get_wall_offset_right_handles_flipped_filling():
     filling_matrix = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi, 4, "Z")
     props, _ = _make_props(filling_matrix, overall_width=1.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_right(props) == pytest.approx(3.5)
+        assert subject._get_offset(props, subject._RIGHT) == pytest.approx(3.5)
 
 
 # ----------------------------------------------------------------------
@@ -223,7 +231,7 @@ def test_set_wall_offset_left_translates_filling_along_wall_x():
     along the wall's local X axis."""
     props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        subject.set_wall_offset_left(props, 2.0)
+        subject._set_offset(props, subject._LEFT, 2.0)
     assert filling_obj.matrix_world.translation.x == pytest.approx(2.0)
     assert filling_obj.matrix_world.translation.z == pytest.approx(0.5)
 
@@ -233,7 +241,7 @@ def test_set_wall_offset_bottom_translates_filling_along_wall_z():
     along the wall's local Z axis."""
     props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        subject.set_wall_offset_bottom(props, 1.0)
+        subject._set_offset(props, subject._BOTTOM, 1.0)
     assert filling_obj.matrix_world.translation.z == pytest.approx(1.0)
     assert filling_obj.matrix_world.translation.x == pytest.approx(1.5)
 
@@ -244,8 +252,8 @@ def test_set_wall_offset_right_round_trips_with_get():
     right edge would silently desync the left."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        subject.set_wall_offset_right(props, 1.0)
-        result = subject.get_wall_offset_right(props)
+        subject._set_offset(props, subject._RIGHT, 1.0)
+        result = subject._get_offset(props, subject._RIGHT)
     assert result == pytest.approx(1.0)
 
 
@@ -253,8 +261,8 @@ def test_set_wall_offset_top_round_trips_with_get():
     """Same round-trip invariant for the top edge."""
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        subject.set_wall_offset_top(props, 0.25)
-        result = subject.get_wall_offset_top(props)
+        subject._set_offset(props, subject._TOP, 0.25)
+        result = subject._get_offset(props, subject._TOP)
     assert result == pytest.approx(0.25)
 
 
@@ -274,10 +282,10 @@ def test_geom_cache_invalidates_when_generation_bumps():
 
     with mock.patch.object(Parametric, "get_geom_generation", return_value=1):
         with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-            first = subject.get_wall_offset_left(props)
+            first = subject._get_offset(props, subject._LEFT)
     with mock.patch.object(Parametric, "get_geom_generation", return_value=2):
         with _patch_host_wall(Matrix.Identity(4), length=8.0, height=3.0):
-            right_after_bump = subject.get_wall_offset_right(props)
+            right_after_bump = subject._get_offset(props, subject._RIGHT)
     assert first == pytest.approx(1.0)
     # 8 m wall, filling at x=1, width 1 → right offset = 6. Reads 6 only if the
     # cache dropped on the generation bump.
@@ -298,7 +306,7 @@ def test_geom_cache_invalidates_when_generation_bumps():
 def test_left_signed_value_positive_for_unflipped_filling():
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_left_signed(props) == pytest.approx(1.5)
+        assert subject._compute_value(props, subject._LEFT) == pytest.approx(1.5)
 
 
 def test_left_signed_value_negative_for_flipped_filling():
@@ -310,13 +318,13 @@ def test_left_signed_value_negative_for_flipped_filling():
     filling = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi, 4, "Z")
     props, _ = _make_props(filling, overall_width=1.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_left_signed(props) == pytest.approx(-0.5)
+        assert subject._compute_value(props, subject._LEFT) == pytest.approx(-0.5)
 
 
 def test_right_signed_value_positive_for_unflipped_filling():
     props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_right_signed(props) == pytest.approx(2.5)
+        assert subject._compute_value(props, subject._RIGHT) == pytest.approx(2.5)
 
 
 def test_right_signed_value_negative_for_flipped_filling():
@@ -325,7 +333,7 @@ def test_right_signed_value_negative_for_flipped_filling():
     filling = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi, 4, "Z")
     props, _ = _make_props(filling, overall_width=1.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        assert subject.get_wall_offset_right_signed(props) == pytest.approx(-3.5)
+        assert subject._compute_value(props, subject._RIGHT) == pytest.approx(-3.5)
 
 
 # ----------------------------------------------------------------------
@@ -341,7 +349,7 @@ def test_left_offset_position_lands_at_wall_start_in_world():
     filling's world matrix must land at world (0, 0, mid_height)."""
     props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)), overall_height=2.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        pos_filling_local = subject.left_offset_position(props)
+        pos_filling_local = subject._edge_position(props, subject._LEFT)
         pos_world = filling_obj.matrix_world @ pos_filling_local
     # Wall's start at world X=0 (bound_box.min_x=0 in the patched wall).
     assert pos_world.x == pytest.approx(0.0)
@@ -353,7 +361,7 @@ def test_top_offset_position_lands_at_wall_top_in_world():
     wall's top edge at world height."""
     props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)), overall_height=2.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        pos_filling_local = subject.top_offset_position(props)
+        pos_filling_local = subject._edge_position(props, subject._TOP)
         pos_world = filling_obj.matrix_world @ pos_filling_local
     # Wall height 3.0, wall base at world Z=0 → wall top at world Z=3.
     assert pos_world.z == pytest.approx(3.0)
@@ -364,7 +372,7 @@ def test_bottom_offset_position_lands_at_wall_base_in_world():
     so the point lands at world Z=0 (the wall's base)."""
     props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)), overall_height=2.0)
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        pos_filling_local = subject.bottom_offset_position(props)
+        pos_filling_local = subject._edge_position(props, subject._BOTTOM)
         pos_world = filling_obj.matrix_world @ pos_filling_local
     assert pos_world.z == pytest.approx(0.0)
 
@@ -386,7 +394,60 @@ def test_clear_caches_drops_all_entries():
     doesn't inherit stale entries from the previous one. Pin the contract."""
     props, _ = _make_props(Matrix.Translation((1.0, 0.0, 0.0)))
     with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
-        subject.get_wall_offset_left(props)
-    assert subject._GEOM_CACHE._data
+        subject._get_offset(props, subject._LEFT)
+    assert subject._GEOM_CACHE
     subject.clear_caches()
-    assert not subject._GEOM_CACHE._data
+    assert not subject._GEOM_CACHE
+
+
+# ----------------------------------------------------------------------
+# Stale-cache edge cases — cache keys are Blender object names, invalidated
+# only by parametric generation bumps and ``load_post``. Anything that
+# changes scene state without bumping the generation (Blender rename,
+# external Python script deleting a wall) leaves the cache holding stale
+# entries until the next IFC mutation. These tests pin that behavior.
+# ----------------------------------------------------------------------
+
+
+def test_filling_rename_within_session_reads_correctly_under_new_name():
+    """Reading offsets after a Blender rename hits a cache miss under the
+    new name and recomputes — the old-name entry is leaked but harmless,
+    and the new-name read returns correct geometry."""
+    props, filling_obj = _make_props(Matrix.Translation((1.5, 0.0, 0.5)), name="Door1")
+    with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
+        first = subject._get_offset(props, subject._LEFT)
+        assert "Door1" in subject._GEOM_CACHE
+        filling_obj.name = "Door1_renamed"
+        second = subject._get_offset(props, subject._LEFT)
+    assert first == pytest.approx(1.5)
+    assert second == pytest.approx(1.5)
+    assert "Door1_renamed" in subject._GEOM_CACHE
+
+
+def test_host_wall_deletion_serves_stale_cache_until_invalidation():
+    """If the host wall is removed without bumping the generation counter
+    (e.g. external script), the cache keeps returning the pre-deletion
+    geometry — only an IFC mutation or ``clear_caches()`` drops the stale
+    entry."""
+    props, _ = _make_props(Matrix.Translation((1.5, 0.0, 0.5)))
+    with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
+        assert subject.has_host_wall(props) is True
+    # Even after the patch exits and the chain would now return None, the
+    # cached entry under the filling's name is still served.
+    with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0, host_present=False):
+        assert subject.has_host_wall(props) is True  # stale
+        subject.clear_caches()
+        assert subject.has_host_wall(props) is False  # recomputed
+
+
+def test_filling_rotated_90_degrees_in_wall_plane_falls_back_to_positive_sign():
+    """A filling rotated exactly 90° around Z has ``col[0].x == 0.0``, which
+    is the ambiguous boundary for the X-sign. The implementation falls back
+    to +1 (the ``>= 0.0`` branch), so the renderer-side value reads as
+    positive — same sign as an unflipped filling."""
+    filling_matrix = Matrix.Translation((1.5, 0.0, 0.5)) @ Matrix.Rotation(pi / 2, 4, "Z")
+    props, _ = _make_props(filling_matrix, overall_width=1.0)
+    with _patch_host_wall(Matrix.Identity(4), length=5.0, height=3.0):
+        signed = subject._compute_value(props, subject._LEFT)
+    # +1 fallback × unflipped-equivalent left offset = +1.5 (filling origin in wall coords).
+    assert signed == pytest.approx(1.5)

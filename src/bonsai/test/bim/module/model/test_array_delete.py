@@ -18,19 +18,18 @@
 #
 # This file was generated with the assistance of an AI coding tool.
 
-"""Regression tests for IFC-Delete on BBIM_Array parents/children.
+"""Tests for IFC-Delete on BBIM_Array parents/children.
 
 Invariants pinned here:
 
-* The delete operator's confirmation count reflects how many array children
-  would be implicitly deleted alongside a parent the user picked alone. A
-  zero count means no destructive dialog needs to fire.
-* When the array parent is part of the selection, ``process_arrays``
-  dismantles every layer of that array — not only the layers whose children
-  are all selected. Without this, deleting just the parent fails the
-  ``is_array_child`` guard further down the delete pipeline and the parent
-  is silently skipped.
-* When only a child of an array is selected, the guard still reports it as
+* The delete operator's confirmation count reflects how many array
+  children would be implicitly deleted alongside a parent the user
+  picked alone. A zero count means no destructive dialog needs to fire.
+* When the array parent is in the selection, every layer of that array
+  is dismantled — not only the layers whose children are also in the
+  selection. Otherwise the parent is silently skipped by the array-child
+  guard further down the delete pipeline.
+* When only a child of an array is selected, the guard reports it as
   undeletable so the array stays intact.
 """
 
@@ -41,6 +40,10 @@ import ifcopenshell
 import pytest
 
 import bonsai.tool as tool
+from bonsai.bim.module.geometry.operator import (
+    count_implicit_array_children_in_selection,
+    has_blocked_array_child_in_selection,
+)
 from test.bim.module.model.conftest import make_ifc_file
 
 pytestmark = pytest.mark.array
@@ -70,8 +73,15 @@ def _call_unbound(operator_class, method_name: str, fake_self, *args, **kwargs):
     return getattr(operator_class, method_name)(fake_self, *args, **kwargs)
 
 
+def _mock_bim_ops():
+    """Replace ``bpy.ops.bim`` wholesale with a MagicMock — leaf patching
+    is ineffective because ``bpy.ops.bim.<op>`` resolves through
+    ``__getattr__`` at call time and returns a real wrapper."""
+    return patch.object(bpy.ops, "bim", new=MagicMock())
+
+
 # ---------------------------------------------------------------------------
-# tool.Blender.Modifier.count_implicit_array_children_in_selection
+# count_implicit_array_children_in_selection
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +93,7 @@ def test_count_is_zero_when_no_array_in_selection():
         patch("bonsai.tool.Ifc.get_entity", return_value=element),
         patch("bonsai.tool.Blender.Modifier.is_array", return_value=False),
     ):
-        result = tool.Blender.Modifier.count_implicit_array_children_in_selection({obj})
+        result = count_implicit_array_children_in_selection({obj})
 
     assert result == 0
 
@@ -105,7 +115,7 @@ def test_count_is_zero_when_parent_plus_all_children_selected():
             return_value=iter([child_a, child_b]),
         ),
     ):
-        result = tool.Blender.Modifier.count_implicit_array_children_in_selection({parent_obj, child_a, child_b})
+        result = count_implicit_array_children_in_selection({parent_obj, child_a, child_b})
 
     assert result == 0
 
@@ -124,7 +134,7 @@ def test_count_reports_all_children_when_parent_selected_alone():
             return_value=iter([child_a, child_b]),
         ),
     ):
-        result = tool.Blender.Modifier.count_implicit_array_children_in_selection({parent_obj})
+        result = count_implicit_array_children_in_selection({parent_obj})
 
     assert result == 2
 
@@ -147,13 +157,43 @@ def test_count_reports_only_unselected_children_when_partial():
             return_value=iter([child_a, child_b, child_c]),
         ),
     ):
-        result = tool.Blender.Modifier.count_implicit_array_children_in_selection({parent_obj, child_a})
+        result = count_implicit_array_children_in_selection({parent_obj, child_a})
 
     assert result == 2
 
 
+def test_count_sums_across_distinct_array_parents():
+    """Selecting two distinct array parents alone counts every child of
+    each array — the outer loop sums across parents independently."""
+    parent_a = _make_obj("parent_a")
+    parent_b = _make_obj("parent_b")
+    child_a1 = _make_obj("child_a1")
+    child_b1 = _make_obj("child_b1")
+    child_b2 = _make_obj("child_b2")
+    parent_a_element = MagicMock(name="parent_a_element")
+    parent_b_element = MagicMock(name="parent_b_element")
+
+    def get_entity(obj):
+        return {parent_a: parent_a_element, parent_b: parent_b_element}.get(obj)
+
+    def get_all_children_objects(element):
+        return iter([child_a1]) if element is parent_a_element else iter([child_b1, child_b2])
+
+    with (
+        patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
+        patch("bonsai.tool.Blender.Modifier.is_array", return_value=True),
+        patch(
+            "bonsai.tool.Blender.Modifier.Array.get_all_children_objects",
+            side_effect=get_all_children_objects,
+        ),
+    ):
+        result = count_implicit_array_children_in_selection({parent_a, parent_b})
+
+    assert result == 3
+
+
 # ---------------------------------------------------------------------------
-# tool.Blender.Modifier.has_blocked_array_child_in_selection
+# has_blocked_array_child_in_selection
 # ---------------------------------------------------------------------------
 
 
@@ -165,7 +205,7 @@ def test_has_blocked_array_child_false_when_no_array_in_selection():
         patch("bonsai.tool.Ifc.get_entity", return_value=element),
         patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=False),
     ):
-        result = tool.Blender.Modifier.has_blocked_array_child_in_selection({obj})
+        result = has_blocked_array_child_in_selection({obj})
 
     assert result is False
 
@@ -188,9 +228,31 @@ def test_has_blocked_array_child_true_when_lone_child_selected():
     ):
         # The parent object isn't in the selection — the child is on its own,
         # so the delete guard would silently skip it.
-        result = tool.Blender.Modifier.has_blocked_array_child_in_selection({child_obj})
+        result = has_blocked_array_child_in_selection({child_obj})
 
     assert result is True
+
+
+def test_has_blocked_array_child_false_when_parent_guid_unresolvable(capsys):
+    """Stray children whose stored Parent GUID does not resolve in the
+    current file are tolerated — they do not raise, do not surface as
+    blocked, and the data-integrity issue is logged to the console."""
+    child_obj = _make_obj("orphan_child")
+    child_element = MagicMock(name="child_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.side_effect = RuntimeError("not found")
+
+    with (
+        patch("bonsai.tool.Ifc.get", return_value=ifc_file),
+        patch("bonsai.tool.Ifc.get_entity", return_value=child_element),
+        patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=True),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "missing-guid"}),
+    ):
+        result = has_blocked_array_child_in_selection({child_obj})
+
+    assert result is False
+    assert "BBIM_Array" in capsys.readouterr().out
 
 
 def test_has_blocked_array_child_false_when_parent_also_selected():
@@ -215,25 +277,58 @@ def test_has_blocked_array_child_false_when_parent_also_selected():
         patch("bonsai.tool.Blender.Modifier.is_array_child", side_effect=is_child),
         patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
     ):
-        # Both parent and child selected → process_arrays will handle the
-        # dismantle path; nothing is silently skipped, so no popup needed.
-        result = tool.Blender.Modifier.has_blocked_array_child_in_selection({parent_obj, child_obj})
+        # Both parent and child selected → the dismantle path handles
+        # cleanup, so no popup is needed.
+        result = has_blocked_array_child_in_selection({parent_obj, child_obj})
 
     assert result is False
 
 
+def test_has_blocked_finds_child_when_other_array_parent_selected():
+    """Selecting an unrelated array's parent does not unblock children of
+    other arrays — the predicate checks each child's own parent."""
+    child_x_obj = _make_obj("child_x")
+    parent_y_obj = _make_obj("parent_y")
+    parent_x_obj = _make_obj("parent_x")
+    child_x_element = MagicMock(name="child_x_element")
+    parent_y_element = MagicMock(name="parent_y_element")
+    parent_x_element = MagicMock(name="parent_x_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.return_value = parent_x_element
+
+    def is_child(elem):
+        # Only child_x is an array child; parent_y_element is its own
+        # array's parent (not a child).
+        return elem is child_x_element
+
+    def get_entity(obj):
+        return {child_x_obj: child_x_element, parent_y_obj: parent_y_element}.get(obj)
+
+    def get_object(elem):
+        return {parent_x_element: parent_x_obj, parent_y_element: parent_y_obj}.get(elem)
+
+    with (
+        patch("bonsai.tool.Ifc.get", return_value=ifc_file),
+        patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
+        patch("bonsai.tool.Ifc.get_object", side_effect=get_object),
+        patch("bonsai.tool.Blender.Modifier.is_array_child", side_effect=is_child),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "x-guid"}),
+    ):
+        result = has_blocked_array_child_in_selection({child_x_obj, parent_y_obj})
+
+    assert result is True
+
+
 # ---------------------------------------------------------------------------
-# process_arrays — parent-alone full-dismantle (the actual bug fix)
+# process_arrays — parent-alone full-dismantle
 # ---------------------------------------------------------------------------
 
 
 def test_process_arrays_fully_dismantles_when_parent_selected_alone():
-    """Reproduces the reported bug: selecting only the array parent and
-    deleting must dismantle every layer of the array. Without the
-    ``array_parents_to_fully_dismantle`` branch, the per-layer
-    ``children.issubset(selected_objects)`` check fails (children weren't
-    selected) and the array stays — leaving the parent stuck behind the
-    ``is_array_child`` guard down the pipeline."""
+    """Selecting only the array parent for delete must dismantle every
+    layer of the array; otherwise the parent is silently skipped further
+    down the delete pipeline."""
     parent_obj = _make_obj("parent")
     parent_element = MagicMock(name="parent_element")
     parent_element.GlobalId = "parent-guid"
@@ -255,18 +350,13 @@ def test_process_arrays_fully_dismantles_when_parent_selected_alone():
             "bonsai.tool.Blender.Modifier.Array.get_modifiers_data",
             return_value=iter([layer_0, layer_1]),
         ),
-        # Returning children not in selection forces a `break` in the legacy
-        # path — a passing test here proves the full-dismantle override fires.
+        # Returning children not present in the selection ensures the
+        # per-layer subset check fails for every layer.
         patch(
             "bonsai.tool.Blender.Modifier.Array.get_children_objects",
             side_effect=lambda layer: iter([_make_obj(f"unselected-{layer['layer']}")]),
         ),
-        # ``bpy.ops.bim.<op>`` resolves through ``__getattr__`` at call time,
-        # so patching the leaf attribute directly is ineffective — the
-        # registry hands back a real BPyOpsSubModOp regardless. Replacing the
-        # whole ``bpy.ops.bim`` submodule with a Mock catches every chained
-        # access.
-        patch.object(bpy.ops, "bim", new=MagicMock()) as bim_ops,
+        _mock_bim_ops() as bim_ops,
     ):
         ctx = _make_context([parent_obj])
         # temp_override is a context-manager method on bpy.types.Context —
@@ -282,10 +372,9 @@ def test_process_arrays_fully_dismantles_when_parent_selected_alone():
 
 
 def test_process_arrays_layer_by_layer_when_all_children_selected():
-    """Regression guard: the pre-existing 'select parent + all children'
-    workflow must keep working unchanged. Each layer whose children are all
-    in the selection gets removed, in reverse order, and the walk stops at
-    the first layer with partially-selected children."""
+    """When the parent plus all children of every layer are selected,
+    each layer is dismantled in reverse order, and the walk stops at the
+    first layer with partially-selected children."""
     parent_obj = _make_obj("parent")
     child_layer0 = _make_obj("child-l0")
     child_layer1 = _make_obj("child-l1")
@@ -329,12 +418,7 @@ def test_process_arrays_layer_by_layer_when_all_children_selected():
             "bonsai.tool.Blender.Modifier.Array.get_children_objects",
             side_effect=get_children_objects,
         ),
-        # ``bpy.ops.bim.<op>`` resolves through ``__getattr__`` at call time,
-        # so patching the leaf attribute directly is ineffective — the
-        # registry hands back a real BPyOpsSubModOp regardless. Replacing the
-        # whole ``bpy.ops.bim`` submodule with a Mock catches every chained
-        # access.
-        patch.object(bpy.ops, "bim", new=MagicMock()) as bim_ops,
+        _mock_bim_ops() as bim_ops,
     ):
         ctx = _make_context([parent_obj, child_layer0, child_layer1])
         from bonsai.bim.module.geometry.operator import OverrideDelete
@@ -355,12 +439,7 @@ def test_process_arrays_does_nothing_when_no_array_in_selection():
         patch("bonsai.tool.Ifc.get", return_value=MagicMock()),
         patch("bonsai.tool.Ifc.get_entity", return_value=element),
         patch("ifcopenshell.util.element.get_pset", return_value=None),
-        # ``bpy.ops.bim.<op>`` resolves through ``__getattr__`` at call time,
-        # so patching the leaf attribute directly is ineffective — the
-        # registry hands back a real BPyOpsSubModOp regardless. Replacing the
-        # whole ``bpy.ops.bim`` submodule with a Mock catches every chained
-        # access.
-        patch.object(bpy.ops, "bim", new=MagicMock()) as bim_ops,
+        _mock_bim_ops() as bim_ops,
     ):
         from bonsai.bim.module.geometry.operator import OverrideDelete
 
@@ -398,15 +477,15 @@ def _instantiate_outliner_op_mock(*, implicit_count: int = 0, has_blocked: bool 
     fake_self = MagicMock(name="outliner_op")
     fake_self.implicit_array_children_count = implicit_count
     fake_self.has_blocked_array_child = has_blocked
-    # The classmethod is called as ``self.get_selected_ids_data(context)`` —
-    # routing it through the mock lets each test supply its own objects set.
+    # The operator delegates to a classmethod that returns the parsed
+    # selection; the mock lets each test supply its own objects set.
     return fake_self
 
 
 def test_outliner_invoke_fires_array_dialog_when_implicit_count_positive():
-    """Selecting only the array parent from the Outliner must trigger the same
-    confirmation dialog the viewport already shows. Without this wiring the
-    array silently dismantles."""
+    """Selecting only the array parent from the Outliner must trigger
+    the array-children confirmation dialog; otherwise the array silently
+    dismantles."""
     from bonsai.bim.module.geometry.operator import (
         OverrideOutlinerDelete,
         SelectedIdsData,
@@ -422,11 +501,11 @@ def test_outliner_invoke_fires_array_dialog_when_implicit_count_positive():
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file()),
         patch("bonsai.bim.module.geometry.operator.calc_delete_is_batch", return_value=False),
         patch(
-            "bonsai.tool.Blender.Modifier.count_implicit_array_children_in_selection",
+            "bonsai.bim.module.geometry.operator.count_implicit_array_children_in_selection",
             return_value=3,
         ),
         patch(
-            "bonsai.tool.Blender.Modifier.has_blocked_array_child_in_selection",
+            "bonsai.bim.module.geometry.operator.has_blocked_array_child_in_selection",
             return_value=False,
         ),
     ):
@@ -443,9 +522,9 @@ def test_outliner_invoke_fires_array_dialog_when_implicit_count_positive():
 
 
 def test_outliner_invoke_uses_got_it_label_when_only_blocked_children():
-    """Selecting a lone array child from the Outliner must surface the same
-    'Got it' acknowledgment popup the viewport shows — no destructive
-    consequence, so the OK button reads as an acknowledgment."""
+    """Selecting a lone array child from the Outliner must surface a
+    'Got it' acknowledgment popup — there is no destructive consequence,
+    so the OK button reads as an acknowledgment."""
     from bonsai.bim.module.geometry.operator import (
         OverrideOutlinerDelete,
         SelectedIdsData,
@@ -461,11 +540,11 @@ def test_outliner_invoke_uses_got_it_label_when_only_blocked_children():
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file()),
         patch("bonsai.bim.module.geometry.operator.calc_delete_is_batch", return_value=False),
         patch(
-            "bonsai.tool.Blender.Modifier.count_implicit_array_children_in_selection",
+            "bonsai.bim.module.geometry.operator.count_implicit_array_children_in_selection",
             return_value=0,
         ),
         patch(
-            "bonsai.tool.Blender.Modifier.has_blocked_array_child_in_selection",
+            "bonsai.bim.module.geometry.operator.has_blocked_array_child_in_selection",
             return_value=True,
         ),
     ):
@@ -478,8 +557,7 @@ def test_outliner_invoke_uses_got_it_label_when_only_blocked_children():
 
 
 def test_outliner_invoke_skips_dialog_for_non_array_selection():
-    """Plain objects from the Outliner must not get the array popup — that's
-    a UX regression for the common case."""
+    """Plain objects from the Outliner must not get the array popup."""
     from bonsai.bim.module.geometry.operator import (
         OverrideOutlinerDelete,
         SelectedIdsData,
@@ -496,16 +574,16 @@ def test_outliner_invoke_skips_dialog_for_non_array_selection():
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file()),
         patch("bonsai.bim.module.geometry.operator.calc_delete_is_batch", return_value=False),
         patch(
-            "bonsai.tool.Blender.Modifier.count_implicit_array_children_in_selection",
+            "bonsai.bim.module.geometry.operator.count_implicit_array_children_in_selection",
             return_value=0,
         ),
         patch(
-            "bonsai.tool.Blender.Modifier.has_blocked_array_child_in_selection",
+            "bonsai.bim.module.geometry.operator.has_blocked_array_child_in_selection",
             return_value=False,
         ),
     ):
         _call_unbound(OverrideOutlinerDelete, "invoke", fake_self, ctx, MagicMock(name="event"))
 
-    # No popup; control falls through to execute() — matching the pre-fix path.
+    # No popup; control falls through to execute().
     ctx.window_manager.invoke_props_dialog.assert_not_called()
     fake_self.execute.assert_called_once_with(ctx)

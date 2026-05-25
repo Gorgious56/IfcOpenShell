@@ -377,13 +377,11 @@ class ExtendWallsToWall(_CommitWallDraftsFirstMixin, bpy.types.Operator, tool.If
         # Shift+click: behave as if the walls were selected in reversed order.
         target_obj, objs = core.resolve_extend_walls_target(target_obj, objs, self.reverse)
         if target_obj and objs:
-            if tool.Ifc.is_moved(target_obj):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=target_obj)
+            tool.Geometry.commit_placement_if_moved(target_obj)
             joiner = DumbWallJoiner()
             target_element = tool.Ifc.get_entity(target_obj)
             for obj in objs:
-                if tool.Ifc.is_moved(obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+                tool.Geometry.commit_placement_if_moved(obj)
                 element = tool.Ifc.get_entity(obj)
                 ifcopenshell.api.geometry.connect_wall(
                     tool.Ifc.get(), wall1=element, wall2=target_element, is_atpath=True
@@ -1439,8 +1437,7 @@ class DumbWallJoiner:
         if not element1:
             return
 
-        if tool.Ifc.is_moved(wall1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall1)
+        tool.Geometry.commit_placement_if_moved(wall1)
 
         axis1 = tool.Model.get_wall_axis(wall1)
         intersect, cut_percentage = mathutils.geometry.intersect_point_line(target.to_2d(), *axis1["reference"])
@@ -1548,8 +1545,7 @@ class DumbWallJoiner:
         tool.Model.recreate_wall(element2, wall2)
 
     def flip(self, wall1: bpy.types.Object) -> None:
-        if tool.Ifc.is_moved(wall1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall1)
+        tool.Geometry.commit_placement_if_moved(wall1)
 
         if (
             not (element1 := tool.Ifc.get_entity(wall1))
@@ -1575,10 +1571,8 @@ class DumbWallJoiner:
         tool.Model.recreate_wall(element1, wall1)
 
     def merge(self, wall1: bpy.types.Object, wall2: bpy.types.Object) -> None:
-        if tool.Ifc.is_moved(wall1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall1)
-        if tool.Ifc.is_moved(wall2):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall2)
+        tool.Geometry.commit_placement_if_moved(wall1)
+        tool.Geometry.commit_placement_if_moved(wall2)
 
         element1 = tool.Ifc.get_entity(wall1)
         element2 = tool.Ifc.get_entity(wall2)
@@ -1655,8 +1649,7 @@ class DumbWallJoiner:
             ifcopenshell.api.geometry.assign_representation(tool.Ifc.get(), product=wall, representation=rep)
 
     def extend(self, wall1, target, connection=False):
-        if tool.Ifc.is_moved(wall1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall1)
+        tool.Geometry.commit_placement_if_moved(wall1)
         element1 = tool.Ifc.get_entity(wall1)
         p1, p2 = ifcopenshell.util.representation.get_reference_line(element1)
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
@@ -1676,8 +1669,7 @@ class DumbWallJoiner:
     def set_length(self, wall1: bpy.types.Object, si_length: float) -> None:
         element1 = tool.Ifc.get_entity(wall1)
         assert element1
-        if tool.Ifc.is_moved(wall1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=wall1)
+        tool.Geometry.commit_placement_if_moved(wall1)
 
         ifcopenshell.api.geometry.disconnect_path(tool.Ifc.get(), element=element1, connection_type="ATEND")
 
@@ -1690,10 +1682,8 @@ class DumbWallJoiner:
     def connect(self, obj1: bpy.types.Object, obj2: bpy.types.Object) -> None:
         wall1 = tool.Ifc.get_entity(obj1)
         wall2 = tool.Ifc.get_entity(obj2)
-        if tool.Ifc.is_moved(obj1):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj1)
-        if tool.Ifc.is_moved(obj2):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj2)
+        tool.Geometry.commit_placement_if_moved(obj1)
+        tool.Geometry.commit_placement_if_moved(obj2)
         ifcopenshell.api.geometry.connect_wall(tool.Ifc.get(), wall1=wall1, wall2=wall2)
         tool.Model.recreate_wall(wall1, obj1)
         tool.Model.recreate_wall(wall2, obj2)

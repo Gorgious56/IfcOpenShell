@@ -39,7 +39,6 @@ from ifcopenshell.util.shape_builder import ShapeBuilder
 from mathutils import Matrix, Vector
 
 import bonsai.bim.import_ifc as import_ifc
-import bonsai.core.geometry
 import bonsai.tool as tool
 from bonsai.bim.ifc import IfcStore
 from bonsai.bim.module.boundary.decorator import BoundaryDecorator
@@ -527,8 +526,7 @@ class ShowBoundaries(bpy.types.Operator, tool.Ifc.Operator):
             element = tool.Ifc.get_entity(obj)
             if not element or not getattr(element, "BoundedBy", None):
                 continue
-            if tool.Ifc.is_moved(obj):
-                bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+            tool.Geometry.commit_placement_if_moved(obj)
             element = tool.Ifc.get_entity(obj)
             for rel in element.BoundedBy or []:
                 boundary_obj = loader.load_boundary(rel, obj)
@@ -686,11 +684,9 @@ class AddBoundary(bpy.types.Operator, tool.Ifc.Operator):
 
         for building_element in building_elements:
             if obj := tool.Ifc.get_object(building_element):
-                if tool.Ifc.is_moved(obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+                tool.Geometry.commit_placement_if_moved(obj)
 
-        if tool.Ifc.is_moved(space_obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=space_obj)
+        tool.Geometry.commit_placement_if_moved(space_obj)
 
         # Don't generate boundaries of building elements that we've already got bounaries for.
         for boundary in space.BoundedBy:
@@ -1036,8 +1032,8 @@ class AddBoundary(bpy.types.Operator, tool.Ifc.Operator):
 
     def get_flattened_polygon(self, element, relating_space_obj, target_face_matrix_i):
         obj = tool.Ifc.get_object(element)
-        if obj and tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+        if obj:
+            tool.Geometry.commit_placement_if_moved(obj)
 
         space_matrix_i = relating_space_obj.matrix_world.inverted()
 

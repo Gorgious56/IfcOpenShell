@@ -1827,20 +1827,10 @@ def draw_tris_with_outline(
 ) -> None:
     """Renders ``batch`` as an opaque tris body with an 8-way dark halo behind.
 
-    Shared between StaticTrisGizmoMixin (static class-level tris) and other
-    custom-draw gizmos with dynamic tris (e.g. GizmoArrayLayerIndicator's
-    count label). The caller supplies the per-frame matrix and the icon
-    color; this routine handles the eight outline passes plus the body pass
-    and the surrounding GPU blend + depth state.
-
-    Depth-test is enabled (``LESS_EQUAL``) for the duration of the draw so
-    icons stacked along the camera's view direction sort by world Z — the
-    closer-to-camera icon occludes the farther one even when ``self.gizmos``
-    submission order would otherwise put the wrong one on top. Within a
-    single icon, all 9 passes share the same Z so they don't fight each
-    other. The icons may now also be occluded by scene geometry closer to
-    the camera; in practice Bonsai positions them above wall tops with
-    enough lift that this is a non-issue."""
+    Shared between StaticTrisGizmoMixin and custom-draw gizmos with dynamic
+    tris. Wraps the draw in ``LESS_EQUAL`` depth-test so overlapping icons
+    sort by camera distance; in exchange, foreground scene geometry can
+    occlude icons (Bonsai mitigates with per-feature Z-lift offsets)."""
     shader = _get_static_tris_shader()
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("LESS_EQUAL")

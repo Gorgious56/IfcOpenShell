@@ -118,8 +118,8 @@ class RegenerateDistributionElement(bpy.types.Operator, tool.Ifc.Operator):
 
                 obj = tool.Ifc.get_object(element)
                 obj_pred = tool.Ifc.get_object(predecessor)
-                tool.Model.sync_object_ifc_position(obj)
-                tool.Model.sync_object_ifc_position(obj_pred)
+                tool.Geometry.commit_placement_if_moved(obj)
+                tool.Geometry.commit_placement_if_moved(obj_pred)
 
                 port, port_pred = get_connected_ports_between(element, predecessor)
                 port_matrix_pred = tool.Model.get_element_matrix(port_pred)
@@ -1835,7 +1835,7 @@ class MEPAddTransition(bpy.types.Operator, tool.Ifc.Operator):
         if start_port_match != direction_match:
             transition_obj.matrix_world = start_object.matrix_world @ Matrix.Rotation(radians(180), 4, "X")
         transition_obj.location = start_segment_extend_point if start_port_match else end_segment_extend_point
-        tool.Model.sync_object_ifc_position(transition_obj)
+        tool.Geometry.commit_placement_if_moved(transition_obj)
 
         # add ports and connect them
         ports = tool.System.get_ports(tool.Ifc.get_entity(transition_obj))
@@ -2206,7 +2206,7 @@ class MEPAddBend(bpy.types.Operator, tool.Ifc.Operator):
             return matrix
 
         fitting_obj.matrix_world = get_fitting_matrix()
-        tool.Model.sync_object_ifc_position(fitting_obj)
+        tool.Geometry.commit_placement_if_moved(fitting_obj)
 
         # add ports and connect them
         ports = tool.System.get_ports(tool.Ifc.get_entity(fitting_obj))

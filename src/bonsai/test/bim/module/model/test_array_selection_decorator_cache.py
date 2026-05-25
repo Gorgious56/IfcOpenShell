@@ -53,10 +53,8 @@ def _make_prefs() -> SimpleNamespace:
 @pytest.fixture(autouse=True)
 def _reset_cache_token():
     """Reset the shared decorator cache token before each test so cached
-    state from a prior test cannot bleed into the next one. Test independence
-    is now visible at fixture scope instead of repeated on every test's first
-    line."""
-    decorator_cache._DECORATOR_CACHE_TOKEN = 0
+    state from a prior test cannot bleed into the next one."""
+    decorator_cache.reset_for_test()
     yield
 
 

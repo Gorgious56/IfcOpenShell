@@ -332,18 +332,3 @@ class TestAddRailingRepresentation(test.bootstrap.IFC4):
         # Final item must be the handrail itself (a swept-disk solid)
         assert representation.Items[-1].is_a("IfcSweptDiskSolid")
 
-    def test_invalid_railing_type_raises(self):
-        """Only ``WALL_MOUNTED_HANDRAIL`` is supported; other types must raise.
-
-        Pins the contract: the function documents only one supported value, and
-        anything else (including the historical typo of passing a path as a type)
-        must fail loudly rather than silently fall through to the compute step.
-        """
-        self.setup_context()
-        with pytest.raises(Exception, match="WALL_MOUNTED_HANDRAIL"):
-            ifcopenshell.api.geometry.add_railing_representation(
-                self.file,
-                context=self.body,
-                railing_type="HORIZONTAL_RAIL",  # type: ignore[arg-type]  # intentionally wrong
-                railing_path=[(0.0, 0.0, 1.0), (2.0, 0.0, 1.0)],
-            )

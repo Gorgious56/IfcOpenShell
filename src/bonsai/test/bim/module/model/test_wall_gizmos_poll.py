@@ -96,6 +96,7 @@ def _run_poll(
 
     patches = _patch_tools(prefs_on, selected, slab_element, wall_element, active_usage, other_usage)
     patches.append(patch.object(tool.Blender, "is_view_top_down", return_value=top_down))
+    patches.append(patch("bonsai.bim.module.model.wall._is_fillet_corner_wall", return_value=False))
     for p in patches:
         p.start()
     try:
@@ -233,8 +234,8 @@ def test_gizmo_groups_never_poll_simultaneously(selection_len):
     for p in patches:
         p.start()
     try:
-        join_polls = GizmoWallJoinIntersection.poll(SimpleNamespace())
-        unjoin_polls = GizmoWallUnjoinSingle.poll(SimpleNamespace())
+        join_polls = GizmoWallJoinIntersection.poll(make_context())
+        unjoin_polls = GizmoWallUnjoinSingle.poll(make_context())
     finally:
         for p in patches:
             p.stop()

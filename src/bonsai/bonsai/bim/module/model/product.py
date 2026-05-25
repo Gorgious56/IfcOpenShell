@@ -502,7 +502,7 @@ class AddOccurrence(bpy.types.Operator, tool.Ifc.Operator):
                 elif props.rl_mode == "CURSOR":
                     pass
 
-        tool.Model.sync_object_ifc_position(obj)
+        tool.Geometry.commit_placement_if_moved(obj)
 
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
         for port in ifcopenshell.util.system.get_ports(relating_type):
@@ -679,7 +679,7 @@ class MirrorElements(bpy.types.Operator, tool.Ifc.Operator):
             newmat.translation = Vector(newmat.translation) - (newmat.to_quaternion() @ centroid)
 
             obj.matrix_world = newmat
-            tool.Model.sync_object_ifc_position(obj)
+            tool.Geometry.commit_placement_if_moved(obj)
 
 
 class CopyZRotationToSelected(bpy.types.Operator, tool.Ifc.Operator):

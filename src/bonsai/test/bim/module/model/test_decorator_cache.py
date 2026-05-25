@@ -41,7 +41,7 @@ pytestmark = pytest.mark.model
 @pytest.fixture(autouse=True)
 def _reset_cache_token():
     """Fresh token between tests so the bump-count assertions are stable."""
-    decorator_cache._DECORATOR_CACHE_TOKEN = 0
+    decorator_cache.reset_for_test()
     yield
 
 
@@ -105,12 +105,12 @@ def test_bump_handler_increments_token():
     the module-level cache token. If it doesn't move, stale Object refs
     survive in dependent caches."""
     decorator_cache._bump_decorator_cache_token()
-    assert decorator_cache._DECORATOR_CACHE_TOKEN == 1
+    assert decorator_cache.get_decorator_cache_token() == 1
     # Blender's hook lists pass positional args (scene, depsgraph, …). The
     # handler must accept them without raising — it's registered against
     # four event types with different signatures.
     decorator_cache._bump_decorator_cache_token("scene", "depsgraph")
-    assert decorator_cache._DECORATOR_CACHE_TOKEN == 2
+    assert decorator_cache.get_decorator_cache_token() == 2
 
 
 def test_get_decorator_cache_token_reads_current_value():

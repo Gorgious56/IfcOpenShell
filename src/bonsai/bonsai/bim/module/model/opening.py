@@ -121,12 +121,11 @@ class FilledOpeningGenerator:
             filling_obj.matrix_world = new_matrix
             bpy.context.view_layer.update()
 
-        if tool.Ifc.is_moved(voided_obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=voided_obj)
+        tool.Geometry.commit_placement_if_moved(voided_obj)
         # Sync the filling's IFC ObjectPlacement to the matrix_world set above,
         # otherwise a later parametric-edit cancel restores from a stale IFC
         # placement and snaps the filling back to its pre-fill position.
-        tool.Model.sync_object_ifc_position(filling_obj)
+        tool.Geometry.commit_placement_if_moved(filling_obj)
 
         existing_opening_occurrence = self.get_existing_opening_occurrence_if_any(filling)
 
@@ -411,6 +410,10 @@ class RecalculateFill(bpy.types.Operator, tool.Ifc.Operator):
         return context.selected_objects
 
     def _execute(self, context):
+        # Host bodies are deduplicated across all selected fillings: an array of
+        # N windows/doors on one wall must regenerate the wall once, not N times.
+        decomposed_building_elements: set = set()
+
         for obj in context.selected_objects:
             element = tool.Ifc.get_entity(obj)
             if not element or not element.FillsVoids:
@@ -421,30 +424,28 @@ class RecalculateFill(bpy.types.Operator, tool.Ifc.Operator):
                 building_elements.extend([r.RelatingBuildingElement for r in opening.VoidsElements or []])
             for building_element in building_elements:
                 building_obj = tool.Ifc.get_object(building_element)
-                if tool.Ifc.is_moved(building_obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=building_obj)
+                tool.Geometry.commit_placement_if_moved(building_obj)
             for opening in openings:
                 bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
                 ifcopenshell.api.geometry.edit_object_placement(
                     tool.Ifc.get(), product=opening, matrix=obj.matrix_world
                 )
 
-            decomposed_building_elements = set()
             for building_element in building_elements:
                 decomposed_building_elements.add(building_element)
                 decomposed_building_elements.update(ifcopenshell.util.element.get_decomposition(building_element))
 
-            for building_element in decomposed_building_elements:
-                building_obj = tool.Ifc.get_object(building_element)
-                if building_obj and building_obj.data:
-                    representation = tool.Geometry.get_active_representation(building_obj)
-                    if representation:
-                        bonsai.core.geometry.switch_representation(
-                            tool.Ifc,
-                            tool.Geometry,
-                            obj=building_obj,
-                            representation=representation,
-                        )
+        for building_element in decomposed_building_elements:
+            building_obj = tool.Ifc.get_object(building_element)
+            if building_obj and building_obj.data:
+                representation = tool.Geometry.get_active_representation(building_obj)
+                if representation:
+                    bonsai.core.geometry.switch_representation(
+                        tool.Ifc,
+                        tool.Geometry,
+                        obj=building_obj,
+                        representation=representation,
+                    )
 
         # Refresh cut decorator
         DecoratorData.cut_cache.clear()
@@ -582,8 +583,7 @@ class ShowOpenings(Operator, tool.Ifc.Operator):
         openings_elements = [rel.RelatedOpeningElement for rel in tool.Geometry.get_openings(element)]
         if not openings_elements:
             return
-        if tool.Ifc.is_moved(obj):
-            bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=obj)
+        tool.Geometry.commit_placement_if_moved(obj)
         openings_elements_to_load = [o for o in openings_elements if not tool.Ifc.get_object(o)]
         openings_objects = tool.Model.load_openings(openings_elements_to_load)
         for obj in openings_objects:
@@ -756,7 +756,7 @@ class EditOpenings(Operator, tool.Ifc.Operator):
                         tool.Geometry, opening_element, similar_openings
                     )
                 elif tool.Ifc.is_moved(opening_obj):
-                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=opening_obj)
+                    tool.Geometry.commit_placement_if_moved(opening_obj)
                     bonsai.core.geometry.edit_similar_opening_placement(
                         tool.Geometry, opening_element, similar_openings
                     )
