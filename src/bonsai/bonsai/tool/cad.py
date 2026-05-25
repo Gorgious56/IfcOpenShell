@@ -46,12 +46,13 @@ if TYPE_CHECKING:
 
 
 VTX_PRECISION = 1.0e-5
-# Tolerance for merging coincident vertices after bmesh-based modifier regeneration.
+# Tolerances below are in Blender units (SI metres).
 # Looser than VTX_PRECISION because regen-time numeric drift exceeds CAD snap precision.
-# Magnitude is in Blender units, which Bonsai standardises to SI metres at the
-# IFC boundary; pre-multiply by si_conversion if you need IFC-project-unit semantics
-# (see tool/cad.py:mep.py:VTX_PRECISION usage for the conversion pattern).
 WELD_TOLERANCE = 1.0e-4
+# How close a vertex must be to the cut plane to count as on it.
+BISECT_TOLERANCE = 1.0e-4
+# Strict weld for cleaning up exactly-coincident vertices.
+WELD_EPSILON = 1.0e-6
 
 
 class Cad:
@@ -1051,10 +1052,9 @@ class Cad:
     ) -> None:
         """Append a flat cylinder (disk extrusion) to ``bm``.
 
-        Models the support's wall-attachment plate from
-        :class:`ifcopenshell.api.geometry.RailingSupport`: a disk of ``radius``
-        extruded by ``depth`` along the +Y axis rotated by ``axis_rotation_z``
-        radians around Z. ``position`` is the disk's base (not its centre).
+        A disk of ``radius`` extruded by ``depth`` along the +Y axis rotated
+        by ``axis_rotation_z`` radians around Z. ``position`` is the disk's
+        base, not its centre.
 
         :param bm: target bmesh, mutated in place.
         :param position: base of the extrusion in object-local coordinates.

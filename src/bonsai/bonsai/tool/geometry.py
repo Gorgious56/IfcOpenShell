@@ -789,6 +789,15 @@ class Geometry(bonsai.core.tool.Geometry):
         return False
 
     @classmethod
+    def has_material_styles(cls, element: ifcopenshell.entity_instance) -> bool:
+        """True when any of ``element``'s materials exposes an
+        ``IfcSurfaceStyle``. Gate body-style assignment to avoid double-styling."""
+        return any(
+            tool.Material.get_style(material) is not None
+            for material in ifcopenshell.util.element.get_materials(element)
+        )
+
+    @classmethod
     def reimport_element_representations(
         cls, obj: bpy.types.Object, representation: ifcopenshell.entity_instance, apply_openings: bool = True
     ) -> None:
@@ -2132,22 +2141,11 @@ class Geometry(bonsai.core.tool.Geometry):
 
         new_active_obj = None
         # Track decompositions so they can be recreated after the operation
-        decomposition_relationships = tool.Root.get_decomposition_relationships(objects_to_duplicate)
-        connection_relationships = tool.Root.get_connection_relationships(objects_to_duplicate)
-        # Snapshot port-to-port connections among MEP elements in the set —
-        # ``copy_class`` disconnects all new ports by default, so without
-        # this Shift+D produces unconnected duplicates and the MEP path
-        # overlay no longer traces through them. Capture each MEP
-        # element's port count too — ``recreate_port_connections`` uses
-        # it as a defensive guard so a future change that causes
-        # copy_class to produce a different port count surfaces as a
-        # skipped connection rather than silently wiring wrong ports.
-        port_connection_relationships = tool.Root.get_port_connection_relationships(objects_to_duplicate)
-        original_port_counts: dict[ifcopenshell.entity_instance, int] = {}
-        for _obj in objects_to_duplicate:
-            _element = tool.Ifc.get_entity(_obj)
-            if _element is not None and tool.System.is_mep_element(_element):
-                original_port_counts[_element] = len(tool.System.get_ports(_element))
+        decomposition_relationships = tool.Duplicate.get_decomposition_relationships(objects_to_duplicate)
+        connection_relationships = tool.Duplicate.get_connection_relationships(objects_to_duplicate)
+        # Snapshot port-to-port connections — copy_class disconnects new ports
+        # by default, leaving Shift+D duplicates unconnected.
+        port_connection_snapshot = tool.Duplicate.get_port_connection_relationships(objects_to_duplicate)
         old_to_new: dict[ifcopenshell.entity_instance, list[ifcopenshell.entity_instance]] = {}
         old_obj_name_to_new_obj_name: dict[str, str] = {}
 
@@ -2254,14 +2252,11 @@ class Geometry(bonsai.core.tool.Geometry):
 
         # Remove connections with old objects and recreates paths
         cls.remove_old_connections(old_to_new)
-        tool.Root.recreate_connections(connection_relationships, old_to_new)
-        # Restore the MEP port-to-port connections captured pre-duplication
-        # so the duplicates are wired to each other (not back to the
-        # originals — ``copy_class`` already disconnected the new ports).
-        tool.Root.recreate_port_connections(port_connection_relationships, old_to_new, original_port_counts)
+        tool.Duplicate.recreate_connections(connection_relationships, old_to_new)
+        tool.Duplicate.recreate_port_connections(port_connection_snapshot, old_to_new)
 
         # Recreate decompositions
-        tool.Root.recreate_decompositions(decomposition_relationships, old_to_new)
+        tool.Duplicate.recreate_decompositions(decomposition_relationships, old_to_new)
         cls.remove_linked_aggregate_data(old_to_new)
         bonsai.bim.handler.refresh_ui_data()
         tool.Root.reload_grid_decorator()

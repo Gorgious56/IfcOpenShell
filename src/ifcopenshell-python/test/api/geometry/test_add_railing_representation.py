@@ -165,15 +165,37 @@ def test_support_shape():
 
 @pytest.mark.parametrize(
     "terminal_type",
-    ["180", "TO_END_POST", "TO_WALL", "TO_FLOOR", "TO_END_POST_AND_FLOOR"],
+    ["180", "TO_END_POST", "TO_WALL", "TO_FLOOR", "TO_END_POST_AND_FLOOR", "NONE"],
 )
 def test_all_terminal_types_produce_valid_geometry(terminal_type):
-    """All five terminal types execute without error and produce a valid handrail polyline."""
+    """All terminal types execute without error and produce a valid handrail polyline."""
     result = compute_wall_mounted_handrail_geometry(
         railing_path=_straight_path(), **_common_kwargs(terminal_type=terminal_type)
     )
     assert result.handrail_polyline.shape[0] >= 2
     assert all(0 <= idx < len(result.handrail_polyline) for idx in result.handrail_arc_point_indices)
+
+
+def test_terminal_type_none_skips_cap_generation():
+    """``terminal_type="NONE"`` skips terminal-cap generation entirely.
+
+    The "NONE" sentinel is consumed at the cap step — the polyline is left
+    exactly as it came out of the fillet pass, with no extra cap vertices
+    or cap arc-point indices appended at either end. Every other terminal
+    type adds at least one cap vertex per end.
+    """
+    result_none = compute_wall_mounted_handrail_geometry(
+        railing_path=_straight_path(), **_common_kwargs(terminal_type="NONE")
+    )
+    result_180 = compute_wall_mounted_handrail_geometry(
+        railing_path=_straight_path(), **_common_kwargs(terminal_type="180")
+    )
+    # NONE leaves the polyline at the raw 2-point path; 180 adds caps at both ends.
+    assert result_none.handrail_polyline.shape[0] == 2
+    assert result_none.handrail_polyline.shape[0] < result_180.handrail_polyline.shape[0]
+    # NONE registers no cap arc points; 180 registers one per cap (2 total).
+    assert result_none.handrail_arc_point_indices == []
+    assert len(result_180.handrail_arc_point_indices) >= 2
 
 
 def test_l_path_adds_fillet_arc():

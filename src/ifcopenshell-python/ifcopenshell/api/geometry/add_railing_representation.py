@@ -25,7 +25,7 @@ from typing_extensions import assert_never
 
 import ifcopenshell.util.unit
 from ifcopenshell.util.shape_builder import (
-    TOLERANCE,
+    PRECISION,
     SequenceOfVectors,
     ShapeBuilder,
     V,
@@ -45,6 +45,7 @@ TERMINAL_TYPE = Literal[
     "TO_WALL",
     "TO_FLOOR",
     "TO_END_POST_AND_FLOOR",
+    "NONE",
 ]
 
 # Geometric design constants for the WALL_MOUNTED_HANDRAIL railing type (millimetres).
@@ -99,6 +100,306 @@ class WallMountedHandrailGeometry:
     supports: list[RailingSupport] = field(default_factory=list)
 
 
+# numpy indexing helpers (3D coords).
+_NP_Z = 2
+_NP_XY = slice(2)
+_NP_YX = [1, 0]
+_Z_DOWN = V(0, 0, -1)
+_ARC_MIDDLE_POINT_COS = sin(radians(45))
+
+
+@dataclass(frozen=True)
+class _RailingDims:
+    """Derived dimensions for a wall-mounted-handrail compute pass.
+
+    All values are in IFC project units.
+    """
+
+    railing_radius: float
+    height_below_handrail: float
+    terminal_radius: float
+    fillet_radius: float
+    support_spacing: float
+    support_length: float
+    support_arc_radius: float
+    support_disk_radius: float
+    support_disk_depth: float
+    clear_width: float
+    cap_type: TERMINAL_TYPE
+
+
+def _collinear(d0: np.ndarray, d1: np.ndarray) -> bool:
+    # Cross-product magnitude is linear near zero, so the test stays
+    # numerically stable for near-parallel unit vectors. The natural
+    # arccos(dot) formulation is not stable here: sub-ulp overshoot of
+    # dot past 1.0 returns NaN, which would silently break the fillet
+    # on straight subdivided edges. Anti-parallel vectors also collapse
+    # |d0 × d1| to 0 — and that "no usable turn" outcome is what the
+    # fillet caller wants, so we treat it as collinear too.
+    return bool(np.linalg.norm(np.cross(d0, d1)) < PRECISION)
+
+
+def _get_fillet_points(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray, radius: float) -> list[np.ndarray]:
+    """Fillet arc points between edges v0v1 and v1v2.
+
+    Raises ``ZeroDivisionError`` / ``FloatingPointError`` (and may return
+    NaN/inf points) on numerically degenerate input — callers that may
+    receive degenerate input must guard.
+    """
+    dir1 = np_normalized(v0 - v1)
+    dir2 = np_normalized(v2 - v1)
+    edge_angle = np_angle(dir1, dir2)
+    slide_distance = radius / tan(edge_angle / 2)
+
+    fillet_v1co = v1 + (dir1 * slide_distance)
+    fillet_v2co = v1 + (dir2 * slide_distance)
+
+    normal = np_normal([v0, v1, v2])
+    center = np_intersect_line_line(
+        fillet_v1co,
+        fillet_v1co + np.cross(normal, dir1),
+        fillet_v2co,
+        fillet_v2co + np.cross(normal, dir2),
+    )[0]
+
+    dir_ = np_normalized(np_lerp(fillet_v1co, fillet_v2co, 0.5) - center)
+    midpointco = center + dir_ * radius
+    return [fillet_v1co, midpointco, fillet_v2co]
+
+
+def _make_support(point: np.ndarray, railing_direction: np.ndarray, dims: _RailingDims) -> RailingSupport:
+    """Build a pure-geometry support description from a point + railing direction."""
+    ortho_dir = railing_direction[_NP_YX] * (1, -1)
+    ortho_dir = np_normalized(np_to_3d(ortho_dir))
+    arc_center = point + ortho_dir * dims.support_length
+    support_points = V(
+        [
+            point,
+            arc_center - ortho_dir * dims.support_length * cos(pi / 4) + _Z_DOWN * dims.support_length * sin(pi / 4),
+            arc_center + _Z_DOWN * dims.support_length,
+        ]
+    )
+    angle = np_angle_signed((0, 1), ortho_dir[_NP_XY])
+    return RailingSupport(
+        arc_polyline=support_points,
+        arc_radius=dims.support_arc_radius,
+        disk_position=support_points[-1],
+        disk_radius=dims.support_disk_radius,
+        disk_depth=dims.support_disk_depth,
+        disk_z_rotation=angle,
+    )
+
+
+def _add_arcs_on_turning_points(
+    base_points: np.ndarray, dims: _RailingDims, looped_path: bool
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Add 3-point fillet arcs on turning points of the railing path.
+
+    Returns ``(polyline_with_arcs, arc_midpoints)``.
+    """
+    arc_points: list[np.ndarray] = []
+    if len(base_points) < 3:
+        return base_points, arc_points
+
+    # looking for turning points by checking non-collinear edges
+    output_points: list[np.ndarray] = list(base_points[:1])
+    prev_dir = np_normalized(base_points[1] - base_points[0])
+    i = 1
+    while i < len(base_points) - 1:
+        cur_dir = np_normalized(base_points[i + 1] - base_points[i])
+
+        # Treat NaN cur_dir (zero-length edge → np_normalized of zero) as
+        # collinear: a coincident path vertex carries no turn information,
+        # so the safest fallback is "stay on the previous direction".
+        cur_dir_is_nan = bool(np.any(np.isnan(cur_dir)))
+
+        if cur_dir_is_nan or _collinear(cur_dir, prev_dir):
+            output_points.append(base_points[i])
+        else:
+            # User-supplied railing paths can produce numerically degenerate
+            # turns (anti-parallel directions, nearly-collinear triangle,
+            # zero-length edges from coincident vertices). Falling back to a
+            # sharp turn at the original vertex keeps the rest of the
+            # polyline real-valued instead of poisoning it with NaN.
+            fillet_points: Optional[list[np.ndarray]]
+            try:
+                fillet_points = _get_fillet_points(
+                    base_points[i - 1], base_points[i], base_points[i + 1], dims.fillet_radius
+                )
+            except (ZeroDivisionError, FloatingPointError):
+                fillet_points = None
+            else:
+                if any(np.any(np.isnan(fp)) or np.any(np.isinf(fp)) for fp in fillet_points):
+                    fillet_points = None
+
+            if fillet_points is None:
+                output_points.append(base_points[i])
+            else:
+                output_points.extend(fillet_points)
+                arc_points.append(fillet_points[1])
+
+        # Only advance prev_dir when cur_dir is well-defined — keeping a
+        # NaN prev_dir would cascade through every subsequent collinearity
+        # check.
+        if not cur_dir_is_nan:
+            prev_dir = cur_dir
+        i = i + 1
+
+    if looped_path:
+        output_points[0] = output_points[-1]
+    else:
+        output_points.append(base_points[-1])
+    return V(output_points), arc_points
+
+
+def _collect_supports(coords: np.ndarray, manual_supports: bool, dims: _RailingDims) -> list[RailingSupport]:
+    """Build the list of supports for the railing path."""
+    supports: list[RailingSupport] = []
+    # simplified_coords is a list of points that form non-collinear edges
+    simplified_coords: list[np.ndarray] = [coords[0]]
+    prev_dir = np_normalized(coords[1] - coords[0])
+
+    # iterating over each edge of the railing path
+    for i in range(1, len(coords) - 1):
+        cur_dir = np_normalized(coords[i + 1] - coords[i])
+
+        if not _collinear(cur_dir, prev_dir):
+            simplified_coords.append(coords[i])
+            prev_dir = cur_dir
+
+        # for manual supports each vertex on the railing path edge
+        # will be a point for a support
+        elif manual_supports:
+            supports.append(_make_support(coords[i], cur_dir, dims))
+
+    simplified_coords.append(coords[-1])
+
+    if manual_supports:
+        return supports
+
+    # create automatic supports based on the support spacing
+    for i in range(len(simplified_coords) - 1):
+        v0, v1 = simplified_coords[i : i + 2]
+        edge = v1 - v0
+        length: float = np.linalg.norm(edge)
+        edge_dir = np_normalized(edge)
+        n_supports, support_offset = divmod(length, dims.support_spacing)
+        n_supports = int(n_supports) + 1
+        support_offset /= 2
+
+        start_position = v0 + support_offset * edge_dir
+        for support_i in range(n_supports):
+            support_position = start_position + support_i * dims.support_spacing * edge_dir
+            supports.append(_make_support(support_position, edge, dims))
+
+    return supports
+
+
+def _add_cap(
+    railing_coords: np.ndarray,
+    arc_points_list: list[np.ndarray],
+    start: bool,
+    dims: _RailingDims,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Add a handrail terminal cap at one end of the railing.
+
+    Returns the inputs unchanged when ``dims.cap_type == "NONE"``.
+    """
+    if dims.cap_type == "NONE":
+        return railing_coords, arc_points_list
+
+    railing_coords_for_cap = railing_coords[::-1] if start else railing_coords
+    arc_points_list = arc_points_list[::-1] if start else arc_points_list
+
+    start_point: np.ndarray = railing_coords_for_cap[-1]
+    cap_dir = railing_coords_for_cap[-1] - railing_coords_for_cap[-2]
+    cap_dir = np_normalized(cap_dir)
+    ortho_dir = np_to_3d(cap_dir[_NP_YX] * (1, -1))
+    ortho_dir = np_normalized(ortho_dir)
+    local_z_down = np.cross(cap_dir, ortho_dir)
+    if start:
+        ortho_dir = -ortho_dir
+
+    cap_type = dims.cap_type
+    terminal_radius = dims.terminal_radius
+
+    if cap_type in ("180", "TO_END_POST"):
+        arc_point = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
+        arc_points_list.append(arc_point)
+        cap_coords = [arc_point, start_point + terminal_radius * 2 * local_z_down]
+
+        if cap_type == "TO_END_POST":
+            end_point = railing_coords_for_cap[-2].copy()
+            end_point[_NP_Z] -= terminal_radius * 2
+            cap_coords.append(end_point)
+
+    elif cap_type == "TO_WALL":
+        arc_point = (
+            start_point
+            + cap_dir * dims.clear_width * _ARC_MIDDLE_POINT_COS
+            + ortho_dir * dims.clear_width * (1 - _ARC_MIDDLE_POINT_COS)
+        )
+        arc_points_list.append(arc_point)
+        cap_coords = [arc_point, start_point + ortho_dir * dims.clear_width + cap_dir * dims.clear_width]
+
+    elif cap_type == "TO_FLOOR":
+        arc_point = (
+            start_point
+            + cap_dir * terminal_radius * _ARC_MIDDLE_POINT_COS
+            + _Z_DOWN * terminal_radius * (1 - _ARC_MIDDLE_POINT_COS)
+        )
+        arc_points_list.append(arc_point)
+        arc_end = start_point + cap_dir * terminal_radius + terminal_radius * _Z_DOWN
+        cap_coords = [
+            arc_point,
+            arc_end,
+            arc_end + _Z_DOWN * (dims.height_below_handrail - terminal_radius),
+        ]
+
+    elif cap_type == "TO_END_POST_AND_FLOOR":
+        first_arc_end = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
+        first_arc_coords = _get_fillet_points(
+            start_point, start_point + cap_dir * terminal_radius, first_arc_end, terminal_radius
+        )
+        arc_points_list.append(first_arc_coords[1])
+
+        end_point = railing_coords_for_cap[-2].copy()
+        end_point[_NP_Z] -= dims.height_below_handrail
+        second_arc_coords = _get_fillet_points(
+            first_arc_end, first_arc_end + local_z_down * terminal_radius, end_point, terminal_radius
+        )
+        arc_points_list.append(second_arc_coords[1])
+        cap_coords = [start_point] + first_arc_coords + second_arc_coords + [end_point]
+    else:
+        assert_never(cap_type)
+
+    railing_coords = np.vstack((railing_coords_for_cap, cap_coords))
+
+    if start:
+        railing_coords = railing_coords[::-1]
+        arc_points_list = arc_points_list[::-1]
+    return railing_coords, arc_points_list
+
+
+def _get_arc_indices(points: np.ndarray, arc_pts: list[np.ndarray]) -> list[int]:
+    points_ = points.copy()
+    arc_indices = []
+    i_base = 0
+    for arc_point in arc_pts:
+        for i, point in enumerate(points_):
+            if np.allclose(arc_point, point):
+                current_index = i + i_base
+                arc_indices.append(current_index)
+                i_base = current_index + 1
+                break
+        else:
+            raise Exception(
+                f"Arc point '{arc_point}' is not present in points:\n{points_}\nFull points data:\n{points}"
+            )
+        points_ = points_[i + 1 :]
+    return arc_indices
+
+
 def compute_wall_mounted_handrail_geometry(
     *,
     railing_path: SequenceOfVectors,
@@ -124,8 +425,18 @@ def compute_wall_mounted_handrail_geometry(
     millimetre constants (fillet radius, support rod radius, etc.) into
     project units.
 
+    Constraints:
+
+    - ``railing_path`` must contain at least 2 points.
+    - ``railing_diameter`` must be > 0.
+    - ``height`` must be ≥ ``railing_diameter / 2`` (otherwise the
+      ``TO_FLOOR`` / ``TO_END_POST_AND_FLOOR`` caps extrude upward
+      instead of down).
+    - ``clear_width`` must be > 0 (otherwise the support wraps backward
+      into the wall).
+
     :param railing_path: Sequence of 3D points along the top of the
-        handrail (not the centre). Must contain at least 2 points.
+        handrail (not the centre).
     :param support_spacing: Distance between automatic supports.
     :param railing_diameter: Handrail tube diameter.
     :param clear_width: Clear gap between the wall and the handrail tube.
@@ -133,303 +444,47 @@ def compute_wall_mounted_handrail_geometry(
     :param use_manual_supports: If true, one support is placed on every
         non-collinear vertex of ``railing_path``; if false, supports are
         distributed automatically by ``support_spacing``.
-    :param terminal_type: Style of the terminal end cap.
+    :param terminal_type: Style of the terminal end cap, or ``"NONE"`` for
+        no cap. Ignored when ``looped_path=True`` (no open ends to cap).
     :param looped_path: If true, the railing closes on its first point.
     :param unit_scale: Output of
         :func:`ifcopenshell.util.unit.calculate_unit_scale`. Defaults to
         1.0 (i.e. inputs are already in metres).
     """
-    z_down = V(0, 0, -1)
     railing_radius = railing_diameter / 2
     # for calculations purposes we use height without railing radius
     height_below_handrail = height - railing_radius
-    cap_type = terminal_type
-    railing_coords: np.ndarray = np.subtract(railing_path, z_down * railing_radius)
+    railing_coords: np.ndarray = np.subtract(railing_path, _Z_DOWN * railing_radius)
 
-    # mm-based stylistic constants converted to project units
-    terminal_radius = mm(TERMINAL_RADIUS_MM) / unit_scale
-    railing_fillet_radius = mm(HANDRAIL_FILLET_RADIUS_MM) / unit_scale
-    support_length = clear_width + railing_radius
-    support_arc_radius = mm(SUPPORT_ARC_RADIUS_MM) / unit_scale
-    support_disk_radius = railing_radius
-    support_disk_depth = mm(SUPPORT_DISK_DEPTH_MM) / unit_scale
-
-    np_Z = 2
-    np_XY = slice(2)
-    np_YX = [1, 0]
-
-    arc_points: list[np.ndarray] = []
-    supports: list[RailingSupport] = []
-
-    def collinear(d0: np.ndarray, d1: np.ndarray) -> bool:
-        # Cross-product magnitude is linear near zero, so the test stays
-        # numerically stable for near-parallel unit vectors. The natural
-        # arccos(dot) formulation is not stable here: sub-ulp overshoot of
-        # dot past 1.0 returns NaN, which would silently break the fillet
-        # on straight subdivided edges. Anti-parallel vectors also collapse
-        # |d0 × d1| to 0 — and that "no usable turn" outcome is what the
-        # fillet caller wants, so we treat it as collinear too.
-        return bool(np.linalg.norm(np.cross(d0, d1)) < TOLERANCE)
-
-    def make_support(point: np.ndarray, railing_direction: np.ndarray) -> RailingSupport:
-        """Build a pure-geometry support description from a point + railing direction."""
-        ortho_dir = railing_direction[np_YX] * (1, -1)
-        ortho_dir = np_normalized(np_to_3d(ortho_dir))
-        arc_center = point + ortho_dir * support_length
-        support_points = V(
-            [
-                point,
-                arc_center - ortho_dir * support_length * cos(pi / 4) + z_down * support_length * sin(pi / 4),
-                arc_center + z_down * support_length,
-            ]
-        )
-        angle = np_angle_signed((0, 1), ortho_dir[np_XY])
-        return RailingSupport(
-            arc_polyline=support_points,
-            arc_radius=support_arc_radius,
-            disk_position=support_points[-1],
-            disk_radius=support_disk_radius,
-            disk_depth=support_disk_depth,
-            disk_z_rotation=angle,
-        )
-
-    def get_fillet_points(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray, radius: float) -> list[np.ndarray]:
-        """get fillet points between edges v0v1 and v1v2"""
-        dir1 = np_normalized(v0 - v1)
-        dir2 = np_normalized(v2 - v1)
-        edge_angle = np_angle(dir1, dir2)
-        slide_distance = radius / tan(edge_angle / 2)
-
-        fillet_v1co = v1 + (dir1 * slide_distance)
-        fillet_v2co = v1 + (dir2 * slide_distance)
-
-        normal = np_normal([v0, v1, v2])
-        center = np_intersect_line_line(
-            fillet_v1co,
-            fillet_v1co + np.cross(normal, dir1),
-            fillet_v2co,
-            fillet_v2co + np.cross(normal, dir2),
-        )[0]
-
-        dir_ = np_normalized(np_lerp(fillet_v1co, fillet_v2co, 0.5) - center)
-        midpointco = center + dir_ * radius
-        return [fillet_v1co, midpointco, fillet_v2co]
-
-    def _safe_get_fillet_points(
-        v0: np.ndarray, v1: np.ndarray, v2: np.ndarray, radius: float
-    ) -> Optional[list[np.ndarray]]:
-        """Call ``get_fillet_points`` and return ``None`` if the result is
-        numerically unusable.
-
-        ``get_fillet_points`` divides by ``tan(edge_angle / 2)``, takes the
-        normal of three points, and intersects two lines — each step can
-        produce ``ZeroDivisionError`` (anti-parallel directions →
-        ``edge_angle = 0``) or NaN (collinear vertices → zero-norm normal,
-        zero-length edges → NaN direction). The caller decides what to do
-        with the missing arc; this wrapper only signals "can't compute".
-        """
-        try:
-            fillet_points = get_fillet_points(v0, v1, v2, radius)
-        except (ZeroDivisionError, FloatingPointError):
-            return None
-        for fp in fillet_points:
-            if np.any(np.isnan(fp)) or np.any(np.isinf(fp)):
-                return None
-        return fillet_points
-
-    def add_arcs_on_turning_points(base_points: np.ndarray) -> np.ndarray:
-        """add 3 point fillet arcs on turning points of the railing path"""
-        if len(base_points) < 3:
-            return base_points
-
-        # looking for turning points by checking non-collinear edges
-        output_points: list[np.ndarray] = list(base_points[:1])
-        prev_dir = np_normalized(base_points[1] - base_points[0])
-        i = 1
-        while i < len(base_points) - 1:
-            cur_dir = np_normalized(base_points[i + 1] - base_points[i])
-
-            # Treat NaN cur_dir (zero-length edge → np_normalized of zero) as
-            # collinear: a coincident path vertex carries no turn information,
-            # so the safest fallback is "stay on the previous direction".
-            cur_dir_is_nan = bool(np.any(np.isnan(cur_dir)))
-
-            if cur_dir_is_nan or collinear(cur_dir, prev_dir):
-                output_points.append(base_points[i])
-            else:
-                fillet_points = _safe_get_fillet_points(
-                    base_points[i - 1], base_points[i], base_points[i + 1], railing_fillet_radius
-                )
-                if fillet_points is None:
-                    # Numerically degenerate turn (anti-parallel directions,
-                    # nearly-collinear triangle, etc.). Falling back to a
-                    # sharp turn keeps the rest of the polyline real-valued
-                    # instead of poisoning it with NaN.
-                    output_points.append(base_points[i])
-                else:
-                    output_points.extend(fillet_points)
-                    arc_points.append(fillet_points[1])
-
-            # Only advance prev_dir when cur_dir is well-defined — keeping a
-            # NaN prev_dir would cascade through every subsequent collinearity
-            # check.
-            if not cur_dir_is_nan:
-                prev_dir = cur_dir
-            i = i + 1
-
-        if looped_path:
-            output_points[0] = output_points[-1]
-        else:
-            output_points.append(base_points[-1])
-        return V(output_points)
-
-    def collect_supports(coords: np.ndarray, manual_supports: bool) -> None:
-        """Populate ``supports`` based on the railing coordinates."""
-        # simplified_coords is a list of points that form non-collinear edges
-        simplified_coords: list[np.ndarray] = [coords[0]]
-        prev_dir = np_normalized(coords[1] - coords[0])
-
-        # iterating over each edge of the railing path
-        for i in range(1, len(coords) - 1):
-            cur_dir = np_normalized(coords[i + 1] - coords[i])
-
-            if not collinear(cur_dir, prev_dir):
-                simplified_coords.append(coords[i])
-                prev_dir = cur_dir
-
-            # for manual supports each vertex on the railing path edge
-            # will be a point for a support
-            elif manual_supports:
-                supports.append(make_support(point=coords[i], railing_direction=cur_dir))
-
-        simplified_coords.append(coords[-1])
-
-        if manual_supports:
-            return
-
-        # create automatic supports based on the support spacing
-        for i in range(len(simplified_coords) - 1):
-            v0, v1 = simplified_coords[i : i + 2]
-            edge = v1 - v0
-            length: float = np.linalg.norm(edge)
-            edge_dir = np_normalized(edge)
-            n_supports, support_offset = divmod(length, support_spacing)
-            n_supports = int(n_supports) + 1
-            support_offset /= 2
-
-            start_position = v0 + support_offset * edge_dir
-            for support_i in range(n_supports):
-                support_position = start_position + support_i * support_spacing * edge_dir
-                supports.append(make_support(point=support_position, railing_direction=edge))
-
-    def add_cap(
-        railing_coords: np.ndarray, arc_points_list: list[np.ndarray], start: bool = False
-    ) -> tuple[np.ndarray, list[np.ndarray]]:
-        """add handrail terminal cap"""
-        railing_coords_for_cap = railing_coords[::-1] if start else railing_coords
-        arc_points_list = arc_points_list[::-1] if start else arc_points_list
-
-        start_point: np.ndarray = railing_coords_for_cap[-1]
-        cap_dir = railing_coords_for_cap[-1] - railing_coords_for_cap[-2]
-        cap_dir = np_normalized(cap_dir)
-        ortho_dir = np_to_3d(cap_dir[np_YX] * (1, -1))
-        ortho_dir = np_normalized(ortho_dir)
-        local_z_down = np.cross(cap_dir, ortho_dir)
-        if start:
-            ortho_dir = -ortho_dir
-
-        arc_middle_point_cos = sin(radians(45))
-
-        if cap_type in ("180", "TO_END_POST"):
-            arc_point = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
-            arc_points_list.append(arc_point)
-            cap_coords = [arc_point, start_point + terminal_radius * 2 * local_z_down]
-
-            if cap_type == "TO_END_POST":
-                end_point = railing_coords_for_cap[-2].copy()
-                end_point[np_Z] -= terminal_radius * 2
-                cap_coords.append(end_point)
-
-        elif cap_type == "TO_WALL":
-            arc_point = (
-                start_point
-                + cap_dir * clear_width * arc_middle_point_cos
-                + ortho_dir * clear_width * (1 - arc_middle_point_cos)
-            )
-            arc_points_list.append(arc_point)
-            cap_coords = [arc_point, start_point + ortho_dir * clear_width + cap_dir * clear_width]
-
-        elif cap_type == "TO_FLOOR":
-            arc_point = (
-                start_point
-                + cap_dir * terminal_radius * arc_middle_point_cos
-                + z_down * terminal_radius * (1 - arc_middle_point_cos)
-            )
-            arc_points_list.append(arc_point)
-            arc_end = start_point + cap_dir * terminal_radius + terminal_radius * z_down
-            cap_coords = [
-                arc_point,
-                arc_end,
-                arc_end + z_down * (height_below_handrail - terminal_radius),
-            ]
-
-        elif cap_type == "TO_END_POST_AND_FLOOR":
-            first_arc_end = start_point + cap_dir * terminal_radius + terminal_radius * local_z_down
-            first_arc_coords = get_fillet_points(
-                start_point, start_point + cap_dir * terminal_radius, first_arc_end, terminal_radius
-            )
-            arc_points_list.append(first_arc_coords[1])
-
-            end_point = railing_coords_for_cap[-2].copy()
-            end_point[np_Z] -= height_below_handrail
-            second_arc_coords = get_fillet_points(
-                first_arc_end, first_arc_end + local_z_down * terminal_radius, end_point, terminal_radius
-            )
-            arc_points_list.append(second_arc_coords[1])
-            cap_coords = [start_point] + first_arc_coords + second_arc_coords + [end_point]
-        else:
-            assert_never(cap_type)
-
-        railing_coords = np.vstack((railing_coords_for_cap, cap_coords))
-
-        if start:
-            railing_coords = railing_coords[::-1]
-            arc_points_list = arc_points_list[::-1]
-        return railing_coords, arc_points_list
-
-    def get_arc_indices(points: np.ndarray, arc_pts: list[np.ndarray]) -> list[int]:
-        points_ = points.copy()
-        arc_indices = []
-        i_base = 0
-        for arc_point in arc_pts:
-            for i, point in enumerate(points_):
-                if np.allclose(arc_point, point):
-                    current_index = i + i_base
-                    arc_indices.append(current_index)
-                    i_base = current_index + 1
-                    break
-            else:
-                raise Exception(
-                    f"Arc point '{arc_point}' is not present in points:\n{points_}\nFull points data:\n{points}"
-                )
-            points_ = points_[i + 1 :]
-        return arc_indices
+    dims = _RailingDims(
+        railing_radius=railing_radius,
+        height_below_handrail=height_below_handrail,
+        terminal_radius=mm(TERMINAL_RADIUS_MM) / unit_scale,
+        fillet_radius=mm(HANDRAIL_FILLET_RADIUS_MM) / unit_scale,
+        support_spacing=support_spacing,
+        support_length=clear_width + railing_radius,
+        support_arc_radius=mm(SUPPORT_ARC_RADIUS_MM) / unit_scale,
+        support_disk_radius=railing_radius,
+        support_disk_depth=mm(SUPPORT_DISK_DEPTH_MM) / unit_scale,
+        clear_width=clear_width,
+        cap_type=terminal_type,
+    )
 
     # need to add first two points to the path
     # to create the turning arcs and supports on the last segment of the loop
     if looped_path:
         railing_coords = np.vstack((railing_coords, railing_coords[:2]))
 
-    collect_supports(railing_coords, manual_supports=use_manual_supports)
-    railing_coords = add_arcs_on_turning_points(railing_coords)
+    supports = _collect_supports(railing_coords, use_manual_supports, dims)
+    railing_coords, arc_points = _add_arcs_on_turning_points(railing_coords, dims, looped_path)
 
-    if not looped_path and cap_type != "NONE":
-        railing_coords, arc_points = add_cap(railing_coords, arc_points, start=True)
-        railing_coords, arc_points = add_cap(railing_coords, arc_points, start=False)
+    if not looped_path:
+        railing_coords, arc_points = _add_cap(railing_coords, arc_points, start=True, dims=dims)
+        railing_coords, arc_points = _add_cap(railing_coords, arc_points, start=False, dims=dims)
 
     return WallMountedHandrailGeometry(
         handrail_polyline=railing_coords,
-        handrail_arc_point_indices=get_arc_indices(railing_coords, arc_points),
+        handrail_arc_point_indices=_get_arc_indices(railing_coords, arc_points),
         handrail_radius=railing_radius,
         supports=supports,
     )
@@ -464,7 +519,7 @@ def add_railing_representation(
     :param support_spacing: Distance between supports if automatic supports are used. Defaults to 1m.
     :param railing_diameter: Railing diameter. Defaults to 50mm.
     :param clear_width: Clear width between the railing and the wall. Defaults to 40mm.
-    :param terminal_type: type of the cap. Defaults to "180".
+    :param terminal_type: type of the cap, or "NONE" for no cap. Defaults to "180".
     :param height: defaults to 1m
     :param looped_path: Whether to end the railing on the first point of `railing_path`. Defaults to False.
     :param unit_scale: The unit scale as calculated by

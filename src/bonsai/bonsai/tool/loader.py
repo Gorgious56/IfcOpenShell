@@ -44,6 +44,7 @@ from mathutils.kdtree import KDTree
 import bonsai.bim.import_ifc
 import bonsai.core.tool
 import bonsai.tool as tool
+from bonsai.tool.cad import BISECT_TOLERANCE
 
 # Progressively we'll refactor loading elements into Blender objects into this
 # class. This will break down the monolithic import_ifc module and allow us to
@@ -1103,7 +1104,7 @@ class Loader(bonsai.core.tool.Loader):
                 prev_co = co.copy()
                 co += no * layer.LayerThickness * cls.unit_scale
                 bisect_geom = bmesh.ops.bisect_plane(
-                    bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], dist=0.0001, plane_co=co, plane_no=no
+                    bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], dist=BISECT_TOLERANCE, plane_co=co, plane_no=no
                 )
                 bmesh.ops.duplicate(bm, geom=bisect_geom["geom_cut"])
             if not (style := ifcopenshell.util.representation.get_material_style(layer.Material, body)):

@@ -131,7 +131,7 @@ class Material(bonsai.core.tool.Material):
                     new.total_elements = len(
                         ifcopenshell.util.element.get_elements_by_material(tool.Ifc.get(), material)
                     )
-                    new.has_style = bool(material.HasRepresentation)
+                    new.has_style = cls.get_style(material) is not None
 
             if category_index_to_reselect is not None:
                 props.active_material_index = category_index_to_reselect

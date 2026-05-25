@@ -21,6 +21,7 @@ from math import pi
 import bpy
 import ifcopenshell
 import ifcopenshell.api
+import ifcopenshell.api.geometry
 import ifcopenshell.api.root
 import ifcopenshell.api.system
 import ifcopenshell.util.system
@@ -330,3 +331,122 @@ class TestFlowElementAndControls(NewFile):
         controls = subject.get_flow_element_controls(flow_element)
         assert set(controls) == set((flow_control, flow_control1))
         assert subject.get_flow_control_flow_element(flow_control) == flow_element
+
+
+class TestGetPortRelatingElement(NewFile):
+    def test_returns_parent_element_when_port_is_nested(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        port = ifcopenshell.api.system.add_port(ifc, element=element)
+        assert subject.get_port_relating_element(port) == element
+
+    def test_returns_none_when_port_has_no_nests(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        # Free-standing port — created without an enclosing element.
+        port = ifcopenshell.api.system.add_port(ifc)
+        assert subject.get_port_relating_element(port) is None
+
+
+class TestWalkConnectedMepElements(NewFile):
+    def _connect(self, ifc, a, b):
+        """Connect last port of element a to first port of element b."""
+        ports_a = ifcopenshell.util.system.get_ports(a)
+        ports_b = ifcopenshell.util.system.get_ports(b)
+        ifcopenshell.api.system.connect_port(ifc, port1=ports_a[-1], port2=ports_b[0])
+
+    def test_returns_empty_for_non_mep_start(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        wall = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        assert subject.walk_connected_mep_elements(wall) == []
+
+    def test_returns_just_start_when_no_neighbours(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        segment = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        ifcopenshell.api.system.add_port(ifc, element=segment)
+        ifcopenshell.api.system.add_port(ifc, element=segment)
+        assert subject.walk_connected_mep_elements(segment) == [segment]
+
+    def test_traverses_chain(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        segments = []
+        for _ in range(3):
+            seg = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+            ifcopenshell.api.system.add_port(ifc, element=seg)
+            ifcopenshell.api.system.add_port(ifc, element=seg)
+            segments.append(seg)
+        self._connect(ifc, segments[0], segments[1])
+        self._connect(ifc, segments[1], segments[2])
+        # BFS order: start, then chain neighbours. Pinned because path-rendering
+        # callers (MEP overlay decorator) depend on traversal order.
+        result = subject.walk_connected_mep_elements(segments[0])
+        assert result == segments
+
+    def test_terminates_on_cycle(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        a = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        b = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        for element in (a, b):
+            ifcopenshell.api.system.add_port(ifc, element=element)
+            ifcopenshell.api.system.add_port(ifc, element=element)
+        # Connect both pairs of ports → closed loop a ↔ b.
+        ports_a = ifcopenshell.util.system.get_ports(a)
+        ports_b = ifcopenshell.util.system.get_ports(b)
+        ifcopenshell.api.system.connect_port(ifc, port1=ports_a[0], port2=ports_b[0])
+        ifcopenshell.api.system.connect_port(ifc, port1=ports_a[1], port2=ports_b[1])
+        result = subject.walk_connected_mep_elements(a)
+        assert set(result) == {a, b}
+
+    def test_filters_non_mep_neighbours(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        segment = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        terminal = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcFlowTerminal")
+        ifcopenshell.api.system.add_port(ifc, element=segment)
+        ifcopenshell.api.system.add_port(ifc, element=terminal)
+        self._connect(ifc, segment, terminal)
+        # IfcFlowTerminal is neither IfcFlowSegment nor IfcFlowFitting, so
+        # is_mep_element rejects it — the BFS walks through but does not
+        # collect it.
+        assert subject.walk_connected_mep_elements(segment) == [segment]
+
+
+class TestGetPortWorldPosition(NewFile):
+    def test_returns_origin_when_port_has_no_placement(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        port = ifc.createIfcDistributionPort()
+        assert subject.get_port_world_position(port) == Vector((0.0, 0.0, 0.0))
+
+    def test_falls_back_to_raw_ifc_world_when_parent_missing(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc().set(ifc)
+        # Free-standing port: no IfcRelNests → no parent_element → fallback
+        # path returns the raw IFC-placement world position.
+        port = ifcopenshell.api.system.add_port(ifc)
+        ifcopenshell.api.geometry.edit_object_placement(
+            ifc, product=port, matrix=Matrix.Translation((1.0, 2.0, 3.0)), is_si=False
+        )
+        position = subject.get_port_world_position(port)
+        assert position == Vector((1.0, 2.0, 3.0))
+
+    def test_uses_parent_blender_matrix_world_when_parent_object_present(self):
+        bpy.ops.bim.create_project()
+        ifc = tool.Ifc.get()
+        segment = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcDuctSegment")
+        port = ifcopenshell.api.system.add_port(ifc, element=segment)
+        # Anchor port + segment at IFC origin, then translate the Blender
+        # object — the world position should follow the Blender translation,
+        # not the IFC placement.
+        ifcopenshell.api.geometry.edit_object_placement(ifc, product=segment, matrix=Matrix.Identity(4), is_si=False)
+        ifcopenshell.api.geometry.edit_object_placement(ifc, product=port, matrix=Matrix.Identity(4), is_si=False)
+        obj = bpy.data.objects.new("Segment", None)
+        tool.Ifc.link(segment, obj)
+        obj.matrix_world = Matrix.Translation((10.0, 0.0, 0.0))
+        position = subject.get_port_world_position(port)
+        assert position == Vector((10.0, 0.0, 0.0))

@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import collections.abc
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from math import atan, cos, degrees, pi, radians
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Literal,
     Optional,
     TypedDict,
@@ -40,9 +39,11 @@ from typing import (
 import bmesh
 import bpy
 import ifcopenshell
+import ifcopenshell.api.feature
 import ifcopenshell.api.geometry
 import ifcopenshell.api.grid
 import ifcopenshell.api.pset
+import ifcopenshell.api.root
 import ifcopenshell.geom
 import ifcopenshell.ifcopenshell_wrapper as W
 import ifcopenshell.util.element
@@ -61,6 +62,7 @@ import bonsai.core.geometry
 import bonsai.core.tool
 import bonsai.tool as tool
 from bonsai.bim import import_ifc
+from bonsai.tool.cad import VTX_PRECISION, WELD_TOLERANCE
 
 T = TypeVar("T")
 V_ = tool.Blender.V_
@@ -1062,7 +1064,14 @@ class Model(bonsai.core.tool.Model):
     def handle_array_on_copied_element(
         cls, element: ifcopenshell.entity_instance, array_data: Optional[dict[str, Any]] = None
     ) -> None:
-        """if no `array_data` is provided then an array will be removed from the element"""
+        """Post-copy hook: decide what to do with the BBIM_Array pset a copy
+        inherits from its source.
+
+        - ``array_data=None`` — detach the copy from any array. Removes the
+          inherited BBIM_Array pset and any CHILD_OF constraint.
+        - ``array_data`` provided — promote the copy to a fresh array parent
+          with an empty children list, using the provided layer config.
+        """
 
         if array_data is None:
             array_pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
@@ -1186,9 +1195,18 @@ class Model(bonsai.core.tool.Model):
             removed_children = set(existing_children) - set(array["children"])
             for removed_child in removed_children:
                 element = tool.Ifc.get().by_guid(removed_child)
+                # Strip any wall/slab opening cut by this child before deletion,
+                # so the host's HasOpenings shrinks symmetrically with count.
+                if getattr(element, "FillsVoids", None):
+                    ifcopenshell.api.feature.remove_feature(
+                        tool.Ifc.get(), feature=element.FillsVoids[0].RelatingOpeningElement
+                    )
                 obj = tool.Ifc.get_object(element)
                 if obj:
                     tool.Geometry.delete_ifc_object(obj)
+
+            if array.get("mirror_to_host", True) and children_elements:
+                cls.mirror_parent_void_fillings_to_children(parent_element, children_elements)
 
             if array_i in array_layers_to_apply:
                 for child_element in children_elements:
@@ -1205,6 +1223,88 @@ class Model(bonsai.core.tool.Model):
         ifcopenshell.api.pset.edit_pset(
             tool.Ifc.get(), pset=pset, properties={"Data": json_data, "Parent": parent_element.GlobalId}
         )
+
+    @classmethod
+    def mirror_parent_void_fillings_to_children(
+        cls,
+        parent_element: ifcopenshell.entity_instance,
+        children_elements: Sequence[ifcopenshell.entity_instance],
+    ) -> None:
+        """Replicate the parent's FillsVoids → host chain onto each array child.
+
+        For each child, tears down any stale opening, creates a new
+        IfcOpeningElement at the child's current placement, reuses the parent's
+        opening representation as a MappedRepresentation, and adds the
+        void + filling pair so the host element is cut once per child.
+
+        No-op when the parent is not a filling, when the host element cannot
+        be resolved, or when the children list is empty. Opt out via the
+        per-layer ``mirror_to_host`` flag on ``BBIM_Array.Data``.
+        """
+        host = tool.Spatial.get_host_element(parent_element)
+        if host is None or not children_elements:
+            return
+
+        ifc_file = tool.Ifc.get()
+        parent_opening = parent_element.FillsVoids[0].RelatingOpeningElement
+        parent_opening_rep = ifcopenshell.util.representation.get_representation(
+            parent_opening, "Model", "Body", "MODEL_VIEW"
+        )
+        if parent_opening_rep is None:
+            return
+        parent_opening_rep = ifcopenshell.util.representation.resolve_representation(parent_opening_rep)
+
+        for child in children_elements:
+            if getattr(child, "FillsVoids", None):
+                ifcopenshell.api.feature.remove_feature(ifc_file, feature=child.FillsVoids[0].RelatingOpeningElement)
+            child_obj = tool.Ifc.get_object(child)
+            if child_obj is None:
+                continue
+
+            new_opening = ifcopenshell.api.root.create_entity(
+                ifc_file,
+                ifc_class="IfcOpeningElement",
+                predefined_type="OPENING",
+                name="Opening",
+            )
+            ifcopenshell.api.geometry.edit_object_placement(
+                ifc_file,
+                product=new_opening,
+                matrix=np.array(child_obj.matrix_world),
+                is_si=True,
+            )
+            mapped_representation = ifcopenshell.api.geometry.map_representation(
+                ifc_file, representation=parent_opening_rep
+            )
+            ifcopenshell.api.geometry.assign_representation(
+                ifc_file, product=new_opening, representation=mapped_representation
+            )
+            ifcopenshell.api.feature.add_feature(ifc_file, feature=new_opening, element=host)
+            ifcopenshell.api.feature.add_filling(ifc_file, opening=new_opening, element=child)
+
+        # Openings affect every sub-element of an aggregate, not just the named host.
+        voided_objs: list[bpy.types.Object] = []
+        host_obj = tool.Ifc.get_object(host)
+        if host_obj is not None:
+            voided_objs.append(host_obj)
+        for subelement in tool.Aggregate.get_parts_recursively(host):
+            subobj = tool.Ifc.get_object(subelement)
+            if subobj is not None:
+                voided_objs.append(subobj)
+
+        for voided_obj in voided_objs:
+            if not voided_obj.data:
+                continue
+            voided_element = tool.Ifc.get_entity(voided_obj)
+            if voided_element is None:
+                continue
+            context = tool.Geometry.get_active_representation_context(voided_obj)
+            representation = tool.Geometry.get_representation_by_context(voided_element, context)
+            if representation is None:
+                continue
+            bonsai.core.geometry.switch_representation(
+                tool.Ifc, tool.Geometry, obj=voided_obj, representation=representation
+            )
 
     @classmethod
     def replace_object_ifc_representation(
@@ -1949,7 +2049,7 @@ class Model(bonsai.core.tool.Model):
 
         bm = bmesh.new()
         bm.from_mesh(mesh)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
         bmesh.ops.delete(bm, geom=bm.faces, context="FACES_ONLY")
 
         # https://docs.blender.org/api/blender_python_api_2_63_8/bmesh.html#CustomDataAccess
@@ -2177,7 +2277,7 @@ class Model(bonsai.core.tool.Model):
 
         bm = bmesh.new()
         bm.from_mesh(mesh)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=VTX_PRECISION)
         bmesh.ops.delete(bm, geom=bm.faces, context="FACES_ONLY")
 
         # https://docs.blender.org/api/blender_python_api_2_63_8/bmesh.html#CustomDataAccess
@@ -2396,6 +2496,12 @@ class Model(bonsai.core.tool.Model):
 
     @classmethod
     def get_existing_x_angle(cls, extrusion: ifcopenshell.entity_instance) -> float:
+        """Signed slope of the extrusion's direction in the y-z plane (radians).
+
+        Assumes extrusion directions lie in the y-z plane (LAYER2 wall and
+        LAYER3 slab convention). For inverted extrusions (z ≤ 0), adds π to
+        preserve angular continuity for callers consuming the angle via
+        cos/sin."""
         x, y, z = extrusion.ExtrudedDirection.DirectionRatios
         vector = Vector((0, 1))
         x_angle = vector.angle_signed(Vector((y, z)))
@@ -2744,6 +2850,20 @@ class Model(bonsai.core.tool.Model):
 
     @classmethod
     def recreate_wall(cls, element: ifcopenshell.entity_instance, obj: bpy.types.Object) -> None:
+        # Curved fillet-corner walls own a hand-built banana body that
+        # ``regenerate_wall_representation`` would flatten — it reads the
+        # axis as a 2-point reference line and builds a straight extrusion.
+        # Instead rebuild the curve in place: ``regenerate_fillet_corner_wall``
+        # keeps radius + placement from the pset / current ``ObjectPlacement``
+        # while picking up new thickness / height from the wall type, which
+        # is what we want when a type-property edit triggered this call.
+        if ifcopenshell.util.element.get_pset(element, "BBIM_Wall", "IsFilletCorner"):
+            # Lazy import: ``tool.Model`` loads before ``bim/module/model``
+            # at addon enable; a module-level import would cycle.
+            from bonsai.bim.module.model.wall import regenerate_fillet_corner_wall
+
+            regenerate_fillet_corner_wall(element, obj)
+            return
         rep = ifcopenshell.api.geometry.regenerate_wall_representation(tool.Ifc.get(), element)
         bonsai.core.geometry.switch_representation(
             tool.Ifc,

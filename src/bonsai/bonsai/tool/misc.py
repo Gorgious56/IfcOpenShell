@@ -32,6 +32,7 @@ from mathutils import Matrix, Vector
 import bonsai.core.root
 import bonsai.core.tool
 import bonsai.tool as tool
+from bonsai.tool.cad import BISECT_TOLERANCE
 
 if TYPE_CHECKING:
     from bonsai.bim.module.misc.prop import BIMMiscProperties
@@ -348,7 +349,7 @@ class Misc(bonsai.core.tool.Misc):
                     bm2 = bm.copy()
                     geom = bm1.verts[:] + bm1.edges[:] + bm1.faces[:]
                     bisect1 = bmesh.ops.bisect_plane(
-                        bm1, geom=geom, dist=0.0001, plane_co=co, plane_no=no, clear_inner=True
+                        bm1, geom=geom, dist=BISECT_TOLERANCE, plane_co=co, plane_no=no, clear_inner=True
                     )
                     if not bisect1["geom"] or not [g for g in bisect1["geom"] if isinstance(g, bmesh.types.BMFace)]:
                         new_bms.append(bm)
@@ -357,7 +358,7 @@ class Misc(bonsai.core.tool.Misc):
                     bmesh.ops.triangle_fill(bm1, use_dissolve=True, edges=edges)
                     geom = bm2.verts[:] + bm2.edges[:] + bm2.faces[:]
                     bisect2 = bmesh.ops.bisect_plane(
-                        bm2, geom=geom, dist=0.0001, plane_co=co, plane_no=no, clear_outer=True
+                        bm2, geom=geom, dist=BISECT_TOLERANCE, plane_co=co, plane_no=no, clear_outer=True
                     )
                     if not bisect2["geom"] or not [g for g in bisect2["geom"] if isinstance(g, bmesh.types.BMFace)]:
                         new_bms.append(bm)

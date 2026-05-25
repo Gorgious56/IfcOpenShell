@@ -270,3 +270,54 @@ class TestGetScreenUpWorld(NewFile):
 
         ctx = self._ctx(Matrix.Identity(4))
         assert subject.get_screen_up_world(ctx) == Vector((0.0, 1.0, 0.0))
+
+
+class TestAreViewportGizmosEnabled(NewFile):
+    """``are_viewport_gizmos_enabled`` is the single read of the addon-preference
+    toggle every Bonsai gizmo ``poll()`` and decorator ``draw()`` guards on.
+    Pin the contract that it returns the underlying ``gizmos.draw_gizmos_in_3d_viewport``
+    pref so callers can rely on one named function instead of inlining the path."""
+
+    def test_returns_true_when_pref_enabled(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        prefs = SimpleNamespace(gizmos=SimpleNamespace(draw_gizmos_in_3d_viewport=True))
+        with patch.object(subject, "get_addon_preferences", return_value=prefs):
+            assert subject.are_viewport_gizmos_enabled() is True
+
+    def test_returns_false_when_pref_disabled(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        prefs = SimpleNamespace(gizmos=SimpleNamespace(draw_gizmos_in_3d_viewport=False))
+        with patch.object(subject, "get_addon_preferences", return_value=prefs):
+            assert subject.are_viewport_gizmos_enabled() is False
+
+
+class TestModifierPsetPredicatesReturnBool(NewFile):
+    """``Modifier.is_door/window/roof/railing/stair`` are annotated ``-> bool``
+    but delegate to ``tool.Pset.get_element_pset``, which returns
+    ``Optional[entity_instance]``. The predicates MUST convert to a proper
+    boolean so callers asserting ``is True`` / ``is False`` see what they
+    expect — otherwise a missing pset surfaces as ``None`` and silently
+    breaks identity-comparison assertions."""
+
+    _PREDICATES = ["is_door", "is_window", "is_roof", "is_railing", "is_stair"]
+
+    @pytest.mark.parametrize("predicate_name", _PREDICATES)
+    def test_returns_false_when_pset_absent(self, predicate_name):
+        from unittest.mock import patch
+
+        predicate = getattr(subject.Modifier, predicate_name)
+        with patch.object(tool.Pset, "get_element_pset", return_value=None):
+            assert predicate(object()) is False
+
+    @pytest.mark.parametrize("predicate_name", _PREDICATES)
+    def test_returns_true_when_pset_present(self, predicate_name):
+        from unittest.mock import patch
+
+        predicate = getattr(subject.Modifier, predicate_name)
+        sentinel_pset = object()
+        with patch.object(tool.Pset, "get_element_pset", return_value=sentinel_pset):
+            assert predicate(object()) is True

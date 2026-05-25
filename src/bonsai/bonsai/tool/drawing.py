@@ -63,6 +63,7 @@ import bonsai.core.root
 import bonsai.core.tool
 import bonsai.core.type
 import bonsai.tool as tool
+from bonsai.tool.cad import BISECT_TOLERANCE, WELD_TOLERANCE
 
 if TYPE_CHECKING:
     from bonsai.bim.module.drawing.prop import (
@@ -322,7 +323,7 @@ class Drawing(bonsai.core.tool.Drawing):
             new_verts = list(outer_shell.exterior.coords)
             bm_verts = [bm.verts.new(v + (0,)) for v in new_verts]
             bm_edges = [bm.edges.new([bm_verts[i], bm_verts[i + 1]]) for i in range(len(new_verts) - 1)]
-            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=WELD_TOLERANCE)
 
             tool.Blender.apply_bmesh(obj.data, bm, obj)
             cloud.location = Vector((0, 0, 0))
@@ -2634,7 +2635,7 @@ class Drawing(bonsai.core.tool.Drawing):
         global_offset = camera.matrix_world.col[2].xyz * -camera.data.clip_start
 
         # Run the bisect operation
-        results = bmesh.ops.bisect_plane(bm, geom=geom, dist=0.0001, plane_co=plane_co, plane_no=plane_no)
+        results = bmesh.ops.bisect_plane(bm, geom=geom, dist=BISECT_TOLERANCE, plane_co=plane_co, plane_no=plane_no)
 
         vert_map = {}
         verts = []
@@ -2664,7 +2665,7 @@ class Drawing(bonsai.core.tool.Drawing):
 
         # Run the bisect operation
         geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
-        results = bmesh.ops.bisect_plane(bm, geom=geom, dist=0.0001, plane_co=plane_co, plane_no=plane_no)
+        results = bmesh.ops.bisect_plane(bm, geom=geom, dist=BISECT_TOLERANCE, plane_co=plane_co, plane_no=plane_no)
 
         vert_map: dict[int, int] = {}
         verts: list[Vector] = []
@@ -2730,14 +2731,16 @@ class Drawing(bonsai.core.tool.Drawing):
             return float(value)
         except:
             pass  # Perhaps it's imperial?
-        l = lark.Lark("""start: feet? "-"? inches?
+        l = lark.Lark(
+            """start: feet? "-"? inches?
                     feet: NUMBER? "-"? fraction? "'"
                     inches: NUMBER? "-"? fraction? "\\""
                     fraction: NUMBER "/" NUMBER
                     %import common.NUMBER
                     %import common.WS
                     %ignore WS // Disregard spaces in text
-                 """)
+                 """
+        )
 
         try:
             start = l.parse(value)

@@ -645,16 +645,7 @@ def convert_unit(value: float, from_unit: ifcopenshell.entity_instance, to_unit:
 
 
 def mm_to_m(value: float) -> float:
-    """Convert a millimetre value to metres.
-
-    Shortcut for the common pattern of expressing hard-coded millimetre
-    constants in code that otherwise works in metres (e.g. geometry-API
-    defaults). The result is in metres; divide by the value returned by
-    :func:`calculate_unit_scale` to land in IFC project units.
-
-    :param value: The numeric value in millimetres.
-    :return: The converted value in metres.
-    """
+    """Convert a millimetre value to metres."""
     return value / 1000
 
 

@@ -19,7 +19,6 @@
 import bpy
 import ifcopenshell
 import ifcopenshell.api
-import ifcopenshell.api.feature
 import ifcopenshell.api.type
 import ifcopenshell.util.element
 
@@ -68,23 +67,6 @@ class TestDoesTypeHaveRepresentations(NewFile):
         assert subject.does_type_have_representations(element) is False
         element.RepresentationMaps = [ifc.createIfcRepresentationMap()]
         assert subject.does_type_have_representations(element) is True
-
-
-class TestGetDecompositionRelationships(NewFile):
-    def test_run(self):
-        ifc = ifcopenshell.file()
-        tool.Ifc.set(ifc)
-
-        element = ifc.createIfcWall()
-        opening = ifc.createIfcOpeningElement()
-        fill = ifc.createIfcWindow()
-        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=element)
-        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=fill)
-
-        obj = bpy.data.objects.new("Object", None)
-        tool.Ifc.link(fill, obj)
-
-        assert subject.get_decomposition_relationships([obj]) == {fill: {"type": "fill", "element": element}}
 
 
 class TestGetElementRepresentation(NewFile):

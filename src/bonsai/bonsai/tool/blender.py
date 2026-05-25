@@ -99,6 +99,19 @@ VIEWPORT_ATTRIBUTES = [
 
 OBJECT_DATA_TYPE = Union[bpy.types.Mesh, bpy.types.Curve, bpy.types.Camera]
 
+_RAILING_MODIFIER_IFC_CLASSES = ("IfcRailing", "IfcRailingType")
+_STAIR_MODIFIER_IFC_CLASSES = (
+    "IfcStairFlight",
+    "IfcStairFlightType",
+    "IfcMember",
+    "IfcMemberType",
+    "IfcStair",
+    "IfcStairType",
+)
+_WINDOW_MODIFIER_IFC_CLASSES = ("IfcWindow", "IfcWindowType", "IfcWindowStyle")
+_DOOR_MODIFIER_IFC_CLASSES = ("IfcDoor", "IfcDoorType", "IfcDoorStyle")
+_ROOF_MODIFIER_IFC_CLASSES = ("IfcRoof", "IfcRoofType")
+
 
 class Blender(bonsai.core.tool.Blender):
     OBJECT_TYPES_THAT_SUPPORT_EDIT_MODE = ("MESH", "CURVE", "SURFACE", "META", "FONT", "LATTICE", "ARMATURE")
@@ -416,6 +429,74 @@ class Blender(bonsai.core.tool.Blender):
     def set_viewport_tool(cls, tool_name: str) -> None:
         with bpy.context.temp_override(**cls.get_viewport_context()):
             bpy.ops.wm.tool_set_by_id(name=tool_name)
+
+    @classmethod
+    def are_viewport_gizmos_enabled(cls) -> bool:
+        """Central gate every Bonsai gizmo poll / decorator draw checks before
+        rendering. Centralises the read of
+        ``gizmos.draw_gizmos_in_3d_viewport`` from addon preferences."""
+        return cls.get_addon_preferences().gizmos.draw_gizmos_in_3d_viewport
+
+    class DecoratorColors(NamedTuple):
+        selected: tuple
+        unselected: tuple
+        special: tuple
+        error: tuple
+        background: tuple
+
+    @classmethod
+    def get_decorator_colors(cls) -> Blender.DecoratorColors:
+        """The five ``decorator_color_*`` fields read together so each viewport
+        decorator's draw callback resolves them in one call instead of five."""
+        prefs = cls.get_addon_preferences()
+        return cls.DecoratorColors(
+            selected=prefs.decorator_color_selected,
+            unselected=prefs.decorator_color_unselected,
+            special=prefs.decorator_color_special,
+            error=prefs.decorator_color_error,
+            background=prefs.decorator_color_background,
+        )
+
+    class ViewportDecorator:
+        """Shared ``SpaceView3D.draw_handler_add`` lifecycle for feature decorators.
+
+        Single-handler subclasses set ``draw_method`` (default ``"draw"``); the
+        handler binds at ``POST_VIEW``. Multi-handler subclasses set
+        ``draw_methods`` to a tuple of ``(method_name, phase)`` pairs; when it
+        is non-``None`` it supersedes ``draw_method``.
+
+        Decorators whose ``install`` must accept extra arguments (e.g. a callback
+        or a precomputed bmesh) override ``install`` themselves."""
+
+        draw_method: str = "draw"
+        draw_methods: tuple[tuple[str, str], ...] | None = None
+
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+            cls.handlers = []
+            cls.is_installed = False
+
+        @classmethod
+        def install(cls, context: bpy.types.Context) -> None:
+            if cls.is_installed:
+                cls.uninstall()
+            handler = cls()
+            bindings = cls.draw_methods if cls.draw_methods is not None else ((cls.draw_method, "POST_VIEW"),)
+            for method_name, phase in bindings:
+                cls.handlers.append(
+                    bpy.types.SpaceView3D.draw_handler_add(getattr(handler, method_name), (context,), "WINDOW", phase)
+                )
+            cls.is_installed = True
+
+        @classmethod
+        def uninstall(cls) -> None:
+            for h in cls.handlers:
+                try:
+                    bpy.types.SpaceView3D.draw_handler_remove(h, "WINDOW")
+                except ValueError:
+                    pass
+            cls.handlers.clear()
+            cls.is_installed = False
 
     @classmethod
     def is_view_top_down(cls, context: bpy.types.Context, threshold: float = 0.9659) -> bool:
@@ -1202,25 +1283,23 @@ class Blender(bonsai.core.tool.Blender):
 
         @classmethod
         def is_eligible_for_railing_modifier(cls, obj: bpy.types.Object) -> bool:
-            return tool.Blender.is_object_an_ifc_class(obj, ("IfcRailing", "IfcRailingType"))
+            return tool.Blender.is_object_an_ifc_class(obj, _RAILING_MODIFIER_IFC_CLASSES)
 
         @classmethod
         def is_eligible_for_stair_modifier(cls, obj: bpy.types.Object) -> bool:
-            return tool.Blender.is_object_an_ifc_class(
-                obj, ("IfcStairFlight", "IfcStairFlightType", "IfcMember", "IfcMemberType", "IfcStair", "IfcStairType")
-            )
+            return tool.Blender.is_object_an_ifc_class(obj, _STAIR_MODIFIER_IFC_CLASSES)
 
         @classmethod
         def is_eligible_for_window_modifier(cls, obj: bpy.types.Object) -> bool:
-            return tool.Blender.is_object_an_ifc_class(obj, ("IfcWindow", "IfcWindowType", "IfcWindowStyle"))
+            return tool.Blender.is_object_an_ifc_class(obj, _WINDOW_MODIFIER_IFC_CLASSES)
 
         @classmethod
         def is_eligible_for_door_modifier(cls, obj: bpy.types.Object) -> bool:
-            return tool.Blender.is_object_an_ifc_class(obj, ("IfcDoor", "IfcDoorType", "IfcDoorStyle"))
+            return tool.Blender.is_object_an_ifc_class(obj, _DOOR_MODIFIER_IFC_CLASSES)
 
         @classmethod
         def is_eligible_for_roof_modifier(cls, obj: bpy.types.Object) -> bool:
-            return tool.Blender.is_object_an_ifc_class(obj, ("IfcRoof", "IfcRoofType"))
+            return tool.Blender.is_object_an_ifc_class(obj, _ROOF_MODIFIER_IFC_CLASSES)
 
         @classmethod
         def _get_array_pset(cls, element: entity_instance) -> dict | None:
@@ -1258,65 +1337,24 @@ class Blender(bonsai.core.tool.Blender):
             return parent_guid is not None and parent_guid != element.GlobalId
 
         @classmethod
-        def count_implicit_array_children_in_selection(cls, selected_objects: set[bpy.types.Object]) -> int:
-            """Children of selected array parents that aren't themselves in the selection.
-
-            For each array parent in ``selected_objects``, count children across every
-            stacked layer that the user didn't also select. Set dedups across layers
-            so children referenced by multiple layers count once."""
-            implicit_children: set[bpy.types.Object] = set()
-            for obj in selected_objects:
-                element = tool.Ifc.get_entity(obj)
-                if not element or not cls.is_array(element):
-                    continue
-                for child_obj in cls.Array.get_all_children_objects(element):
-                    if child_obj not in selected_objects:
-                        implicit_children.add(child_obj)
-            return len(implicit_children)
-
-        @classmethod
-        def has_blocked_array_child_in_selection(cls, selected_objects: set[bpy.types.Object]) -> bool:
-            """True if any array child in the selection has its parent *outside* the selection.
-
-            Such children get silently skipped by the IFC delete pipeline; a consumer
-            can use this predicate to surface the constraint in a modal popup before
-            the destructive operation runs. Orphan or unresolvable parent GUIDs are
-            tolerated (caught at by_guid)."""
-            for obj in selected_objects:
-                element = tool.Ifc.get_entity(obj)
-                if not element or not cls.is_array_child(element):
-                    continue
-                pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
-                if not pset:
-                    continue
-                try:
-                    parent_element = tool.Ifc.get().by_guid(pset["Parent"])
-                except RuntimeError:
-                    continue
-                parent_obj = tool.Ifc.get_object(parent_element)
-                if parent_obj not in selected_objects:
-                    return True
-            return False
-
-        @classmethod
         def is_railing(cls, element: entity_instance) -> bool:
-            return tool.Pset.get_element_pset(element, "BBIM_Railing")
+            return tool.Pset.get_element_pset(element, "BBIM_Railing") is not None
 
         @classmethod
         def is_roof(cls, element: entity_instance) -> bool:
-            return tool.Pset.get_element_pset(element, "BBIM_Roof")
+            return tool.Pset.get_element_pset(element, "BBIM_Roof") is not None
 
         @classmethod
         def is_window(cls, element: entity_instance) -> bool:
-            return tool.Pset.get_element_pset(element, "BBIM_Window")
+            return tool.Pset.get_element_pset(element, "BBIM_Window") is not None
 
         @classmethod
         def is_door(cls, element: entity_instance) -> bool:
-            return tool.Pset.get_element_pset(element, "BBIM_Door")
+            return tool.Pset.get_element_pset(element, "BBIM_Door") is not None
 
         @classmethod
         def is_stair(cls, element: entity_instance) -> bool:
-            return tool.Pset.get_element_pset(element, "BBIM_Stair")
+            return tool.Pset.get_element_pset(element, "BBIM_Stair") is not None
 
         @classmethod
         def is_wall(cls, element: entity_instance) -> bool:
@@ -1330,24 +1368,27 @@ class Blender(bonsai.core.tool.Blender):
             return tool.Model.get_usage_type(element) == "LAYER2"
 
         @classmethod
-        def is_pipe_segment(cls, element: entity_instance) -> bool:
-            """Total predicate for the pipe-segment dimension gizmo.
+        def is_slab(cls, element: entity_instance) -> bool:
+            """A slab is host-eligible for the parametric add-opening gizmo if
+            it is an IfcSlab with LAYER3 usage.
 
-            Like walls, pipe segments have no proprietary BBIM_PipeSegment pset
-            — parametric length lives in the standard IFC extrusion depth and
-            is mutated via ``DumbProfileJoiner.set_depth``. ``entity_instance.is_a``
-            returns False for non-matching types without raising, so the
-            predicate-totality test passes by construction."""
+            Slabs carry no proprietary BBIM_Slab pset — their parametric state
+            lives in standard IFC (extrusion depth, IfcMaterialLayerSetUsage
+            with LayerSetDirection AXIS3). Any LAYER3 slab qualifies."""
+            if not element.is_a("IfcSlab"):
+                return False
+            return tool.Model.get_usage_type(element) == "LAYER3"
+
+        @classmethod
+        def is_pipe_segment(cls, element: entity_instance) -> bool:
             return element.is_a("IfcPipeSegment")
 
         @classmethod
         def is_duct_segment(cls, element: entity_instance) -> bool:
-            """Total predicate for the duct-segment dimension gizmo. Mirror of
-            the pipe-segment predicate above."""
             return element.is_a("IfcDuctSegment")
 
         @classmethod
-        def is_editing_railing_path(cls, obj: bpy.types.Object):
+        def is_editing_railing_path(cls, obj: bpy.types.Object) -> bool:
             props = tool.Model.get_railing_props(obj)
             return props.is_editing_path
 
@@ -1420,6 +1461,33 @@ class Blender(bonsai.core.tool.Blender):
                     yield from cls.get_children_objects(array_modifier)
 
             @classmethod
+            def get_parent_element(cls, element: entity_instance) -> entity_instance | None:
+                """Inverse of ``get_all_children_objects``: resolve an array
+                element back to its parent entity. Returns ``None`` when the
+                element isn't part of a Bonsai parametric array, or the stored
+                Parent GUID does not resolve in the current file (this is a
+                data-integrity warning and is logged to the console)."""
+                pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+                if not pset:
+                    return None
+                parent_guid = pset["Parent"]
+                try:
+                    return tool.Ifc.get().by_guid(parent_guid)
+                except RuntimeError:
+                    print(
+                        f"BBIM_Array.Parent GUID {parent_guid!r} on {element} does not resolve "
+                        f"in the current file — array integrity may be broken."
+                    )
+                    return None
+
+            @classmethod
+            def get_parent_object(cls, element: entity_instance) -> bpy.types.Object | None:
+                parent_element = cls.get_parent_element(element)
+                if parent_element is None:
+                    return None
+                return tool.Ifc.get_object(parent_element)
+
+            @classmethod
             def get_modifiers_data(
                 cls, parent_element: ifcopenshell.entity_instance
             ) -> Generator[dict[str, Any], None, None]:
@@ -1433,6 +1501,34 @@ class Blender(bonsai.core.tool.Blender):
                     child_obj = tool.Blender.get_object_from_guid(child_guid)
                     if child_obj:
                         yield child_obj
+
+            @classmethod
+            def get_child_layer_index(cls, child_element: entity_instance) -> int | None:
+                """Index of the layer that produced ``child_element``, or ``None``
+                if the child is unparented, missing from the parent's data, or
+                the parent's pset is unreadable. Total: never raises."""
+                pset = ifcopenshell.util.element.get_pset(child_element, "BBIM_Array")
+                if not pset:
+                    return None
+                parent_guid = pset.get("Parent")
+                if not parent_guid or parent_guid == child_element.GlobalId:
+                    return None
+                try:
+                    parent_element = tool.Ifc.get().by_guid(parent_guid)
+                except RuntimeError:
+                    return None
+                data_text = ifcopenshell.util.element.get_pset(parent_element, "BBIM_Array", "Data")
+                if not data_text:
+                    return None
+                try:
+                    layers = json.loads(data_text)
+                except (ValueError, TypeError):
+                    return None
+                child_guid = child_element.GlobalId
+                for i, layer in enumerate(layers):
+                    if child_guid in layer.get("children", []):
+                        return i
+                return None
 
     class Attribute:
         @classmethod

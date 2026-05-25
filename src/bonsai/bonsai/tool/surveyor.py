@@ -21,6 +21,7 @@ import ifcopenshell.util.geolocation
 import ifcopenshell.util.unit
 import numpy as np
 import numpy.typing as npt
+from mathutils import Matrix
 
 import bonsai.core.tool
 import bonsai.tool as tool
@@ -48,3 +49,14 @@ class Surveyor(bonsai.core.tool.Surveyor):
                 )
             )
         return matrix
+
+    @classmethod
+    def get_z_rotation(cls, obj: bpy.types.Object) -> float:
+        return obj.matrix_world.decompose()[1].to_euler().z
+
+    @classmethod
+    def set_z_rotation(cls, obj: bpy.types.Object, z: float) -> None:
+        loc, rot, scale = obj.matrix_world.decompose()
+        euler = rot.to_euler()
+        euler.z = z
+        obj.matrix_world = Matrix.Translation(loc) @ euler.to_matrix().to_4x4() @ Matrix.Diagonal(scale).to_4x4()

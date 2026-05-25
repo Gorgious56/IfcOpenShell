@@ -27,9 +27,8 @@ declarative — they get a dict, not an IFC walk."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
-import ifcopenshell
 import ifcopenshell.util.representation
 import ifcopenshell.util.unit
 
@@ -40,9 +39,14 @@ if TYPE_CHECKING:
     import bpy
 
 
+class SlabGeometry(TypedDict):
+    depth: float
+    x_angle: float
+
+
 class Slab(bonsai.core.tool.Slab):
     @classmethod
-    def read_geometry(cls, obj: bpy.types.Object) -> dict | None:
+    def read_geometry(cls, obj: bpy.types.Object) -> SlabGeometry | None:
         """Live-read slab parametric geometry as a dict, or ``None`` if the
         object is not a LAYER3 extruded slab.
 

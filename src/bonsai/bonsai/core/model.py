@@ -34,6 +34,15 @@ if TYPE_CHECKING:
     OffsetType = Literal["CENTER", "EXTERIOR", "INTERIOR"]
 
 
+# Arc sample count for fillet preview polylines. 24 samples produces a visually
+# smooth arc at common viewport scales without bloating the GPU batch.
+FILLET_DEFAULT_ARC_RESOLUTION = 24
+# Dot-product floor for treating two segments as parallel. cos(2°) ≈ 0.9994 —
+# below this the projected intersection is too sensitive to floating-point
+# noise to be useful as a fillet apex.
+_FILLET_PARALLEL_DOT_THRESHOLD = 0.9994
+
+
 def unjoin_walls(
     ifc: type[tool.Ifc],
     blender: type[tool.Blender],
@@ -471,8 +480,8 @@ def compute_fillet_polylines(
     seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
     radius: float,
-    arc_resolution: int = 24,
-    parallel_threshold: float = 0.9994,
+    arc_resolution: int = FILLET_DEFAULT_ARC_RESOLUTION,
+    parallel_threshold: float = _FILLET_PARALLEL_DOT_THRESHOLD,
 ) -> dict:
     """Preview polylines for a circular fillet at the junction of two axes.
 

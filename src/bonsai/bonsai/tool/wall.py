@@ -290,7 +290,7 @@ class Wall(bonsai.core.tool.Wall):
         wall_a_obj: bpy.types.Object,
         wall_b_obj: bpy.types.Object,
         radius: float,
-        arc_resolution: int = 24,
+        arc_resolution: int = bonsai.core.model.FILLET_DEFAULT_ARC_RESOLUTION,
     ) -> dict | None:
         """Compute fillet geometry between two walls in world space.
 

@@ -30,6 +30,7 @@ import ifcopenshell.util.element
 import ifcopenshell.util.representation
 import ifcopenshell.util.shape_builder
 import numpy as np
+import pytest
 from ifcopenshell.util.shape_builder import ShapeBuilder, V
 
 import bonsai.core.tool
@@ -41,6 +42,93 @@ from test.bim.bootstrap import NewFile
 class TestImplementsTool(NewFile):
     def test_run(self):
         assert isinstance(subject(), bonsai.core.tool.Model)
+
+
+class TestResolveActivePropsForEdit(NewFile):
+    """Branch coverage for the active-object + is_editing + (optional) subtype
+    guard helper. Operators that delegate their guard preamble here rely on
+    each branch returning ``None`` cleanly so they can ``return {"CANCELLED"}``.
+
+    The helper only touches ``context.active_object`` from the bpy surface; a
+    ``Mock(spec=bpy.types.Context)`` is sufficient to drive each branch
+    without instantiating real objects.
+    """
+
+    @staticmethod
+    def _make_context(active_object):
+        from unittest.mock import Mock
+
+        context = Mock(spec=bpy.types.Context)
+        context.active_object = active_object
+        return context
+
+    def test_returns_none_when_no_active_object(self):
+        context = self._make_context(active_object=None)
+
+        # props_getter must NOT be invoked when there's no active object,
+        # so a raise here would fail the test loudly.
+        def boom(_obj):
+            raise AssertionError("props_getter must not be called without an active object")
+
+        assert subject.resolve_active_props_for_edit(context, boom) is None
+
+    def test_returns_none_when_props_not_editing(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        obj = Mock(spec=bpy.types.Object)
+        context = self._make_context(active_object=obj)
+        props = SimpleNamespace(is_editing=False)
+
+        assert subject.resolve_active_props_for_edit(context, lambda _o: props) is None
+
+    def test_returns_tuple_when_editing_and_no_subtype_constraint(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        obj = Mock(spec=bpy.types.Object)
+        context = self._make_context(active_object=obj)
+        props = SimpleNamespace(is_editing=True)
+
+        result = subject.resolve_active_props_for_edit(context, lambda _o: props)
+        assert result == (obj, props)
+
+    def test_returns_none_when_subtype_does_not_match(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        obj = Mock(spec=bpy.types.Object)
+        context = self._make_context(active_object=obj)
+        props = SimpleNamespace(is_editing=True, kind="FOO")
+
+        result = subject.resolve_active_props_for_edit(context, lambda _o: props, subtype=("kind", "BAR"))
+        assert result is None
+
+    def test_returns_tuple_when_subtype_matches(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        obj = Mock(spec=bpy.types.Object)
+        context = self._make_context(active_object=obj)
+        props = SimpleNamespace(is_editing=True, kind="BAR")
+
+        result = subject.resolve_active_props_for_edit(context, lambda _o: props, subtype=("kind", "BAR"))
+        assert result == (obj, props)
+
+    def test_returns_none_when_subtype_attr_missing_on_props(self):
+        """A typo'd ``subtype`` attr should fail closed (None), not silently
+        succeed — otherwise a refactor that renames the props field would
+        accept every input and pass the guard."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        obj = Mock(spec=bpy.types.Object)
+        context = self._make_context(active_object=obj)
+        # is_editing True but the props lacks the requested ``kind`` attr.
+        props = SimpleNamespace(is_editing=True)
+
+        result = subject.resolve_active_props_for_edit(context, lambda _o: props, subtype=("kind", "BAR"))
+        assert result is None
 
 
 class TestGenerateOccurrenceName(NewFile):
@@ -600,7 +688,7 @@ class TestUsingArrays(NewFile):
         bpy.ops.bim.assign_class(ifc_class="IfcActuator", predefined_type="ELECTRICACTUATOR", userdefined_type="")
 
         bpy.ops.bim.add_array()
-        bpy.ops.bim.enable_editing_array(item=0)
+        bpy.ops.bim.enable_editing_array_item(item=0)
         props = tool.Model.get_array_props(obj)
         props.count = 4
         props.x = 4
@@ -609,7 +697,7 @@ class TestUsingArrays(NewFile):
 
         if add_second_layer:
             bpy.ops.bim.add_array()
-            bpy.ops.bim.enable_editing_array(item=1)
+            bpy.ops.bim.enable_editing_array_item(item=1)
             props = tool.Model.get_array_props(obj)
             props.count = 3
             props.y = 4
@@ -667,6 +755,248 @@ class TestUsingArrays(NewFile):
             element = tool.Ifc.get_entity(obj)
             pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
             assert pset is None, (obj, pset)
+
+    def test_handle_array_on_copied_element_detaches_copy_only(self):
+        """The detach branch (``array_data=None``) of the post-copy hook must
+        remove the BBIM_Array pset from the COPY without touching the source.
+
+        Exercises the contract that ``DumbWallJoiner.duplicate_wall`` relies on
+        when splitting a wall that is part of an array: the split-off half is
+        produced via ``bonsai.core.root.copy_class`` (which copies the pset
+        verbatim) and then scrubbed via this hook. A regression here would
+        cause the split-off wall to pose as an array child of the source."""
+        import bonsai.core.root
+
+        self.setup_array()
+        parent_obj = bpy.context.active_object
+        parent_element = tool.Ifc.get_entity(parent_obj)
+        assert ifcopenshell.util.element.get_pset(parent_element, "BBIM_Array") is not None
+
+        # Mimic the wall-split duplicate path: clone bpy obj, then copy_class
+        # to create a new IFC entity that inherits the source's BBIM_Array pset.
+        copy_obj = parent_obj.copy()
+        copy_obj.data = parent_obj.data.copy()
+        for collection in parent_obj.users_collection:
+            collection.objects.link(copy_obj)
+        bonsai.core.root.copy_class(tool.Ifc, tool.Collector, tool.Geometry, tool.Root, obj=copy_obj)
+        copy_element = tool.Ifc.get_entity(copy_obj)
+        assert copy_element is not None
+        assert ifcopenshell.util.element.get_pset(copy_element, "BBIM_Array") is not None
+
+        subject.handle_array_on_copied_element(copy_element, array_data=None)
+
+        assert ifcopenshell.util.element.get_pset(copy_element, "BBIM_Array") is None
+        # Source parent's pset must remain intact — its array keeps working.
+        assert ifcopenshell.util.element.get_pset(parent_element, "BBIM_Array") is not None
+
+
+class TestMirrorParentVoidFillingsToChildren(NewFile):
+    """Array children of a filling inherit their parent's void+filling chain.
+
+    The contract: when the array parent is a door / window / generic filling
+    that voids a host element (wall, slab, …), each child element receives
+    its own IfcOpeningElement cut into the same host, sharing the parent's
+    opening representation via a MappedRepresentation. Without this, an
+    arrayed door appears to pass through solid wall material — semantically
+    invalid for any downstream IFC consumer (validators, clash, schedules).
+    """
+
+    def _setup_door_in_wall(self):
+        bpy.ops.bim.create_project()
+        bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 1))
+        wall_obj = bpy.context.active_object
+        assert wall_obj
+        rprops = tool.Root.get_root_props()
+        rprops.ifc_product = "IfcElement"
+        bpy.ops.bim.assign_class(ifc_class="IfcWall")
+
+        bpy.ops.mesh.primitive_cube_add(size=0.4, location=(0, 0, 0.5))
+        door_obj = bpy.context.active_object
+        assert door_obj
+        rprops.ifc_product = "IfcElement"
+        bpy.ops.bim.assign_class(ifc_class="IfcDoor")
+
+        # Wire FillsVoids manually using the same building blocks the
+        # canonical generator does, minus its wall-axis snap (which expects a
+        # parametric wall with a material layer set — this test uses a bare
+        # mesh wall).
+        import ifcopenshell.api.feature
+        import ifcopenshell.api.root
+
+        from bonsai.bim.module.model.opening import FilledOpeningGenerator
+
+        door = tool.Ifc.get_entity(door_obj)
+        wall = tool.Ifc.get_entity(wall_obj)
+        ifc_file = tool.Ifc.get()
+
+        opening = ifcopenshell.api.root.create_entity(
+            ifc_file, ifc_class="IfcOpeningElement", predefined_type="OPENING", name="Opening"
+        )
+        ifcopenshell.api.geometry.edit_object_placement(
+            ifc_file, product=opening, matrix=np.array(door_obj.matrix_world), is_si=True
+        )
+        representation = FilledOpeningGenerator().generate_opening_from_filling(
+            door, door_obj, opening_thickness_si=0.5
+        )
+        mapped = ifcopenshell.api.geometry.map_representation(ifc_file, representation=representation)
+        ifcopenshell.api.geometry.assign_representation(ifc_file, product=opening, representation=mapped)
+        ifcopenshell.api.feature.add_feature(ifc_file, feature=opening, element=wall)
+        ifcopenshell.api.feature.add_filling(ifc_file, opening=opening, element=door)
+        return wall_obj, door_obj
+
+    def _activate(self, obj):
+        bpy.ops.object.select_all(action="DESELECT")
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+
+    def test_no_op_when_parent_has_no_fills_voids(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        parent = ifc.createIfcWall()
+        child = ifc.createIfcWall()
+
+        subject.mirror_parent_void_fillings_to_children(parent, [child])
+
+        assert not ifc.by_type("IfcOpeningElement")
+        assert not ifc.by_type("IfcRelVoidsElement")
+        assert not ifc.by_type("IfcRelFillsElement")
+
+    def test_no_op_when_children_list_is_empty(self):
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        door = tool.Ifc.get_entity(door_obj)
+        before = len(wall.HasOpenings)
+
+        subject.mirror_parent_void_fillings_to_children(door, [])
+
+        assert len(wall.HasOpenings) == before
+
+    def test_array_through_add_array_creates_openings_for_each_child(self):
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        assert len(wall.HasOpenings) == 1
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        # parent + 2 new children → 3 openings, each linked to a distinct filling
+        assert len(wall.HasOpenings) == 3
+        filling_ids = set()
+        for rel in wall.HasOpenings:
+            opening = rel.RelatedOpeningElement
+            assert opening.HasFillings, "Every child opening must reference its filling"
+            filling_ids.add(opening.HasFillings[0].RelatedBuildingElement.GlobalId)
+        assert len(filling_ids) == 3, "Each child must be the filling of its own opening"
+        assert tool.Ifc.get_entity(door_obj).GlobalId in filling_ids
+
+    def test_opt_out_via_mirror_to_host_false_leaves_host_uncut(self):
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        baseline_openings = len(wall.HasOpenings)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        props.mirror_to_host = False
+        bpy.ops.bim.edit_array(item=0)
+
+        # Only the parent's original opening remains; children are free-floating.
+        assert len(wall.HasOpenings) == baseline_openings
+
+    def test_count_reduction_removes_orphaned_child_openings(self):
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 4
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == 4
+
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 2
+        bpy.ops.bim.edit_array(item=0)
+
+        # Removed children must take their openings with them — host stays symmetric.
+        assert len(wall.HasOpenings) == 2
+
+    def test_multi_layer_array_mirrors_all_children(self):
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=1)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 2
+        props.z = 1.0
+        bpy.ops.bim.edit_array(item=1)
+
+        # 3 (X) * 2 (Z) = 6 doors; each layer's mirror call must fire.
+        assert len(wall.HasOpenings) == 6
+        filling_ids = {
+            rel.RelatedOpeningElement.HasFillings[0].RelatedBuildingElement.GlobalId for rel in wall.HasOpenings
+        }
+        assert len(filling_ids) == 6, "Each of the 6 array instances gets its own opening + filling"
+
+    def test_apply_preserves_child_fillings(self):
+        """Applying the array converts children to standalone elements but their
+        wall-filling relationship must survive — that's the whole point of the
+        opening lifecycle being driven by ``regenerate_array``'s child set, not
+        by the BBIM_Array pset's existence."""
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        door = tool.Ifc.get_entity(door_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == 3
+
+        # Snapshot child GUIDs before apply — afterwards the BBIM_Array pset
+        # (and its children list) is gone, so we need to capture identity now.
+        parent_pset_data = json.loads(ifcopenshell.util.element.get_pset(door, "BBIM_Array", "Data"))
+        child_guids = parent_pset_data[0]["children"]
+        assert len(child_guids) == 2
+        children = [tool.Ifc.get().by_guid(g) for g in child_guids]
+
+        self._activate(door_obj)
+        bpy.ops.bim.apply_array()
+
+        # Apply contract: children lose their BBIM_Array pset (become standalone).
+        for child in children:
+            assert ifcopenshell.util.element.get_pset(child, "BBIM_Array") is None
+
+        # Mirror contract: each former child still cuts and fills its own opening
+        # on the same host wall — the apply path must NOT regress this.
+        assert len(wall.HasOpenings) == 3, "Wall openings must survive array apply"
+        for child in children:
+            assert child.FillsVoids, f"Child {child.GlobalId} lost its filling on apply"
+            host = child.FillsVoids[0].RelatingOpeningElement.VoidsElements[0].RelatingBuildingElement
+            assert host == wall
 
 
 class TestApplyIfcMaterialChanges(NewFile):
@@ -930,3 +1260,67 @@ class TestOffsetWall(NewFile):
         usage.DirectionSense = "NEGATIVE"
         subject.offset_wall(obj, "EXTERIOR")
         assert usage.OffsetFromReferenceLine == 100
+
+
+class TestGetExistingXAngle(NewFile):
+    """``get_existing_x_angle(extrusion)`` returns the signed slope (radians)
+    of an IfcExtrudedAreaSolid's ExtrudedDirection, applying a ``+ pi``
+    correction when the direction points into the negative-z half-space.
+
+    The correction is the difference between this canonical helper and a
+    hand-rolled ``Vector((0, 1)).angle_signed(Vector((y, z)))`` closure;
+    omitting it drifts ``props.x_angle`` on inverted-extrusion walls/slabs."""
+
+    def test_returns_zero_for_vertical_extrusion(self):
+        ifc = ifcopenshell.file()
+        direction = ifc.createIfcDirection((0.0, 0.0, 1.0))
+        extrusion = ifc.createIfcExtrudedAreaSolid(ExtrudedDirection=direction, Depth=1.0)
+        assert subject.get_existing_x_angle(extrusion) == pytest.approx(0.0)
+
+    def test_returns_signed_slope_for_slanted_extrusion(self):
+        # Direction (0, sin(slope), cos(slope)): the (y, z) vector is to the
+        # right of (0, 1); ``mathutils.Vector.angle_signed`` returns positive
+        # when ``other`` lies on the +y side of ``self``, hence +slope.
+        from math import cos, radians, sin
+
+        slope = radians(30)
+        ifc = ifcopenshell.file()
+        direction = ifc.createIfcDirection((0.0, sin(slope), cos(slope)))
+        extrusion = ifc.createIfcExtrudedAreaSolid(ExtrudedDirection=direction, Depth=1.0)
+        assert subject.get_existing_x_angle(extrusion) == pytest.approx(slope)
+
+    def test_applies_pi_correction_for_inverted_extrusion(self):
+        # Direction (0, sin(slope), -cos(slope)): the (y, z) vector is in the
+        # lower-right quadrant relative to (0, 1) → angle_signed = π - slope.
+        # z ≤ 0 triggers the +π correction → result = 2π - slope. Pins both
+        # the raw mathutils sign convention AND the +π shift.
+        from math import cos, pi, radians, sin
+
+        slope = radians(30)
+        ifc = ifcopenshell.file()
+        direction = ifc.createIfcDirection((0.0, sin(slope), -cos(slope)))
+        extrusion = ifc.createIfcExtrudedAreaSolid(ExtrudedDirection=direction, Depth=1.0)
+        assert subject.get_existing_x_angle(extrusion) == pytest.approx(2 * pi - slope)
+
+    def test_ignores_x_component_in_extrusion_direction(self):
+        # The helper operates in the y-z plane only — the x component of
+        # ``DirectionRatios`` is dropped silently. Any change that adds
+        # 3D-slant support must update this test.
+        from math import cos, radians, sin
+
+        slope = radians(30)
+        ifc = ifcopenshell.file()
+        direction = ifc.createIfcDirection((0.5, sin(slope), cos(slope)))
+        extrusion = ifc.createIfcExtrudedAreaSolid(ExtrudedDirection=direction, Depth=1.0)
+        assert subject.get_existing_x_angle(extrusion) == pytest.approx(slope)
+
+    def test_treats_horizontal_extrusion_as_inverted(self):
+        # Boundary: z == 0 (a purely horizontal extrusion) hits the
+        # ``else`` branch via ``if z > 0``. angle_signed((0,1), (1,0)) is
+        # +π/2; the +π correction shifts to +3π/2.
+        from math import pi
+
+        ifc = ifcopenshell.file()
+        direction = ifc.createIfcDirection((0.0, 1.0, 0.0))
+        extrusion = ifc.createIfcExtrudedAreaSolid(ExtrudedDirection=direction, Depth=1.0)
+        assert subject.get_existing_x_angle(extrusion) == pytest.approx(3 * pi / 2)

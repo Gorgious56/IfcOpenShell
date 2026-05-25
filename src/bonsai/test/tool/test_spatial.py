@@ -157,6 +157,53 @@ class TestGetDecomposedElements(NewFile):
         assert subject.get_decomposed_elements(site) == {wall}
 
 
+class TestGetHostElement(NewFile):
+    """``get_host_element`` is the type-agnostic chain-walk. Callers that
+    don't care what type hosts the filling (decomposition-graph builders,
+    BCF exporters, etc.) reach for this; the wall-only narrower shape lives
+    in `get_host_wall`."""
+
+    def test_door_in_wall_returns_wall(self):
+        ifc = ifcopenshell.file()
+        wall = ifc.createIfcWall()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=wall)
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_element(door) == wall
+
+    def test_door_in_slab_returns_slab(self):
+        # Skylight-shaped case: the host is real but isn't a wall. The
+        # general helper returns it; ``get_host_wall`` filters it out.
+        ifc = ifcopenshell.file()
+        slab = ifc.createIfcSlab()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_feature(ifc, feature=opening, element=slab)
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_element(door) == slab
+
+    def test_filling_with_no_opening_returns_none(self):
+        ifc = ifcopenshell.file()
+        door = ifc.createIfcDoor()
+        assert subject.get_host_element(door) is None
+
+    def test_opening_with_no_void_returns_none(self):
+        ifc = ifcopenshell.file()
+        opening = ifc.createIfcOpeningElement()
+        door = ifc.createIfcDoor()
+        ifcopenshell.api.feature.add_filling(ifc, opening=opening, element=door)
+        assert subject.get_host_element(door) is None
+
+    def test_non_filling_entity_returns_none(self):
+        # An entity without a ``FillsVoids`` inverse (e.g. a wall) must not
+        # raise — callers like the decomposition snapshot iterate every
+        # entity in the scene, so the helper has to handle that cleanly.
+        ifc = ifcopenshell.file()
+        wall = ifc.createIfcWall()
+        assert subject.get_host_element(wall) is None
+
+
 class TestGetHostWall(NewFile):
     """``get_host_wall`` is the chain-walk callers reach for when a filling's
     wall-offset gizmo needs the host wall's length/height — the four guards

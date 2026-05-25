@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -36,10 +37,27 @@ import bonsai.core.root
 import bonsai.core.tool
 import bonsai.tool as tool
 from bonsai.bim import import_ifc
-from bonsai.bim.module.system.data import ObjectSystemData, SystemDecorationData
+
+# Data-class imports from ``bonsai.bim.module.system.data`` are function-local:
+# a top-level import would trigger a partial-init cycle through tool.Ifc.Operator.
 
 if TYPE_CHECKING:
     from bonsai.bim.module.system.prop import BIMSystemProperties, BIMZoneProperties
+
+
+_DIRECTION_FROM_FLOW_PAIR: dict[tuple[str, str], str] = {
+    ("SOURCE", "SINK"): "SOURCE",
+    ("SINK", "SOURCE"): "SINK",
+    ("SOURCEANDSINK", "SOURCEANDSINK"): "SOURCEANDSINK",
+}
+
+
+def direction_from_port_pair(port_a: ifcopenshell.entity_instance, port_b: ifcopenshell.entity_instance) -> str:
+    """Derive the ``direction`` arg for ``ifcopenshell.api.system.connect_port``
+    from each port's ``FlowDirection``. Returns ``NOTDEFINED`` for non-canonical pairs."""
+    a = getattr(port_a, "FlowDirection", None) or "NOTDEFINED"
+    b = getattr(port_b, "FlowDirection", None) or "NOTDEFINED"
+    return _DIRECTION_FROM_FLOW_PAIR.get((a, b), "NOTDEFINED")
 
 
 class System(bonsai.core.tool.System):
@@ -163,12 +181,12 @@ class System(bonsai.core.tool.System):
         return ifcopenshell.util.system.get_ports(element)
 
     @classmethod
-    def get_port_relating_element(cls, port: ifcopenshell.entity_instance) -> ifcopenshell.entity_instance:
+    def get_port_relating_element(cls, port: ifcopenshell.entity_instance) -> Union[ifcopenshell.entity_instance, None]:
         if tool.Ifc.get_schema() == "IFC2X3":
-            element = port.ContainedIn[0].RelatedElement
-        else:
-            element = port.Nests[0].RelatingObject
-        return element
+            rel = port.ContainedIn[0] if port.ContainedIn else None
+            return rel.RelatedElement if rel else None
+        rel = port.Nests[0] if port.Nests else None
+        return rel.RelatingObject if rel else None
 
     @classmethod
     def get_port_predefined_type(cls, mep_element: ifcopenshell.entity_instance) -> str:
@@ -281,30 +299,41 @@ class System(bonsai.core.tool.System):
         system_props = cls.get_system_props()
         return tool.Ifc.get_entity_by_id(system_props.active_system_id)
 
+    # Decoration-data cache, keyed on (decorator_cache_token, id(decorated_elements_set)).
+    _decoration_data_cache_key: tuple | None = None
+    _decoration_data_cache: dict[str, Any] | None = None
+
     @classmethod
     def get_decoration_data(cls) -> dict[str, Any]:
+        from bonsai.bim.decorator_cache import get_decorator_cache_token
+        from bonsai.bim.module.system.data import ObjectSystemData, SystemDecorationData
+
+        if not ObjectSystemData.is_loaded:
+            ObjectSystemData.load()
+        if not SystemDecorationData.is_loaded:
+            SystemDecorationData.load()
+
+        token = get_decorator_cache_token()
+        key = (token, id(SystemDecorationData.data["decorated_elements"]))
+        if key == cls._decoration_data_cache_key and cls._decoration_data_cache is not None:
+            return cls._decoration_data_cache
+
+        result = cls._build_decoration_data()
+        cls._decoration_data_cache_key = key
+        cls._decoration_data_cache = result
+        return result
+
+    @classmethod
+    def _build_decoration_data(cls) -> dict[str, Any]:
+        from bonsai.bim.module.system.data import ObjectSystemData, SystemDecorationData
+
         all_vertices = []
         preview_edges = []
         special_vertices = []
         selected_edges = []
         selected_vertices = []
 
-        view3d_space = tool.Blender.get_viewport_context()["space_data"].region_3d
-        viewport_matrix = view3d_space.view_matrix.inverted()
-        viewport_y_axis = viewport_matrix.col[1].to_3d().normalized()
-        camera_pos = viewport_matrix.translation
-        dir_to_camera = lambda x: (camera_pos - x).normalized()
-
-        def most_aligned_vector(a, vectors):
-            return max(vectors, key=lambda v: abs(a.dot(v)))
-
         start_vert_i = 0
-
-        if not ObjectSystemData.is_loaded:
-            ObjectSystemData.load()
-
-        if not SystemDecorationData.is_loaded:
-            SystemDecorationData.load()
 
         class FlowDirection(Enum):
             BACKWARD = -1
@@ -461,45 +490,29 @@ class System(bonsai.core.tool.System):
 
     @classmethod
     def walk_connected_mep_elements(
-        cls,
-        start_element: ifcopenshell.entity_instance,
-        max_nodes: int = 5000,
+        cls, start_element: ifcopenshell.entity_instance
     ) -> list[ifcopenshell.entity_instance]:
         """Return all MEP elements reachable from ``start_element`` via
-        ``IfcRelConnectsPorts`` (in either direction), including the start.
+        ``IfcRelConnectsPorts`` in either direction, in BFS order with
+        ``start_element`` first.
 
-        BFS with a visited set keyed by ifcopenshell entity instance — the
-        cycle case (closed loop in a distribution network) terminates
-        normally instead of looping. Filtered via ``is_mep_element`` so only
-        ``IfcFlowSegment`` and ``IfcFlowFitting`` instances make it into the
-        result; ports are followed as traversal edges but never returned.
-
-        ``max_nodes`` caps the traversal at a defensive bound — typical MEP
-        runs are 5-50 elements, large buildings 100-500; the cap only fires
-        on pathological 10k+ networks where the per-frame draw cost would
-        also exceed the user's patience. When the cap fires, returns the
-        partial result so the decorator still draws SOMETHING."""
+        Only ``IfcFlowSegment`` and ``IfcFlowFitting`` instances are
+        returned; non-MEP neighbours reached via a fitting's port are
+        traversed but not collected.
+        """
         if not cls.is_mep_element(start_element):
             return []
         result: list[ifcopenshell.entity_instance] = []
         visited: set[int] = set()
-        queue: list[ifcopenshell.entity_instance] = [start_element]
-        while queue and len(result) < max_nodes:
-            element = queue.pop(0)
+        queue: deque[ifcopenshell.entity_instance] = deque([start_element])
+        while queue:
+            element = queue.popleft()
             if element.id() in visited:
                 continue
             visited.add(element.id())
             if not cls.is_mep_element(element):
-                # Non-MEP element reached via a fitting's connection (e.g. a
-                # terminal). Walked through to keep the path continuous, but
-                # don't add it to the result — the caller only renders MEP
-                # axes / fittings.
                 continue
             result.append(element)
-            # Walk every port of this element to its connected counterpart's
-            # element. ``get_connected_port`` already handles both
-            # ConnectedTo and ConnectedFrom directions, so we get bidirectional
-            # traversal "for free" without separately querying each direction.
             for port in cls.get_ports(element):
                 connected_port = cls.get_connected_port(port)
                 if connected_port is None:
@@ -512,37 +525,17 @@ class System(bonsai.core.tool.System):
 
     @classmethod
     def get_port_world_position(cls, port: ifcopenshell.entity_instance) -> Vector:
-        """Return the world-space position of an ``IfcDistributionPort``.
+        """World-space position of an ``IfcDistributionPort``.
 
-        Computes the port's position by combining (a) the port's IFC
-        placement relative to its parent element's IFC frame with (b) the
-        parent element's CURRENT Blender ``matrix_world``. This means the
-        port follows the parent's live Blender rotation / translation even
-        when the IFC placement hasn't been re-committed — critical for the
-        MEP path overlay because the segment axes are drawn from
-        ``obj.matrix_world`` (live Blender) while ports were previously
-        drawn from raw IFC placement (stale on uncommitted rotation),
-        producing visible drift on rotated fittings.
-
-        Falls back to the raw IFC-placement world position when the parent
-        element / object can't be resolved — preserves the old behaviour as
-        the defensive default for free-standing ports or for callers that
-        don't care about the parent-Blender-rotation case.
-
-        Pure read — no IFC mutation."""
+        Follows the parent element's live ``matrix_world`` when available so
+        an uncommitted rotation doesn't drift from its ports; falls back to
+        the raw IFC placement otherwise."""
         placement = getattr(port, "ObjectPlacement", None)
         if placement is None:
             return Vector((0.0, 0.0, 0.0))
-        # ``get_local_placement`` returns a 4x4 numpy array resolving the
-        # full IFC placement chain to world space — this is the port's
-        # world position AS RECORDED IN IFC. May lag behind Blender if the
-        # user has moved / rotated the parent without committing.
         port_ifc_matrix = Matrix(ifcopenshell.util.placement.get_local_placement(placement).tolist())
 
-        try:
-            parent_element = cls.get_port_relating_element(port)
-        except Exception:
-            parent_element = None
+        parent_element = cls.get_port_relating_element(port)
         if parent_element is None:
             return Vector(port_ifc_matrix.translation)
 
@@ -555,16 +548,9 @@ class System(bonsai.core.tool.System):
             return Vector(port_ifc_matrix.translation)
         parent_ifc_matrix = Matrix(ifcopenshell.util.placement.get_local_placement(parent_placement).tolist())
 
-        # Port expressed in the parent's LOCAL frame (cancels the parent's
-        # IFC world transform). When parent's Blender matrix_world matches
-        # its IFC placement (the steady-state case) this gives the same
-        # result as the raw IFC-placement read; when they diverge (Blender
-        # rotation un-committed) it gives the up-to-date world position.
         try:
             port_local_to_parent = parent_ifc_matrix.inverted() @ port_ifc_matrix
         except ValueError:
-            # parent_ifc_matrix not invertible (degenerate placement) —
-            # fall back to raw IFC world.
             return Vector(port_ifc_matrix.translation)
         return (parent_obj.matrix_world @ port_local_to_parent).translation
 

@@ -127,19 +127,16 @@ class Aggregate(bonsai.core.tool.Aggregate):
                 aggregates.append(element)
         return aggregates
 
-    @staticmethod
-    def pick_aggregate_to_draw(
+    @classmethod
+    def get_highlight_ancestor(
+        cls,
         aggregates_list: list[ifcopenshell.entity_instance],
         editing_aggregate: Union[ifcopenshell.entity_instance, None],
     ) -> Union[ifcopenshell.entity_instance, None]:
-        """Return the aggregate the decorator should highlight, or None.
+        """Pick the ancestor aggregate to highlight, or ``None``.
 
-        In aggregate mode, returns the predecessor of ``editing_aggregate`` in the
-        ancestor chain so the user sees the level above the one being edited.
-        Outside aggregate mode, returns the deepest ancestor aggregate.
-        Returns None when no choice is possible (empty list, editing aggregate
-        not in the chain, or editing aggregate is already the deepest).
-        """
+        With ``editing_aggregate``, returns its predecessor (the level above
+        the one being edited); otherwise the deepest ancestor."""
         if editing_aggregate is not None:
             if editing_aggregate not in aggregates_list:
                 return None

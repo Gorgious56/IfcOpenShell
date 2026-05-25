@@ -34,11 +34,6 @@ import ifcopenshell.util.representation
 import ifcopenshell.util.unit
 
 PRECISION = 1.0e-5
-# Tolerance for equality / deviation checks ("how close to exact is close enough?").
-# Currently equal to PRECISION, but logically separate — if some future equality test
-# needs a looser bound than the rounding precision, change this literal here without
-# also moving PRECISION (which is consumed by round_to_precision below).
-TOLERANCE = 1.0e-5
 
 
 if TYPE_CHECKING:
@@ -82,7 +77,7 @@ def ifc_safe_vector_type(v: Union[VectorType, SequenceOfVectors]) -> Any:
 def is_x(value: float, x: float, si_conversion: Optional[float] = None) -> bool:
     if si_conversion is not None:
         value = value * si_conversion
-    return (x + TOLERANCE) > value > (x - TOLERANCE)
+    return (x + PRECISION) > value > (x - PRECISION)
 
 
 def round_to_precision(x: float, si_conversion: float) -> float:
@@ -1831,7 +1826,7 @@ class ShapeBuilder:
         end_half_dim: np.ndarray,
         angle: float,
         profile_offset: VectorType = (0.0, 0.0),
-        verbose: bool = True,
+        verbose: bool = False,
     ) -> Optional[float]:
         """Get the transition length for two profile half-dimensions, an angle, and an XY offset.
 
@@ -1843,7 +1838,9 @@ class ShapeBuilder:
         :param end_half_dim: Half-dimensions of the end profile in the same format.
         :param angle: Maximum allowed transition angle, in degrees.
         :param profile_offset: 2D XY offset between the centrelines of the start and end profiles.
-        :param verbose: If True, print diagnostic values during calculation.
+        :param verbose: If True, print diagnostic values during calculation. Default is False —
+            the prints are debug-only output; enabling them spams the console on every transition
+            geometry computation (which fires per-fitting on IFC load).
         :return: Transition length in project length units, or ``None`` if no valid length exists
             for the given angle and offset.
         """
@@ -1904,7 +1901,7 @@ class ShapeBuilder:
         end_profile: bool = False,
         length: Optional[float] = None,
         angle: Optional[float] = None,
-        verbose: bool = True,
+        verbose: bool = False,
     ) -> Union[float, None]:
         """Calculate MEP transition length from angle, or transition angle from length.
 
