@@ -28,6 +28,7 @@ from math import atan, cos, degrees, pi, radians
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Literal,
     Optional,
     TypedDict,
@@ -139,6 +140,35 @@ class Model(bonsai.core.tool.Model):
     def get_polyline_props(cls) -> BIMPolylineProperties:
         assert (scene := bpy.context.scene)
         return scene.BIMPolylineProperties  # pyright: ignore[reportAttributeAccessIssue]
+
+    @classmethod
+    def resolve_active_props_for_edit(
+        cls,
+        context: bpy.types.Context,
+        props_getter: Callable[[bpy.types.Object], Any],
+        *,
+        subtype: Optional[tuple[str, Any]] = None,
+    ) -> Optional[tuple[bpy.types.Object, Any]]:
+        """Resolve ``(obj, props)`` for an operator that acts on the active
+        object only while a parametric edit is active.
+
+        Returns ``None`` (the operator should ``return {"CANCELLED"}``) when
+        any of these fail:
+        - no active object,
+        - ``props.is_editing`` is False,
+        - ``subtype`` is given as ``(attr, value)`` and ``props.<attr> != value``.
+        """
+        obj = context.active_object
+        if not obj:
+            return None
+        props = props_getter(obj)
+        if not getattr(props, "is_editing", False):
+            return None
+        if subtype is not None:
+            attr, value = subtype
+            if getattr(props, attr, None) != value:
+                return None
+        return obj, props
 
     @classmethod
     def convert_si_to_unit(cls, value: T) -> T:
