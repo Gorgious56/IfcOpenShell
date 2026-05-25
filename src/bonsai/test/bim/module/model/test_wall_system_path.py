@@ -30,10 +30,16 @@ these tests pin the walls-specific surface:
   the wall and MEP path decorators in one user-facing switch).
 """
 
+import contextlib
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 import bpy
+import ifcopenshell
 import pytest
 
 import bonsai.tool as tool
+from bonsai.bim.module.model import decorator as decorator_module
 from test.bim.bootstrap import NewFile
 
 pytestmark = pytest.mark.model
@@ -132,3 +138,109 @@ class TestWalkConnectedWalls(NewFile):
         # from one must yield only itself.
         result = tool.Wall.walk_connected_walls(elem_a)
         assert [w.id() for w in result] == [elem_a.id()]
+
+
+@pytest.mark.model
+class TestHasAxisRepresentation:
+    """Pin the predicate ``tool.Geometry.has_axis_representation`` against
+    raw IFC entities. Anything that draws a schematic 1D path overlay must
+    consult this predicate before deriving coordinates — elements without an
+    Axis representation cannot be projected to an unambiguous line, and
+    falling back to mesh-derived geometry produces misleading overlays."""
+
+    def test_element_without_representation_is_rejected(self):
+        ifc_file = ifcopenshell.file()
+        element = ifc_file.create_entity("IfcWall", GlobalId=ifcopenshell.guid.new())
+        assert tool.Geometry.has_axis_representation(element) is False
+
+    def test_element_with_body_only_is_rejected(self):
+        ifc_file = ifcopenshell.file()
+        element = ifc_file.create_entity("IfcWall", GlobalId=ifcopenshell.guid.new())
+        body = ifc_file.create_entity(
+            "IfcShapeRepresentation",
+            RepresentationIdentifier="Body",
+            RepresentationType="Brep",
+            Items=[],
+        )
+        element.Representation = ifc_file.create_entity("IfcProductDefinitionShape", Representations=[body])
+        assert tool.Geometry.has_axis_representation(element) is False
+
+    def test_element_with_axis_is_accepted(self):
+        ifc_file = ifcopenshell.file()
+        element = ifc_file.create_entity("IfcWall", GlobalId=ifcopenshell.guid.new())
+        axis = ifc_file.create_entity(
+            "IfcShapeRepresentation",
+            RepresentationIdentifier="Axis",
+            RepresentationType="Curve2D",
+            Items=[],
+        )
+        element.Representation = ifc_file.create_entity("IfcProductDefinitionShape", Representations=[axis])
+        assert tool.Geometry.has_axis_representation(element) is True
+
+    def test_element_with_body_and_axis_is_accepted(self):
+        ifc_file = ifcopenshell.file()
+        element = ifc_file.create_entity("IfcWall", GlobalId=ifcopenshell.guid.new())
+        axis = ifc_file.create_entity(
+            "IfcShapeRepresentation",
+            RepresentationIdentifier="Axis",
+            RepresentationType="Curve2D",
+            Items=[],
+        )
+        body = ifc_file.create_entity(
+            "IfcShapeRepresentation",
+            RepresentationIdentifier="Body",
+            RepresentationType="SweptSolid",
+            Items=[],
+        )
+        element.Representation = ifc_file.create_entity("IfcProductDefinitionShape", Representations=[axis, body])
+        assert tool.Geometry.has_axis_representation(element) is True
+
+
+@pytest.mark.model
+def test_wall_seed_skips_wall_without_axis_representation(monkeypatch):
+    """A selected IfcWall that lacks an IFC Axis representation (custom
+    BREP-only body) must not seed the overlay. The decorator can only
+    project walls with a real reference axis to a 1D path; falling back to
+    the synthetic 1m line from ``get_reference_line``'s last-resort path
+    would draw a misleading segment at the object origin."""
+    from bonsai.bim import decorator_cache
+    from bonsai.bim.module.model.decorator import WallSystemPathDecorator
+
+    decorator_cache.reset_for_test()
+    decorator = WallSystemPathDecorator()
+
+    element = Mock()
+    element.GlobalId = "guid-brep-only"
+    element.is_a = Mock(return_value=True)
+    obj = Mock()
+
+    build = Mock(return_value=([], []))
+    monkeypatch.setattr(decorator, "_build_geometry", build)
+
+    walk = Mock(return_value=[element])
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                tool.Model,
+                "get_model_props",
+                return_value=SimpleNamespace(show_paths=True),
+            )
+        )
+        stack.enter_context(patch.object(tool.Ifc, "get", return_value=Mock(name="ifc_file")))
+        stack.enter_context(patch.object(tool.Ifc, "get_entity", return_value=element))
+        stack.enter_context(patch.object(tool.Geometry, "has_axis_representation", return_value=False))
+        stack.enter_context(patch.object(tool.Wall, "walk_connected_walls", walk))
+        stack.enter_context(
+            patch.object(
+                tool.Blender,
+                "get_addon_preferences",
+                return_value=SimpleNamespace(decorator_color_selected=(1.0, 0.5, 0.0, 1.0)),
+            )
+        )
+        stack.enter_context(patch.object(decorator_module, "_stroke_lines_alpha", return_value=None))
+        ctx = SimpleNamespace(selected_objects=[obj])
+        decorator.draw(ctx)
+
+    assert walk.call_count == 0, "axis-less seed must short-circuit before walk"
+    assert build.call_count == 0, "axis-less seed must short-circuit before geometry build"

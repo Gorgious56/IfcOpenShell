@@ -20,6 +20,7 @@
 
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import bpy
 import pytest
@@ -251,6 +252,31 @@ def test_textured_quad_gizmo_mixin_inherits_static_tris_mixin():
     )
 
 
+def test_textured_quad_gizmo_falls_back_to_static_tris_on_missing_texture():
+    """When the texture pipeline returns ``None`` (missing PNG, GPU init
+    failure, mid-reload race), ``TexturedQuadGizmoMixin.draw`` delegates to
+    ``StaticTrisGizmoMixin.draw`` so the gizmo renders its tris glyph
+    instead of disappearing — the documented safety net for texture
+    failures."""
+    from bonsai.bim.module.drawing.gizmos import (
+        StaticTrisGizmoMixin,
+        TexturedQuadGizmoMixin,
+    )
+
+    fake_self = MagicMock(name="gizmo", spec=TexturedQuadGizmoMixin)
+    fake_self.icon_name = "missing_icon"
+    ctx = MagicMock(name="context")
+
+    with (
+        patch("bonsai.bim.module.drawing.gizmo_textures.get_icon_texture", return_value=None) as get_tex,
+        patch.object(StaticTrisGizmoMixin, "draw") as static_draw,
+    ):
+        TexturedQuadGizmoMixin.draw(fake_self, ctx)
+
+    get_tex.assert_called_once_with("missing_icon")
+    static_draw.assert_called_once_with(ctx)
+
+
 def test_static_tris_gizmo_mixin_outline_enabled_by_default():
     """Default outline_alpha > 0 and outline_width > 0 keep icon glyphs legible
     against same-color backgrounds (white icon on white wall, dark on dark).
@@ -329,6 +355,70 @@ def test_every_static_tris_gizmo_draw_override_routes_through_outline_path():
         f"outline path (super().draw / draw_tris_with_outline): {offenders}. "
         f"The icon will render without its dark halo."
     )
+
+
+def test_draw_outline_and_body_renders_eight_outline_passes_then_one_body_pass():
+    """The shared helper renders the icon nine times: 8 outline passes
+    (semi-transparent black at ``outline_alpha``) followed by 1 body pass at
+    the caller-supplied colour. Pins the call sequence so a refactor can't
+    silently drop a pass or scramble the colour order."""
+    from mathutils import Matrix
+
+    from bonsai.bim.module.drawing.gizmos import _draw_outline_and_body
+
+    shader = MagicMock(name="shader")
+    batch = MagicMock(name="batch")
+    body_color = (0.2, 0.4, 0.6, 1.0)
+
+    with patch("bonsai.bim.module.drawing.gizmos.gpu"):
+        _draw_outline_and_body(shader, batch, Matrix.Identity(4), body_color, 0.03, 0.4)
+
+    assert batch.draw.call_count == 9, f"Expected 8 outline + 1 body = 9 batch.draw calls; got {batch.draw.call_count}."
+    color_calls = [c for c in shader.uniform_float.call_args_list if c.args[0] == "color"]
+    assert (
+        len(color_calls) == 2
+    ), f"Expected 2 ``color`` uniform assignments (outline then body); got {len(color_calls)}."
+    assert color_calls[0].args[1] == (0.0, 0.0, 0.0, 0.4), (
+        "Outline pass must use semi-transparent black so the 8 overlapping passes accumulate "
+        "into a uniform dark halo without tinting the icon body."
+    )
+    assert color_calls[1].args[1] == body_color, "Body pass must use the caller-supplied colour unchanged."
+
+
+def test_draw_outline_and_body_skips_outline_when_alpha_is_zero():
+    """``outline_alpha == 0`` is the per-class halo opt-out documented on
+    ``StaticTrisGizmoMixin.outline_alpha``. Helper draws only the body pass."""
+    from mathutils import Matrix
+
+    from bonsai.bim.module.drawing.gizmos import _draw_outline_and_body
+
+    shader = MagicMock(name="shader")
+    batch = MagicMock(name="batch")
+
+    with patch("bonsai.bim.module.drawing.gizmos.gpu"):
+        _draw_outline_and_body(shader, batch, Matrix.Identity(4), (1.0, 1.0, 1.0, 1.0), 0.03, 0.0)
+
+    assert (
+        batch.draw.call_count == 1
+    ), f"Expected only the body pass when outline_alpha == 0; got {batch.draw.call_count} draws."
+
+
+def test_draw_outline_and_body_skips_outline_when_width_is_zero():
+    """``outline_width == 0`` collapses every outline pass onto the body and
+    is therefore treated the same as the alpha opt-out."""
+    from mathutils import Matrix
+
+    from bonsai.bim.module.drawing.gizmos import _draw_outline_and_body
+
+    shader = MagicMock(name="shader")
+    batch = MagicMock(name="batch")
+
+    with patch("bonsai.bim.module.drawing.gizmos.gpu"):
+        _draw_outline_and_body(shader, batch, Matrix.Identity(4), (1.0, 1.0, 1.0, 1.0), 0.0, 0.4)
+
+    assert (
+        batch.draw.call_count == 1
+    ), f"Expected only the body pass when outline_width == 0; got {batch.draw.call_count} draws."
 
 
 def test_gizmo_array_layer_indicator_declares_outlined_batch_slot():

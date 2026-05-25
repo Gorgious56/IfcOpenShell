@@ -183,3 +183,16 @@ Scenario: Copy a storey - when unlocked
     Then the object "IfcBuildingStorey/My Storey" and "IfcBuildingStorey/My Storey.001" are different elements
     And the object "IfcBuildingStorey/My Storey" is in the collection "IfcBuildingStorey/My Storey"
     And the object "IfcBuildingStorey/My Storey.001" is in the collection "IfcBuildingStorey/My Storey.001"
+
+Scenario: Copy a wall with a material-supplied surface style - skips body-style assignment
+    Given an empty IFC project
+    And I add a cube
+    And the object "Cube" is selected
+    And I set "scene.BIMRootProperties.ifc_product" to "IfcElement"
+    And I set "scene.BIMRootProperties.ifc_class" to "IfcWall"
+    And I press "bim.assign_class"
+    And the object "IfcWall/Cube" is selected
+    And I assign the IFC material "WallMat" with a surface style to the active object
+    And the variable "styled_before" is "len({ifc}.by_type('IfcStyledItem'))"
+    When I duplicate the selected objects
+    Then the variable "styled_before" equals "len({ifc}.by_type('IfcStyledItem'))"

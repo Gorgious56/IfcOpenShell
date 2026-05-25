@@ -56,7 +56,7 @@ def patched_draw_env():
             decorator.draw(context)"""
 
     @contextlib.contextmanager
-    def _factory(show: bool, selected: list, entity_for, walk_result):
+    def _factory(show: bool, selected: list, entity_for, walk_result, has_axis: bool = True):
         with contextlib.ExitStack() as stack:
             stack.enter_context(
                 patch.object(
@@ -68,6 +68,7 @@ def patched_draw_env():
             stack.enter_context(patch.object(tool.Ifc, "get", return_value=Mock(name="ifc_file")))
             stack.enter_context(patch.object(tool.Ifc, "get_entity", side_effect=entity_for))
             stack.enter_context(patch.object(tool.System, "is_mep_element", return_value=True))
+            stack.enter_context(patch.object(tool.Geometry, "has_axis_representation", return_value=has_axis))
             stack.enter_context(patch.object(tool.System, "walk_connected_mep_elements", return_value=walk_result))
             stack.enter_context(
                 patch.object(
@@ -197,3 +198,29 @@ def test_show_paths_off_short_circuits(patched_draw_env, monkeypatch):
         decorator.draw(ctx)
 
     assert build.call_count == 0, "toggle-off must short-circuit before geometry build"
+
+
+def test_seed_skips_mep_element_without_axis_representation(patched_draw_env, monkeypatch):
+    """A selected IfcFlowSegment / IfcFlowFitting that lacks an IFC Axis
+    representation (e.g. custom BREP-only body) must not seed the overlay.
+    The decorator can only project elements with a real 1D axis to a
+    schematic path; falling back to mesh-derived geometry would draw a
+    misleading line."""
+    decorator = MEPSystemPathDecorator()
+    element = Mock()
+    element.GlobalId = "guid-brep-only"
+    obj, _ = _make_selected(element)
+
+    build = Mock(return_value=([], []))
+    monkeypatch.setattr(decorator, "_build_geometry", build)
+
+    with patched_draw_env(
+        show=True,
+        selected=[obj],
+        entity_for=lambda o: element if o is obj else None,
+        walk_result=[element],
+        has_axis=False,
+    ) as ctx:
+        decorator.draw(ctx)
+
+    assert build.call_count == 0, "axis-less seed must short-circuit before walk + geometry build"

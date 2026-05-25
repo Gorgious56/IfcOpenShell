@@ -88,9 +88,9 @@ class TestGenerateCommitsFillingPlacement(NewIfc):
         """After ``FilledOpeningGenerator.generate`` returns, the filling's IFC
         ``ObjectPlacement`` must match its post-generate ``matrix_world``.
 
-        Without this contract, ``_restore_placement_from_ifc`` (called from the
-        parametric-edit cancel path) reads a stale placement and snaps the
-        filling away from its visible position."""
+        Without this contract, the parametric-edit cancel path would read a
+        stale placement on restore and snap the filling away from its visible
+        position."""
         from bonsai.bim.module.model.opening import FilledOpeningGenerator
 
         wall_obj, door_obj = self._make_cube_wall_and_door()

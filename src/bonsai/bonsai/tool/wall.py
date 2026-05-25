@@ -141,7 +141,7 @@ class Wall(bonsai.core.tool.Wall):
         self_conn_type: str,
         seg_other: tuple[Vector, Vector],
         other_conn_type: str,
-        parallel_threshold: float = 0.9994,
+        parallel_threshold: float = bonsai.core.model.PARALLEL_DOT_THRESHOLD,
     ) -> Vector:
         """World-space physical join point of an ``IfcRelConnectsPathElements`` — an
         endpoint for end-connected walls, the axis intersection for ATPATH junctions."""
@@ -225,17 +225,14 @@ class Wall(bonsai.core.tool.Wall):
         """World-space endpoints of the wall's IFC reference line, in Blender units.
 
         Returns ``(p1, p2)`` as 3D vectors with the wall's local Z preserved.
-        Returns ``None`` when the wall has no IFC element or no readable
-        reference line. Anchors to the IFC reference line, not the mesh bound
+        Returns ``None`` when the wall has no IFC element or no IFC Axis
+        representation. Anchors to the IFC reference line, not the mesh bound
         box, so it stays correct when the mesh is stale or trimmed past the
         IFC axis endpoints."""
         element = tool.Ifc.get_entity(obj)
-        if element is None:
+        if element is None or not tool.Geometry.has_axis_representation(element):
             return None
-        try:
-            p1, p2 = ifcopenshell.util.representation.get_reference_line(element)
-        except Exception:
-            return None
+        p1, p2 = ifcopenshell.util.representation.get_reference_line(element)
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
         local_p1 = Vector((p1[0] * unit_scale, p1[1] * unit_scale, 0.0))
         local_p2 = Vector((p2[0] * unit_scale, p2[1] * unit_scale, 0.0))

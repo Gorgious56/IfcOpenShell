@@ -327,6 +327,74 @@ class TestRecordObjectPosition(NewFile):
         assert props.rotation_checksum == repr(tool.Blender.np_array_legacy(obj.matrix_world.to_3x3()).tobytes())
 
 
+class TestCommitPlacementIfMoved(NewFile):
+    """Pins the helper's two-line contract: no-op when ``tool.Ifc.is_moved`` is
+    False, else write the current matrix_world to the element's IFC placement."""
+
+    def _setup_linked_wall(self) -> tuple[bpy.types.Object, ifcopenshell.entity_instance]:
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcProject")
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        obj = bpy.data.objects.new("Object", None)
+        bpy.context.scene.collection.objects.link(obj)
+        tool.Ifc.link(element, obj)
+        subject.record_object_position(obj)
+        return obj, element
+
+    def test_skips_when_not_moved(self):
+        obj, element = self._setup_linked_wall()
+        original_placement = element.ObjectPlacement
+        subject.commit_placement_if_moved(obj)
+        assert element.ObjectPlacement is original_placement
+
+    def test_writes_ifc_placement_when_moved(self):
+        obj, element = self._setup_linked_wall()
+        obj.matrix_world.translation = Vector((1.0, 2.0, 3.0))
+        subject.commit_placement_if_moved(obj)
+        committed = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement)
+        assert np.allclose(committed[:3, 3], [1.0, 2.0, 3.0])
+
+    def test_apply_scale_false_skips_scale_apply(self):
+        obj, element = self._setup_linked_wall()
+        obj.matrix_world.translation = Vector((1.0, 0.0, 0.0))
+        obj.scale = (2.0, 2.0, 2.0)
+        subject.commit_placement_if_moved(obj, apply_scale=False)
+        # apply_scale=False leaves the Blender scale untouched; apply_scale=True
+        # would have cleared it via tool.Geometry.clear_scale.
+        assert tuple(obj.scale) == (2.0, 2.0, 2.0)
+
+
+class TestRestorePlacementFromIfc(NewFile):
+    """Pins the helper's contract: write the element's IFC placement onto
+    ``obj.matrix_world`` and re-baseline the drift checksum so ``is_moved``
+    returns False afterwards."""
+
+    def test_restores_matrix_and_clears_drift(self):
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcProject")
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        obj = bpy.data.objects.new("Object", None)
+        bpy.context.scene.collection.objects.link(obj)
+        tool.Ifc.link(element, obj)
+        # Commit a known IFC placement, then baseline the checksum so a later
+        # Blender-side drag flips is_moved to True.
+        ifcopenshell.api.geometry.edit_object_placement(ifc, product=element, matrix=np.eye(4), is_si=True)
+        obj.matrix_world.translation = Vector((0.0, 0.0, 0.0))
+        subject.record_object_position(obj)
+        # Drag the Blender object away from the committed IFC position.
+        obj.matrix_world.translation = Vector((5.0, 5.0, 5.0))
+        assert tool.Ifc.is_moved(obj) is True
+
+        subject.restore_placement_from_ifc(obj, element)
+
+        # matrix_world snapped back to the IFC placement (origin).
+        assert np.allclose(np.array(obj.matrix_world.translation), [0.0, 0.0, 0.0])
+        # Checksum re-baselined: is_moved no longer flags the object as drifted.
+        assert tool.Ifc.is_moved(obj) is False
+
+
 class TestRemoveConnection(NewFile):
     def test_run(self):
         ifc = ifcopenshell.file()

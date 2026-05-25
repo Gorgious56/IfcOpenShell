@@ -104,7 +104,7 @@ def patched_railing():
         # tool.Model.get_modeling_bbim_pset_data and would otherwise miss.
         mock_tool.Ifc.get_entity.return_value = mock.Mock(name="entity")
         # Default the drift handler to a no-op for tests that aren't asserting
-        # on it — the new base-class hook gates on ``tool.Ifc.is_moved``.
+        # on it — the hook gates on ``tool.Ifc.is_moved``.
         mock_pl_tool.Ifc.is_moved.return_value = False
         yield {
             "tool": mock_tool,

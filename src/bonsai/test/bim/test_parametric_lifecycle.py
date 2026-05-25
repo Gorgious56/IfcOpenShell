@@ -166,7 +166,7 @@ def test_feature_modifier_enable_one_noop_when_no_entity(patched_tool_and_ifc):
     assert props.is_editing is False
 
 
-def test_feature_modifier_enable_one_commits_placement_when_moved(patched_tool_and_ifc):
+def test_feature_modifier_enable_one_commits_placement_drift(patched_tool_and_ifc):
     """Enable must commit any pre-edit matrix_world drift to IFC at entry —
     otherwise Cancel's restore-from-IFC reads a stale ObjectPlacement and
     snaps the object back to its pre-drift position. The common trigger is
@@ -180,35 +180,11 @@ def test_feature_modifier_enable_one_commits_placement_when_moved(patched_tool_a
     patched_tool_and_ifc["ifc"].util.element.get_pset.return_value = _make_pset_text(
         {"width": 1234}, {"thickness": 50}, {"material": "wood"}
     )
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
 
     cls = _door_mixin_cls(match=True)
     cls._enable_one(obj)
 
-    edit_call = patched_tool_and_ifc["bonsai"].core.geometry.edit_object_placement
-    edit_call.assert_called_once_with(
-        patched_tool_and_ifc["tool"].Ifc,
-        patched_tool_and_ifc["tool"].Geometry,
-        patched_tool_and_ifc["tool"].Surveyor,
-        obj=obj,
-        apply_scale=False,
-    )
-
-
-def test_feature_modifier_enable_one_skips_placement_when_not_moved(patched_tool_and_ifc):
-    """Enable on an object whose matrix_world matches IFC must not write the
-    placement back — the sync is an undo-only safeguard, never a forced refresh."""
-    props = _FakeProps()
-    obj = _make_obj(props)
-    patched_tool_and_ifc["ifc"].util.element.get_pset.return_value = _make_pset_text(
-        {"width": 1234}, {"thickness": 50}, {"material": "wood"}
-    )
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = False
-
-    cls = _door_mixin_cls(match=True)
-    cls._enable_one(obj)
-
-    patched_tool_and_ifc["bonsai"].core.geometry.edit_object_placement.assert_not_called()
+    patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj, apply_scale=False)
 
 
 def test_feature_modifier_finish_one_clears_is_editing_and_writes_pset(patched_tool_and_ifc):
@@ -261,33 +237,18 @@ def test_feature_modifier_cancel_one_restores_and_clears_is_editing(patched_tool
     patched_tool_and_ifc["bonsai"].core.geometry.switch_representation.assert_called_once()
 
 
-def test_feature_modifier_finish_one_commits_placement_when_moved(patched_tool_and_ifc):
+def test_feature_modifier_finish_one_commits_placement_drift(patched_tool_and_ifc):
     """When the filling's matrix_world has drifted from IFC during the edit
     (typical of a wall-offset gizmo drag), Finish must commit the placement —
     pset write alone is not sufficient because placement isn't in the pset."""
     props = _FakeProps()
     props.is_editing = True
     obj = _make_obj(props)
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
 
     cls = _door_mixin_cls(match=True)
     cls._finish_one(obj, mock.Mock(name="context"))
 
-    patched_tool_and_ifc["bonsai"].core.geometry.edit_object_placement.assert_called_once()
-
-
-def test_feature_modifier_finish_one_skips_placement_when_not_moved(patched_tool_and_ifc):
-    """Finishing without a placement diff must not write the placement back —
-    the existing pset-only path is the common case and must remain cheap."""
-    props = _FakeProps()
-    props.is_editing = True
-    obj = _make_obj(props)
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = False
-
-    cls = _door_mixin_cls(match=True)
-    cls._finish_one(obj, mock.Mock(name="context"))
-
-    patched_tool_and_ifc["bonsai"].core.geometry.edit_object_placement.assert_not_called()
+    patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj)
 
 
 def test_feature_modifier_cancel_one_restores_placement_when_moved(patched_tool_and_ifc):
@@ -300,21 +261,13 @@ def test_feature_modifier_cancel_one_restores_placement_when_moved(patched_tool_
         {"width": 900}, {"thickness": 60}, {"material": "steel"}
     )
     patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
-    # `_restore_placement_from_ifc` reads `get_local_placement(...)`, scales
-    # by `calculate_unit_scale(...)`, and pushes the result through
-    # `tool.Loader.apply_blender_offset_to_matrix_world` before assigning to
-    # ``obj.matrix_world``. The numeric values don't matter here — what matters
-    # is that the restore path is invoked when ``is_moved`` is True.
-    import numpy as np
-
-    patched_tool_and_ifc["ifc"].util.placement.get_local_placement.return_value = np.eye(4)
-    patched_tool_and_ifc["ifc"].util.unit.calculate_unit_scale.return_value = 1.0
 
     cls = _door_mixin_cls(match=True)
     cls._cancel_one(obj)
 
-    patched_tool_and_ifc["tool"].Loader.apply_blender_offset_to_matrix_world.assert_called_once()
-    patched_tool_and_ifc["tool"].Geometry.record_object_position.assert_called_once_with(obj)
+    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_called_once_with(
+        obj, patched_tool_and_ifc["element"]
+    )
 
 
 def test_feature_modifier_cancel_one_skips_placement_restore_when_not_moved(patched_tool_and_ifc):
@@ -331,8 +284,7 @@ def test_feature_modifier_cancel_one_skips_placement_restore_when_not_moved(patc
     cls = _door_mixin_cls(match=True)
     cls._cancel_one(obj)
 
-    patched_tool_and_ifc["tool"].Loader.apply_blender_offset_to_matrix_world.assert_not_called()
-    patched_tool_and_ifc["tool"].Geometry.record_object_position.assert_not_called()
+    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_not_called()
 
 
 def test_feature_modifier_targets_loop_uses_iter_targets(patched_tool_and_ifc):
@@ -513,6 +465,97 @@ def test_path_preserving_cancel_one_short_circuits_when_draft_matches_stored(pat
 
     assert props.is_editing is False, "is_editing must still flip on no-op"
     assert not cls.bmesh_updates, "_restore_viewport_after_cancel must NOT fire on no-op cancel"
+
+
+def test_path_preserving_enable_one_commits_placement_drift(patched_tool_and_ifc):
+    """Path-preserving Enable mirrors FeatureModifier Enable: any pre-edit
+    matrix_world drift commits to IFC at entry, otherwise Cancel restores
+    from a stale ObjectPlacement. ``apply_scale=False`` so Enable doesn't
+    bake object scale into geometry."""
+    props = _FakePathProps()
+    obj = _make_obj(props)
+    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+        "data_dict": {"width": 250, "path_data": {"points": []}}
+    }
+
+    cls = _path_mixin_cls(match=True)
+    cls._enable_one(obj)
+
+    patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj, apply_scale=False)
+
+
+def test_path_preserving_finish_one_commits_placement_drift_on_change(patched_tool_and_ifc):
+    """Finish-with-changes commits placement after the pset/IFC writes —
+    pset content is independent of matrix_world drift."""
+    props = _FakePathProps()  # general={"width": 200, "thickness": 10}
+    props.is_editing = True
+    obj = _make_obj(props)
+    # Stored differs from draft → triggers the commit path.
+    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+        "data_dict": {"width": 999, "thickness": 99, "path_data": {"points": []}}
+    }
+
+    cls = _path_mixin_cls(match=True)
+    cls._finish_one(obj, mock.Mock(name="context"))
+
+    patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj)
+
+
+def test_path_preserving_finish_one_commits_placement_drift_on_no_change(patched_tool_and_ifc):
+    """Even when the pset draft equals stored (no IFC write), the drift
+    commit must still fire — matrix_world drift is independent of pset
+    content, so an Enable → drag → Finish without prop changes must still
+    persist the placement move."""
+    props = _FakePathProps()  # general={"width": 200, "thickness": 10}
+    props.is_editing = True
+    obj = _make_obj(props)
+    sentinel_path = {"points": [[0, 0]]}
+    # Stored == draft → no-op pset path.
+    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+        "data_dict": {"width": 200, "thickness": 10, "path_data": sentinel_path}
+    }
+
+    cls = _path_mixin_cls(match=True)
+    cls._finish_one(obj, mock.Mock(name="context"))
+
+    patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj)
+    assert not cls.pset_updates, "no-op finish must skip pset write"
+
+
+def test_path_preserving_cancel_one_restores_placement_when_moved(patched_tool_and_ifc):
+    """Cancel restores matrix_world from IFC when the user dragged during
+    the edit — symmetric to FeatureModifier Cancel."""
+    props = _FakePathProps()
+    props.is_editing = True
+    obj = _make_obj(props)
+    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+        "data_dict": {"width": 200, "thickness": 10, "path_data": {"points": []}}
+    }
+    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
+
+    cls = _path_mixin_cls(match=True)
+    cls._cancel_one(obj, mock.Mock(name="context"))
+
+    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_called_once_with(
+        obj, patched_tool_and_ifc["element"]
+    )
+
+
+def test_path_preserving_cancel_one_skips_placement_restore_when_not_moved(patched_tool_and_ifc):
+    """No drag → no restore. Cancel must not touch matrix_world for an
+    unmoved object — the restore path is an undo-only safeguard."""
+    props = _FakePathProps()
+    props.is_editing = True
+    obj = _make_obj(props)
+    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+        "data_dict": {"width": 200, "thickness": 10, "path_data": {"points": []}}
+    }
+    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = False
+
+    cls = _path_mixin_cls(match=True)
+    cls._cancel_one(obj, mock.Mock(name="context"))
+
+    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_not_called()
 
 
 # ----------------------------------------------------------------------

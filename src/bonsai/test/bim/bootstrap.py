@@ -40,6 +40,19 @@ tool.Drawing.open_with_user_command = lambda x, y: True
 variables = {"cwd": os.getcwd(), "ifc": "IfcStore.get_file()"}
 
 
+def reset_to_new_ifc() -> None:
+    """Replay the ``NewIfc`` autouse bootstrap as a callable. Tests that need
+    to compare multiple isolated IFC scenarios within a single test method
+    (e.g. perf-scaling assertions across different N values) call this between
+    scenarios; the autouse fixture itself only fires once per test method."""
+    IfcStore.purge()
+    bpy.ops.wm.read_homefile(app_template="")
+    bpy.data.batch_remove(bpy.data.objects)
+    bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+    bonsai.bim.handler.load_post(None)
+    bpy.ops.bim.create_project()
+
+
 class NewFile:
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -54,12 +67,7 @@ class NewFile:
 class NewIfc:
     @pytest.fixture(autouse=True)
     def setup(self):
-        IfcStore.purge()
-        bpy.ops.wm.read_homefile(app_template="")
-        bpy.data.batch_remove(bpy.data.objects)
-        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
-        bonsai.bim.handler.load_post(None)
-        bpy.ops.bim.create_project()
+        reset_to_new_ifc()
 
 
 class NewIfc4X3:

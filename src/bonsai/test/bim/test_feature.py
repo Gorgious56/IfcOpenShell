@@ -823,6 +823,32 @@ def the_material_name_colour_is_set_to_colour(name, colour):
     obj.diffuse_color = [float(c) for c in colour.split(",")]
 
 
+@given(parsers.parse('I assign the IFC material "{name}" with a surface style to the active object'))
+@when(parsers.parse('I assign the IFC material "{name}" with a surface style to the active object'))
+def i_assign_ifc_material_with_surface_style_to_active(name):
+    import ifcopenshell.api.material
+    import ifcopenshell.api.style
+    import ifcopenshell.util.representation
+
+    ifc_file = tool.Ifc.get()
+    body = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
+    assert body, "Body MODEL_VIEW context is required (load a standard IFC project first)"
+
+    style = ifcopenshell.api.style.add_style(ifc_file, name=f"{name}Style")
+    ifcopenshell.api.style.add_surface_style(
+        ifc_file,
+        style=style,
+        ifc_class="IfcSurfaceStyleShading",
+        attributes={"SurfaceColour": {"Name": None, "Red": 1.0, "Green": 0.0, "Blue": 0.0}},
+    )
+    material = ifcopenshell.api.material.add_material(ifc_file, name=name)
+    ifcopenshell.api.style.assign_material_style(ifc_file, material=material, style=style, context=body)
+
+    element = tool.Ifc.get_entity(bpy.context.active_object)
+    assert element, "Active object is not an IFC entity"
+    ifcopenshell.api.material.assign_material(ifc_file, products=[element], material=material, type="IfcMaterial")
+
+
 @given("I add an array modifier")
 def i_add_an_array_modifier():
     bpy.ops.object.modifier_add(type="ARRAY")

@@ -1791,6 +1791,10 @@ class EnableEditingWall(bpy.types.Operator, tool.Ifc.Operator):
         # the IFC state the gizmos read from.
         if tool.Model.get_model_props().openings:
             bpy.ops.bim.edit_openings(apply_all=True)
+        # Commit any pre-edit matrix_world drift to IFC so the snap_* values
+        # below capture from a post-drift axis. Otherwise Finish's sub-ops
+        # would write against the stale IFC placement.
+        tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
         props = tool.Model.get_wall_props(obj)
         # Force is_editing False before populating so update_wall stays a no-op
         # while we copy IFC state into the draft properties.
@@ -1820,6 +1824,17 @@ class CancelEditingWall(bpy.types.Operator, tool.Ifc.Operator):
         props.height = props.snap_height
         props.thickness = props.snap_thickness
         props.offset = props.snap_offset
+        # Restore matrix_world from IFC alongside the draft props. Without this,
+        # an in-edit drag survives the cancel and a later Finish silently commits it.
+        if tool.Ifc.is_moved(obj):
+            element = tool.Ifc.get_entity(obj)
+            if element is not None and element.ObjectPlacement is None:
+                # Nothing to restore from — re-baseline the checksum so a later
+                # Finish does not commit the cancelled drag to an element whose
+                # schema model intentionally lacks ObjectPlacement.
+                tool.Geometry.record_object_position(obj)
+            elif element is not None:
+                tool.Geometry.restore_placement_from_ifc(obj, element)
         # If the user dragged before cancelling, the visible mesh is the simplified
         # preview box (openings/layers stripped). Restore the real IFC-derived geometry
         # so cancel feels like a true undo — equivalent to the user hitting S_G manually.
@@ -1872,6 +1887,12 @@ class FinishEditingWall(bpy.types.Operator, tool.Ifc.Operator):
             props.mesh_dirty = False
         else:
             _restore_wall_mesh_if_dirty(obj)
+        # Commit any in-edit matrix_world drift. The sub-ops above already commit
+        # transitively when fired (DumbWallJoiner et al. call commit_placement_if_moved
+        # at entry), so this is a no-op in the any_change branch. The not-any-change
+        # branch is the gap this closes: a drag with no parameter change would
+        # otherwise silently disappear on Finish.
+        tool.Geometry.commit_placement_if_moved(obj)
         # Set only on success: if any sub-op above raised, the draft survives for retry.
         props.is_editing = False
         # Sub-ops above ran with is_editing=True, so their internal resync calls
@@ -2563,8 +2584,8 @@ def _classify_wall_join_state(
 def _are_walls_collinear(
     seg_a: tuple[Vector, Vector],
     seg_b: tuple[Vector, Vector],
-    parallel_threshold: float = 0.9994,
-    line_tolerance: float = 0.05,
+    parallel_threshold: float = core.PARALLEL_DOT_THRESHOLD,
+    line_tolerance: float = core.COLLINEAR_LINE_TOLERANCE,
 ) -> bool:
     """Vector wrapper around `core.are_axes_collinear` — converts Vector
     endpoints to plain tuples at the boundary so the math stays unit-testable in
@@ -2714,12 +2735,6 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
     bl_region_type = "WINDOW"
     bl_options = {"3D", "PERSISTENT"}
 
-    # Hide the gizmo when walls are nearly parallel (intersection would be unreasonably far).
-    # cos(2°) ≈ 0.9994 → walls within ~2° of parallel are treated as parallel for this purpose.
-    PARALLEL_DOT_THRESHOLD = 0.9994
-    # Perpendicular tolerance (m) for treating two parallel wall axes as collinear.
-    COLLINEAR_LINE_TOLERANCE = 0.05
-
     # Per-region weakref map (see GizmoWallEdition for the rationale). The
     # wall-join preview decorator dereferences this each draw to read live
     # ``is_highlight`` state off the join / extend-to-wall icons in the same
@@ -2755,6 +2770,13 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
     # outline in perspective views — without this the icons sit exactly on
     # the wall edge and read as occluded geometry.
     ICON_TOP_LIFT = 0.15
+
+    # Top-down clearance: the wall-top Z lift collapses to zero on-screen in
+    # plan view, so the stack lands right on top of the intersection / corner
+    # point and obscures the very feature the user is trying to act on. Scaled
+    # by ``tool.Blender.top_down_factor`` so the lift ramps in continuously as
+    # the camera approaches plan rather than jumping at the cone boundary.
+    TOP_DOWN_INTERSECTION_CLEARANCE = 0.5
 
     def setup(self, context: bpy.types.Context) -> None:
         colors = self._icon_colors()
@@ -2807,7 +2829,7 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
         seg_b = _wall_axis_world_segment_from_geom(selected[1], geom_b)
         billboard_rot = gizmo.get_billboard_rotation(context)
         state, intersection_tuple = _classify_wall_join_state(
-            elem_a, elem_b, seg_a, seg_b, self.PARALLEL_DOT_THRESHOLD, self.COLLINEAR_LINE_TOLERANCE
+            elem_a, elem_b, seg_a, seg_b, core.PARALLEL_DOT_THRESHOLD, core.COLLINEAR_LINE_TOLERANCE
         )
 
         # Reject re-filleting an already-curved corner wall — its axis is the
@@ -2826,12 +2848,17 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
         wall_b_top = selected[1].matrix_world.translation.z + (geom_b.get("height") or 0.0)
         anchor_z = max(wall_a_top, wall_b_top) + self.ICON_TOP_LIFT
         screen_up = billboard_rot @ Vector((0.0, 1.0, 0.0))
+        # Plan view: wall-top Z lift is invisible, so add a screen-up shift
+        # so the cursor / intersection / corner stays visible below the icons.
+        # Scaled by the continuous top-down factor (0 well off-axis, 1 strictly
+        # top-down) so the lift fades in as the camera rotates toward plan.
+        top_down_lift = screen_up * (self.TOP_DOWN_INTERSECTION_CLEARANCE * tool.Blender.top_down_factor(context))
 
         # State 1: walls are already joined → show Unjoin + Fillet stacked
         # above the shared corner.
         if state == "joined":
             corner = tool.Wall.collinear_boundary_world(seg_a, seg_b)
-            stack_anchor = Vector((corner.x, corner.y, anchor_z))
+            stack_anchor = Vector((corner.x, corner.y, anchor_z)) + top_down_lift
             self.unjoin_icon.matrix_basis = gizmo.billboarded_at(stack_anchor, billboard_rot)
             self.unjoin_icon.hide = False
             self.merge_icon.hide = True
@@ -2870,7 +2897,7 @@ class GizmoWallJoinIntersection(bpy.types.GizmoGroup, WallGeomCachedBillboarding
         assert intersection_tuple is not None
         intersection = Vector(intersection_tuple)
 
-        stack_anchor = Vector((intersection.x, intersection.y, anchor_z))
+        stack_anchor = Vector((intersection.x, intersection.y, anchor_z)) + top_down_lift
         self.extend_to_wall_icon.matrix_basis = gizmo.billboarded_at(stack_anchor, billboard_rot)
         self.extend_to_wall_icon.hide = False
 
@@ -3099,15 +3126,14 @@ def _apply_fillet_corner_geometry(
     geom: dict,
     wall_a_obj: bpy.types.Object,
 ) -> tuple[Vector, Vector, Vector, float] | None:
-    """Position the corner wall at ``tangent_a`` aligned to the chord, then
-    rebuild its banana body from ``geom``. Shared by the creation and
-    regenerate paths so neighbour-driven recalcs match creation-time output
-    even when wall A's layer set has been edited since.
+    """Position the corner wall at ``tangent_a`` and rebuild its banana body
+    from ``geom``. Shared by the creation and regenerate paths so a
+    neighbour-driven recalc matches creation-time output even when wall A's
+    layer set has been edited since.
 
     Returns ``(x_dir, y_dir, z_dir, chord_length_si)`` on success or ``None``
-    when the chord is degenerate or no Body/MODEL_VIEW context exists. The
-    body context probe runs before any Blender / IFC mutation so the failure
-    case leaves the corner wall untouched."""
+    on degenerate chord / missing Body context. All probes run before any
+    mutation, so failures leave the corner wall untouched."""
     tangent_a = Vector(geom["tangent_a"])
     tangent_b = Vector(geom["tangent_b"])
     chord = tangent_b - tangent_a
@@ -3232,7 +3258,9 @@ class EnableWallFilletPreview(bpy.types.Operator):
         if seg_a is None or seg_b is None:
             self.report({"ERROR"}, "Could not read reference line on one of the walls.")
             return {"CANCELLED"}
-        state, _ = _classify_wall_join_state(elem_a, elem_b, seg_a, seg_b, 0.9994, 0.05)
+        state, _ = _classify_wall_join_state(
+            elem_a, elem_b, seg_a, seg_b, core.PARALLEL_DOT_THRESHOLD, core.COLLINEAR_LINE_TOLERANCE
+        )
         if state not in {"intersect", "joined"}:
             self.report({"ERROR"}, f"Fillet requires intersecting or joined walls (state was {state}).")
             return {"CANCELLED"}

@@ -58,8 +58,8 @@ def _make_position_gizmos_self():
     """Build a stub instance for ``GizmoWallJoinIntersection.position_gizmos()``.
 
     Carries the four icon gizmos (each a namespace with writable ``hide``
-    and ``matrix_basis``), the two class-level thresholds, and a
-    ``_hide_all()`` helper bound to the stub."""
+    and ``matrix_basis``), the class-level tunables ``position_gizmos`` reads,
+    and a ``_hide_all()`` helper bound to the stub."""
     from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
 
     def _icon():
@@ -71,10 +71,9 @@ def _make_position_gizmos_self():
         join_icon=_icon(),
         extend_to_wall_icon=_icon(),
         fillet_icon=_icon(),
-        PARALLEL_DOT_THRESHOLD=GizmoWallJoinIntersection.PARALLEL_DOT_THRESHOLD,
-        COLLINEAR_LINE_TOLERANCE=GizmoWallJoinIntersection.COLLINEAR_LINE_TOLERANCE,
         ICON_STACK_OFFSET_Y=GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y,
         ICON_TOP_LIFT=GizmoWallJoinIntersection.ICON_TOP_LIFT,
+        TOP_DOWN_INTERSECTION_CLEARANCE=GizmoWallJoinIntersection.TOP_DOWN_INTERSECTION_CLEARANCE,
     )
 
     def _hide_all():
@@ -142,6 +141,7 @@ def _run_position_gizmos(seg_a, seg_b, top_down=False, screen_up=(0.0, 1.0, 0.0)
         patch.object(wall_module, "_is_fillet_corner_wall", return_value=False),
         patch.object(tool.Wall, "read_geometry", side_effect=read_wall_geometry),
         patch.object(tool.Blender, "is_view_top_down", return_value=top_down),
+        patch.object(tool.Blender, "top_down_factor", return_value=1.0 if top_down else 0.0),
         patch.object(tool.Blender, "get_screen_up_world", return_value=Vector(screen_up)),
         patch.object(gizmo_module, "get_billboard_rotation", return_value=Matrix.Identity(4)),
         patch.object(gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)),
@@ -249,6 +249,42 @@ def test_position_gizmos_stacks_along_screen_up_in_perspective_view():
     delta = join_pos - extend_pos
     assert delta.y == pytest.approx(GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y)
     assert delta.x == pytest.approx(0.0)
+
+
+def test_position_gizmos_lifts_stack_above_intersection_in_top_down_view():
+    """Plan view: stack's lowest icon (extend) sits one
+    ``TOP_DOWN_INTERSECTION_CLEARANCE`` *above* the intersection in screen-up,
+    so the wall axes meeting underneath stay visible. Without this the icons
+    land right on the intersection point and obscure the very feature the
+    user is hovering."""
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
+    self_stub = _run_position_gizmos(
+        seg_a=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        seg_b=((50.0, 50.0, 0.0), (50.0, 51.0, 0.0)),
+        top_down=True,
+        screen_up=(0.0, 1.0, 0.0),
+    )
+    extend_pos = self_stub.extend_to_wall_icon.matrix_basis.translation
+    # Axes intersect at world (50.0, 0.0). The lowest icon (extend) sits at
+    # intersection.y + TOP_DOWN_INTERSECTION_CLEARANCE along screen-up.
+    assert extend_pos.x == pytest.approx(50.0)
+    assert extend_pos.y == pytest.approx(GizmoWallJoinIntersection.TOP_DOWN_INTERSECTION_CLEARANCE)
+
+
+def test_position_gizmos_no_extra_lift_in_perspective_view():
+    """Perspective view: the wall-top Z lift already separates the icons from
+    the wall body, so no screen-up shift applies. The lowest icon's XY
+    matches the intersection."""
+    self_stub = _run_position_gizmos(
+        seg_a=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        seg_b=((50.0, 50.0, 0.0), (50.0, 51.0, 0.0)),
+        top_down=False,
+        screen_up=(0.0, 1.0, 0.0),
+    )
+    extend_pos = self_stub.extend_to_wall_icon.matrix_basis.translation
+    assert extend_pos.x == pytest.approx(50.0)
+    assert extend_pos.y == pytest.approx(0.0)
 
 
 # GizmoWallExtendVertically position_gizmos is unconditional — the top-down
@@ -562,3 +598,74 @@ def test_update_cursor_gizmos_split_world_z_matches_height_for_sloped_wall():
     assert split.matrix_basis.translation.z == pytest.approx(3.0)
     # Pre-fix value (the regression we are guarding against):
     assert split.matrix_basis.translation.z != pytest.approx(3.0 * math.cos(x_angle), rel=1e-3)
+
+
+# ----------------------------------------------------------------------------
+# Hit-shape vs stack-spacing invariant — bbox hitboxes can't overlap siblings
+# ----------------------------------------------------------------------------
+#
+# The icons stacked vertically in GizmoWallJoinIntersection (fillet / wall-corner /
+# wall-tee) sit ICON_STACK_OFFSET_Y apart. Their glyph tris extend across a Y range
+# that exceeds that spacing, so a 2D-bounding-box hit shape would overlap the
+# next icon's hit area and let Blender's reverse-iter hit-test route clicks to
+# the wrong icon. This test pins the resolution: those classes opt out of the
+# bbox hit shape AND, defensively, if anyone flips them back, the bbox extent
+# must fit inside the stack spacing budget.
+
+
+def test_wall_junction_icons_opt_out_of_bbox_hit_shape():
+    """The three wall-junction icons must keep ``hit_uses_bbox = False`` because
+    their stack spacing in ``GizmoWallJoinIntersection`` is smaller than their
+    glyph bbox; the full-bbox hit would let the topmost-iter icon steal clicks
+    from the icons below it."""
+    from bonsai.bim.module.drawing.gizmos import (
+        GizmoFillet,
+        GizmoWallCornerIcon,
+        GizmoWallTeeIcon,
+    )
+
+    for cls in (GizmoFillet, GizmoWallCornerIcon, GizmoWallTeeIcon):
+        assert cls.hit_uses_bbox is False, (
+            f"{cls.__name__} sits in the wall-junction stack at ICON_STACK_OFFSET_Y "
+            f"spacing; flipping hit_uses_bbox to True would let sibling bboxes overlap "
+            f"and misroute clicks. Either keep the opt-out or bump ICON_STACK_OFFSET_Y "
+            f"to fit the glyph bbox + outline padding."
+        )
+
+
+def test_wall_tee_icon_branching_bar_is_centered_not_bottom_anchored():
+    """The side-T (⊣) orientation places the branching (horizontal) bar at the
+    icon's midline so the vertical 'through' bar extends equally above and
+    below it. Asserts the left-edge vertices (where the branching bar
+    reaches) sit above the icon's midpoint."""
+    from bonsai.bim.module.drawing.gizmos import WALL_TEE_TRIS_DEFAULT
+
+    # Left edge of the branching bar reaches the icon's left bbox edge (x ≈ -0.45).
+    left_edge_ys = [v[1] for v in WALL_TEE_TRIS_DEFAULT if v[0] <= -0.40]
+    assert left_edge_ys, "no tris reach the left edge — icon has no branching bar"
+    assert min(left_edge_ys) > 0.0, "branching bar must sit above the icon midline (y=0) for the ⊣ orientation"
+
+
+def test_wall_junction_icon_glyph_bbox_exceeds_stack_offset():
+    """Documents the geometry that motivates the opt-out: each wall-junction icon's
+    glyph extends >0.6 local units in Y (asymmetric: bars reach to +0.45 and -0.28),
+    while ICON_STACK_OFFSET_Y is 0.4 — so bbox+pad hit shapes would overlap each
+    other by ~0.3 local units. If either side of this inequality changes, the
+    opt-out decision needs re-evaluation."""
+    from bonsai.bim.module.drawing.gizmos import (
+        _OUTLINE_DEFAULT_WIDTH,
+        FILLET_TRIS_DEFAULT,
+        WALL_CORNER_TRIS_DEFAULT,
+        WALL_TEE_TRIS_DEFAULT,
+    )
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
+    stack_offset = GizmoWallJoinIntersection.ICON_STACK_OFFSET_Y
+    for tris in (FILLET_TRIS_DEFAULT, WALL_CORNER_TRIS_DEFAULT, WALL_TEE_TRIS_DEFAULT):
+        ys = [v[1] for v in tris]
+        bbox_height_with_pad = (max(ys) - min(ys)) + 2 * _OUTLINE_DEFAULT_WIDTH
+        assert bbox_height_with_pad > stack_offset, (
+            f"bbox+pad height ({bbox_height_with_pad}) fits inside stack offset "
+            f"({stack_offset}) — the wall-junction icons no longer need to opt out "
+            f"of hit_uses_bbox; the opt-out can be removed."
+        )

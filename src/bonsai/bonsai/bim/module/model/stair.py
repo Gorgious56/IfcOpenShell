@@ -242,6 +242,13 @@ class CancelEditingStair(bpy.types.Operator, tool.Ifc.Operator):
         # restore previous settings since editing was canceled
         props.set_props_kwargs_from_ifc_data(data)
         regenerate_stair_mesh(obj)
+        # Restore matrix_world from IFC. Without this an uncommitted drag
+        # survives the cancel and a later Finish silently commits it.
+        if tool.Ifc.is_moved(obj):
+            if element.ObjectPlacement is None:
+                tool.Geometry.record_object_position(obj)
+            else:
+                tool.Geometry.restore_placement_from_ifc(obj, element)
 
         props.is_editing = False
 
@@ -272,6 +279,10 @@ class FinishEditingStair(bpy.types.Operator, tool.Ifc.Operator):
 
         # update IfcStairFlight properties
         update_ifc_stair_props(obj)
+        # Commit any in-edit matrix_world drift. Pset + representation writes
+        # above do not cover placement; without this an in-edit drag is silently
+        # dropped on Finish.
+        tool.Geometry.commit_placement_if_moved(obj)
         props.is_editing = False
         return {"FINISHED"}
 
@@ -285,6 +296,9 @@ class EnableEditingStair(bpy.types.Operator, tool.Ifc.Operator):
     def _execute(self, context: bpy.types.Context) -> set[str]:
         obj = context.active_object
         assert obj
+        # Commit pre-edit matrix_world drift so Cancel's restore-from-IFC
+        # reads a fresh ObjectPlacement instead of snapping back past the drag.
+        tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
         props = tool.Model.get_stair_props(obj)
         element = tool.Ifc.get_entity(obj)
         data = json.loads(ifcopenshell.util.element.get_pset(element, "BBIM_Stair", "Data"))

@@ -33,6 +33,7 @@ counts the calls to the operator's module-local ``bonsai.core.geometry.
 switch_representation``. Both the N=1 (independent ``workspace.py`` caller)
 and the N=8 (array commit) shapes must converge to a single host regen."""
 
+import time
 from unittest.mock import patch
 
 import bpy
@@ -41,7 +42,7 @@ from mathutils import Vector
 
 import bonsai.core.geometry
 import bonsai.tool as tool
-from test.bim.bootstrap import NewIfc
+from test.bim.bootstrap import NewIfc, reset_to_new_ifc
 
 pytestmark = pytest.mark.model
 
@@ -72,7 +73,9 @@ class TestRecalculateFillDedupesHostRegen(NewIfc):
         bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 1))
         wall_obj = bpy.context.active_object
         assert wall_obj
-        wall_obj.scale = (10.0, 0.1, 1.5)
+        # 16 units half-extent in X accommodates up to n=16 doors at the 1.5
+        # spacing below; the perf-scaling test exercises that upper bound.
+        wall_obj.scale = (16.0, 0.1, 1.5)
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         rprops = tool.Root.get_root_props()
         rprops.ifc_product = "IfcElement"
@@ -137,4 +140,81 @@ class TestRecalculateFillDedupesHostRegen(NewIfc):
         wall_regens = self._count_wall_regens(wall, doors)
         assert wall_regens == 1, (
             f"RecalculateFill regenerated the host wall {wall_regens}× for a " f"single filling — expected 1."
+        )
+
+    def _time_recalculate_fill(self, n: int, repeats: int) -> float:
+        """Build a fresh wall + ``n`` doors and return the median wall-clock
+        time for ``bpy.ops.bim.recalculate_fill`` across ``repeats`` runs."""
+        _wall, doors = self._make_wall_with_n_doors(n=n)
+        samples = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            with bpy.context.temp_override(selected_objects=doors):
+                bpy.ops.bim.recalculate_fill()
+            samples.append(time.perf_counter() - t0)
+        samples.sort()
+        return samples[len(samples) // 2]
+
+    def test_update_simple_openings_dedupes_host_regen_across_array_siblings(self):
+        """End-to-end pin for the user-facing workflow. ``finish_editing_window``
+        and ``finish_editing_door`` both go through
+        ``tool.Model.update_simple_openings(element)``, which resolves array
+        siblings via ``get_all_element_occurrences`` and dispatches them all
+        into ``bim.recalculate_fill`` via a ``temp_override``. The inner
+        dedup contract — host wall regenerated once, not once per sibling —
+        must survive that dispatch path, not just direct ``recalculate_fill``
+        calls with a hand-picked selection.
+
+        Patches ``get_all_element_occurrences`` to return all N doors as
+        siblings, sidestepping the IfcType + IfcRelDefinesByType scaffolding
+        a real array would build (those rels fire Bonsai handlers that need
+        Blender objects per type, which is orthogonal to what this test
+        pins). The dispatch chain inside ``update_simple_openings``
+        (``temp_override`` → ``bim.recalculate_fill``) is exercised the
+        same way."""
+        wall, doors = self._make_wall_with_n_doors(n=8)
+        door_elements = [tool.Ifc.get_entity(d) for d in doors]
+
+        from bonsai.bim.module.model import opening as opening_module
+
+        with (
+            patch.object(tool.Ifc, "get_all_element_occurrences", return_value=door_elements),
+            patch.object(opening_module, "bonsai") as mock_bonsai,
+        ):
+            tool.Model.update_simple_openings(door_elements[0])
+            sr = mock_bonsai.core.geometry.switch_representation
+            wall_regens = sum(1 for call in sr.call_args_list if call.kwargs.get("obj") is wall)
+
+        assert wall_regens == 1, (
+            f"update_simple_openings drove recalculate_fill to regenerate the "
+            f"host wall {wall_regens}× across 8 array siblings — expected 1. "
+            f"The dedup contract didn't survive the full user-facing dispatch path."
+        )
+
+    def test_recalculate_fill_scaling_stays_subquadratic(self):
+        """Perf regression guard. A regression that re-introduces per-filling
+        host regen (the pre-fix bug, O(N²) on the cube benchmark) shows up
+        as a steep ratio between the N=16 and N=4 wall-times. With the dedup
+        intact the ratio is ~4× on a dev machine (post-fix); pre-fix it was
+        ~14×. The 7× threshold is set generously above the post-fix
+        measurement to absorb CI jitter while still catching a return to
+        quadratic scaling.
+
+        Telemetry — the print on success surfaces the measured ratio in CI
+        logs (visible under ``pytest -s``) so creeping regressions toward
+        the threshold are spotted before they fail the build."""
+        t_n4 = self._time_recalculate_fill(n=4, repeats=5)
+        reset_to_new_ifc()
+        t_n16 = self._time_recalculate_fill(n=16, repeats=5)
+
+        ratio = t_n16 / t_n4
+        print(
+            f"\n[perf] recalculate_fill scaling — N=4: {t_n4 * 1000:.0f}ms, "
+            f"N=16: {t_n16 * 1000:.0f}ms, ratio: {ratio:.1f}× (threshold <7×)"
+        )
+        assert ratio < 7.0, (
+            f"recalculate_fill(N=16)={t_n16 * 1000:.0f}ms is {ratio:.1f}× "
+            f"recalculate_fill(N=4)={t_n4 * 1000:.0f}ms — a quadratic-looking "
+            f"slope. The host wall is likely being regenerated per-filling "
+            f"again instead of once per unique host."
         )

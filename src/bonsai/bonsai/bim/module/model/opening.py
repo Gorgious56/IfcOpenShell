@@ -756,7 +756,7 @@ class EditOpenings(Operator, tool.Ifc.Operator):
                         tool.Geometry, opening_element, similar_openings
                     )
                 elif tool.Ifc.is_moved(opening_obj):
-                    tool.Geometry.commit_placement_if_moved(opening_obj)
+                    bonsai.core.geometry.edit_object_placement(tool.Ifc, tool.Geometry, tool.Surveyor, obj=opening_obj)
                     bonsai.core.geometry.edit_similar_opening_placement(
                         tool.Geometry, opening_element, similar_openings
                     )
