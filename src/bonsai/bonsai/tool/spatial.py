@@ -1083,7 +1083,7 @@ class Spatial(bonsai.core.tool.Spatial):
         curve = builder.polyline(coords_2d, closed=True)
         item = builder.extrude(curve, magnitude=depth_ifc)
 
-        old_body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        old_body = tool.Geometry.get_body_representation(element)
         if old_body:
             context = old_body.ContextOfItems
             ifcopenshell.api.geometry.unassign_representation(ifc_file, product=element, representation=old_body)

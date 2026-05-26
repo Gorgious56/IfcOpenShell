@@ -35,7 +35,6 @@ __all__ = [  # noqa: RUF022 (unsorted `__all__`)
     "CoordinateSpace",
     "ModalState",
     "DimensionGizmoConfig",
-    "DimensionDrawConfig",
     "ViewDirection",
     "GizmoModalContext",
     "get_modal_context",
@@ -72,9 +71,6 @@ __all__ = [  # noqa: RUF022 (unsorted `__all__`)
     "GizmoCone",
     "GizmoDimension",
     "DimensionRenderer",
-    "TypeAccessorBase",
-    "CycleTypeMixin",
-    "PickTypeMixin",
     "BaseParametricGizmoGroup",
     "UglyDotGizmo",
     "ExtrusionGuidesGizmo",
@@ -85,7 +81,7 @@ import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import blf
 import bpy
@@ -265,9 +261,9 @@ class ModalState(Enum):
 class GizmoModalContext:
     """Typed context for modal gizmo operations.
 
-    This replaces the untyped dict pattern for passing state between gizmos
-    and the BIM_OT_gizmo_value_input modal operator. Blender ID properties
-    don't support function callbacks, so we use this module-level instance.
+    Passes state between a gizmo and the BIM_OT_gizmo_value_input modal operator.
+    Blender ID properties cannot carry function callbacks, so a module-level
+    instance carries them out-of-band.
 
     Attributes:
         move_set_cb: Callback to set the property value
@@ -426,9 +422,8 @@ class GPUStateScope:
 class DimensionTextRenderer:
     """Handles text rendering for dimension gizmos.
 
-    Extracted from GizmoDimension to follow Single Responsibility Principle.
-    This class manages all text drawing operations including value text,
-    property tooltips, and text backgrounds.
+    Manages text drawing operations including value text, property
+    tooltips, and text backgrounds.
 
     Usage:
         renderer = DimensionTextRenderer.get_instance()
@@ -583,50 +578,6 @@ class DimensionTextRenderer:
 
 
 @dataclass(slots=True, frozen=True)
-class DimensionDrawConfig:
-    """Immutable configuration for drawing a dimension line.
-
-    Groups the many parameters needed by DimensionRenderer.draw() into a
-    single configuration object, improving readability and maintainability.
-
-    Attributes:
-        start_world: World-space start position
-        end_world: World-space end position
-        axis_world: Normalized axis direction in world space
-        dimension_length: Length of the dimension (for drawing the line)
-        color: Base color (r, g, b)
-        alpha: Base alpha (0.0 to 1.0)
-        is_highlight: Whether gizmo is highlighted/hovered
-        highlight_color: Highlight color (r, g, b)
-        highlight_alpha: Highlight alpha
-        show_start_arrow: Whether to show arrow at start
-        show_end_arrow: Whether to show arrow at end
-        show_extension_lines: Whether to show extension lines
-        text_offset_sign: 1 for above/right, -1 for below/left
-        text_alignment: TextAlignment value for text positioning along line
-        prop_name: Property name for tooltip (shown when highlighted)
-        display_value: Value to display as text (can be negative); uses dimension_length if None
-    """
-
-    start_world: Vector
-    end_world: Vector
-    axis_world: Vector
-    dimension_length: float
-    color: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    alpha: float = 1.0
-    is_highlight: bool = False
-    highlight_color: tuple[float, float, float] = (1.0, 1.0, 0.5)
-    highlight_alpha: float = 1.0
-    show_start_arrow: bool = False
-    show_end_arrow: bool = True
-    show_extension_lines: bool = True
-    text_offset_sign: Literal[-1, 1] = 1
-    text_alignment: TextAlignment = TextAlignment.CENTER
-    prop_name: str | None = None
-    display_value: float | None = None
-
-
-@dataclass(slots=True, frozen=True)
 class ViewDirection:
     """Immutable representation of camera view direction relative to an element's local space.
 
@@ -717,19 +668,8 @@ _OUTLINE_DIRECTIONS_8 = (
 
 
 class DimensionRenderer:
-    """Handles rendering of dimension line graphics.
-
-    Extracted from GizmoDimension to follow Single Responsibility Principle.
-    This class manages all dimension drawing operations including lines,
-    arrows, and extension lines in screen space.
-
-    Usage:
-        renderer = DimensionRenderer.get_instance()
-        config = DimensionDrawConfig(start_world, end_world, axis_world, length, color)
-        renderer.draw(context, config)
-        # Or use legacy method signature:
-        renderer.draw(context, start_world, end_world, ...)
-    """
+    """Singleton renderer for dimension line graphics. Draws the dimension
+    line, end arrows, and extension lines in screen space."""
 
     _instance: "DimensionRenderer | None" = None
     _line_shader = None
@@ -1287,13 +1227,12 @@ class DimensionGizmoConfig(BaseValueGizmoConfig):
     show_end_arrow: bool = True
     text_formatter: Callable[[Any, float], str] | None = None  # Optional: function(props, value) -> label text
     schematic_visible_length: float | None = None  # Override the schematic group's default tag length for this dim.
-    # In-place dimensions ignore this — it only takes effect when the config is
-    # consumed by ``BaseSchematicGizmoGroup.update_schematic_dimensions``.
+    # In-place dimensions ignore this — it only affects schematic-group rendering.
 
     def __post_init__(self):
-        # Explicit parent call rather than super(): @dataclass(slots=True) replaces the
-        # decorated class in module namespace, but super()'s implicit __class__ cell
-        # still binds to the pre-decorator class, so super() raises TypeError here.
+        # @dataclass(slots=True) rebinds the class in module namespace, leaving super()'s
+        # implicit __class__ cell pointing at the pre-decorator class. Call the parent
+        # __post_init__ directly to avoid the resulting TypeError.
         BaseValueGizmoConfig.__post_init__(self)
 
         # Normalize and validate text_alignment
@@ -1725,6 +1664,26 @@ def billboarded_at(world_pos: Vector, billboard_rot: Matrix, scale: float = DEFA
     return Matrix.Translation(world_pos) @ billboard_rot @ Matrix.Scale(scale, 4)
 
 
+# Dead-band on the screen-X delta — prevents flicker when the gizmo sits on the
+# element origin.
+EXTEND_FLIP_EPSILON = 1e-4
+
+# Post-multipliers that mirror a billboarded matrix about its local X / Y axis.
+EXTEND_FLIP_MIRROR_X = Matrix.Diagonal(Vector((-1.0, 1.0, 1.0, 1.0)))
+EXTEND_FLIP_MIRROR_Y = Matrix.Diagonal(Vector((1.0, -1.0, 1.0, 1.0)))
+
+
+def should_flip_extend_arrow(
+    gizmo_world: Vector,
+    origin_world: Vector,
+    billboard_rot: Matrix,
+) -> bool:
+    """True when ``origin_world`` projects to screen-right of ``gizmo_world`` —
+    mirror the extend arrow's local X so it points toward the element's body."""
+    screen_delta = billboard_rot.transposed() @ (origin_world - gizmo_world)
+    return screen_delta.x > EXTEND_FLIP_EPSILON
+
+
 def setup_icon_gizmo(
     gizmo_group: bpy.types.GizmoGroup,
     gizmo_type: str,
@@ -1833,19 +1792,18 @@ def _draw_outline_and_body(
     Caller must bind the shader and configure any sampler / texture
     uniforms before calling. The ``color`` uniform is set internally for
     each pass — caller's ``color`` uniform is overwritten."""
-    gpu.state.blend_set("ALPHA")
-    if outline_alpha > 0.0 and outline_width > 0.0:
-        shader.uniform_float("color", (0.0, 0.0, 0.0, outline_alpha))
-        for dx, dy in _OUTLINE_DIRECTIONS_8:
-            offset_matrix = base_matrix @ Matrix.Translation((dx * outline_width, dy * outline_width, 0.0))
-            with gpu.matrix.push_pop():
-                gpu.matrix.multiply_matrix(offset_matrix)
-                batch.draw(shader)
-    shader.uniform_float("color", color)
-    with gpu.matrix.push_pop():
-        gpu.matrix.multiply_matrix(base_matrix)
-        batch.draw(shader)
-    gpu.state.blend_set("NONE")
+    with GPUStateScope(blend="ALPHA"):
+        if outline_alpha > 0.0 and outline_width > 0.0:
+            shader.uniform_float("color", (0.0, 0.0, 0.0, outline_alpha))
+            for dx, dy in _OUTLINE_DIRECTIONS_8:
+                offset_matrix = base_matrix @ Matrix.Translation((dx * outline_width, dy * outline_width, 0.0))
+                with gpu.matrix.push_pop():
+                    gpu.matrix.multiply_matrix(offset_matrix)
+                    batch.draw(shader)
+        shader.uniform_float("color", color)
+        with gpu.matrix.push_pop():
+            gpu.matrix.multiply_matrix(base_matrix)
+            batch.draw(shader)
 
 
 def draw_tris_with_outline(
@@ -3674,7 +3632,7 @@ class GizmoArrayAll(StaticTrisGizmoMixin, bpy.types.Gizmo):
         child_element = tool.Ifc.get_entity(obj)
         if child_element is None:
             return
-        layer_index = tool.Blender.Modifier.Array.get_child_layer_index(child_element)
+        layer_index = tool.Array.get_child_layer_index(child_element)
         if layer_index is None:
             return
         pset = ifcopenshell.util.element.get_pset(child_element, "BBIM_Array")
@@ -3827,6 +3785,32 @@ class GizmoSplit(StaticTrisGizmoMixin, bpy.types.Gizmo):
         (0.35, 0.0, 0.0),
         # Right tail extending toward the left.
         *rect_tris(-0.10, -0.06, 0.05, 0.06),
+    )
+
+
+class GizmoUnjoin(StaticTrisGizmoMixin, bpy.types.Gizmo):
+    """Two C-shaped hooks facing each other across a clear gap — conveys
+    severing a relationship between two elements (e.g. an
+    ``IfcRelConnectsPathElements`` between two walls). The "two linked
+    things pulled apart" silhouette reads as relationship-cut rather than
+    geometry-cut."""
+
+    bl_idname = "VIEW3D_GT_unjoin"
+
+    __slots__ = ("custom_shape",)
+
+    # Each hook is three solid bars composing a C: top, bottom, and back
+    # wall. The two C's face inward across a clear gap so the silhouette
+    # reads as "two interlocking links pulled apart".
+    tris = (
+        # Left hook — C opening to the right.
+        *rect_tris(-0.30, 0.11, -0.08, 0.17),
+        *rect_tris(-0.30, -0.17, -0.08, -0.11),
+        *rect_tris(-0.30, -0.17, -0.24, 0.17),
+        # Right hook — mirror, C opening to the left.
+        *rect_tris(0.08, 0.11, 0.30, 0.17),
+        *rect_tris(0.08, -0.17, 0.30, -0.11),
+        *rect_tris(0.24, -0.17, 0.30, 0.17),
     )
 
 
@@ -4767,145 +4751,6 @@ class GizmoDimension(GizmoMovable):
         clear_snap_cache()
 
 
-class TypeAccessorBase:
-    """Shared contract for operators that resolve and write a Literal type
-    attribute on a Bonsai PropertyGroup.
-
-    Subclasses define ``element_checker``, ``props_getter``, ``type_literal``,
-    ``type_attr``; ``skip_element_check`` bypasses element validation. Concrete
-    subclasses (``CycleTypeMixin``, ``PickTypeMixin``) add the interaction
-    shape on top.
-
-    Test doubles must be set on the operator instance — the predicates are
-    bound at class-definition time, so patching the underlying tool module
-    has no effect."""
-
-    element_checker: Callable[[ifcopenshell.entity_instance], bool]
-    props_getter: Callable[[bpy.types.Object], bpy.types.PropertyGroup]
-    type_literal: type
-    type_attr: str
-    skip_element_check: bool = False
-
-    def _resolve_target(self, context: bpy.types.Context) -> bpy.types.Object | None:
-        """Return the active object iff it passes ``element_checker`` (or the
-        check is skipped). ``None`` signals the operator should bail with
-        ``{'CANCELLED'}``."""
-        obj = context.active_object
-        if not obj:
-            return None
-        if not self.skip_element_check:
-            element = tool.Ifc.get_entity(obj)
-            if not element or not self.element_checker(element):
-                return None
-        return obj
-
-
-class CycleTypeMixin(TypeAccessorBase):
-    """Operator mixin that cycles through ``type_literal``'s values.
-
-    Shift-click reverses direction."""
-
-    reverse: bpy.props.BoolProperty(name="Reverse", default=False, options={"HIDDEN", "SKIP_SAVE"})
-
-    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
-        self.reverse = event.shift
-        return self.execute(context)
-
-    def _cycle_type(self, context: bpy.types.Context) -> set[str]:
-        obj = self._resolve_target(context)
-        if obj is None:
-            return {"CANCELLED"}
-
-        props = self.props_getter(obj)
-        types = get_args(self.type_literal)
-        current = getattr(props, self.type_attr)
-        idx = types.index(current) if current in types else 0
-        direction = -1 if self.reverse else 1
-        setattr(props, self.type_attr, types[(idx + direction) % len(types)])
-
-        return {"FINISHED"}
-
-
-class PickTypeMixin(TypeAccessorBase):
-    """Operator mixin that opens a popup menu listing ``type_literal``'s values.
-
-    Empty ``value`` ⇒ ``invoke`` opens the popup; non-empty ⇒ the user picked
-    an item and ``_pick_type`` applies it.
-
-    When invoked mid-click (e.g. from a gizmo's ``target_set_operator``), the
-    menu opens only after the originating ``LEFTMOUSE`` releases. Otherwise
-    the still-pressed click flows straight into Blender's drag-through-pick
-    gesture and the menu commits whichever item the cursor drifts over on
-    release. Other invocation paths (command-palette / F3, EXEC_DEFAULT, F6
-    redo) bypass the wait and open the menu immediately.
-
-    The ``value`` StringProperty is declared on this mixin but registered via
-    the concrete Operator subclass's MRO scan — do not instantiate the mixin
-    standalone."""
-
-    # Carries the picked value through invoke→execute; empty default
-    # distinguishes "open popup" from "apply".
-    value: bpy.props.StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})
-
-    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
-        """Open the picker menu, or apply a value that was preset by a
-        menu-item click.
-
-        Routing through ``execute()`` keeps subclass IFC-transaction wrapping
-        in the loop and means F6 redo / ``EXEC_DEFAULT`` reach the apply path."""
-        if self.value:
-            return self.execute(context)
-
-        if self._resolve_target(context) is None:
-            return {"CANCELLED"}
-
-        if event.value == "PRESS":
-            context.window_manager.modal_handler_add(self)
-            return {"RUNNING_MODAL"}
-        return self._open_picker(context)
-
-    def modal(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            return self._open_picker(context)
-        if event.type in {"RIGHTMOUSE", "ESC"}:
-            return {"CANCELLED"}
-        return {"RUNNING_MODAL"}
-
-    def _open_picker(self, context: bpy.types.Context) -> set[str]:
-        bl_idname = self.bl_idname
-        values = list(get_args(self.type_literal))
-
-        def draw(menu_self, _menu_context):
-            layout = menu_self.layout
-            for v in values:
-                op = layout.operator(bl_idname, text=v)
-                op.value = v
-
-        context.window_manager.popup_menu(draw, title=self.bl_label, icon="MENU_PANEL")
-        # INTERFACE (not FINISHED) keeps the menu-opening invocation out of the
-        # undo stack; the picked-value write below returns FINISHED, so the
-        # type change remains undoable as a single step.
-        return {"INTERFACE"}
-
-    def _pick_type(self, context: bpy.types.Context) -> set[str]:
-        if not self.value:
-            # No-op rather than re-open the menu, so command-palette misuse
-            # doesn't infinite-loop.
-            return {"CANCELLED"}
-
-        obj = self._resolve_target(context)
-        if obj is None:
-            return {"CANCELLED"}
-
-        if self.value not in get_args(self.type_literal):
-            self.report({"WARNING"}, f"Unknown {self.type_attr}: {self.value!r}")
-            return {"CANCELLED"}
-
-        props = self.props_getter(obj)
-        setattr(props, self.type_attr, self.value)
-        return {"FINISHED"}
-
-
 class BillboardingGizmoGroupMixin:
     """Mixin for standalone ``bpy.types.GizmoGroup`` classes whose icons must billboard
     (face the camera) and re-position every frame.
@@ -5438,10 +5283,10 @@ class BaseParametricGizmoGroup:
             return False
         if not cls.is_element_type(element):
             return False
-        # Mutual exclusion between parametric and array triads — running two
+        # Mutual exclusion between parametric and array edit lifecycles — running two
         # finish operators against the same object would race, and the doubled
         # validate/cancel icon stack reads as a UI bug. Hide this gizmo group
-        # while a different parametric type is in an active triad edit on obj.
+        # while a different parametric type is in an active edit lifecycle on obj.
         if cls._other_parametric_edit_active(obj):
             return False
         return True
@@ -5449,7 +5294,7 @@ class BaseParametricGizmoGroup:
     @classmethod
     def _other_parametric_edit_active(cls, obj: bpy.types.Object) -> bool:
         """True if any parametric type OTHER than this group's own is in an
-        active triad edit on ``obj``."""
+        active edit lifecycle on ``obj``."""
         return tool.Parametric.is_object_editing(obj, skip_name=getattr(cls, "gizmo_pref_name", None)) is not None
 
     def setup(self, context: bpy.types.Context) -> None:
@@ -5783,7 +5628,7 @@ class BaseParametricGizmoGroup:
                 "VIEW3D_GT_menu", default_color, self.pick_type_operator, highlight_color
             )
 
-        # ARRAY button — visible during the feature triad edit only (positioned by
+        # ARRAY button — visible during the feature edit lifecycle only (positioned by
         # ``update_editing_gizmos``). Click commits the current edit and adds a
         # Blender-vanilla-defaulted array (count=2, X-offset = bbox extent). The
         # array gizmo group opts out via ``hide_array_button = True`` since

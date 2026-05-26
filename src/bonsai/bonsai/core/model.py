@@ -41,6 +41,15 @@ FILLET_DEFAULT_ARC_RESOLUTION = 24
 # this the projected intersection is too sensitive to floating-point noise
 # to be useful as a junction apex. Calibrated to ~2° from parallel.
 PARALLEL_DOT_THRESHOLD = 0.9994
+# Perpendicular distance (SI metres) under which two parallel wall axes are
+# considered to share the same infinite line. Calibrated to absorb sub-50mm
+# placement drift between authored-joined walls without merging genuinely
+# offset parallel walls.
+COLLINEAR_LINE_TOLERANCE = 0.05
+# Default proximity (SI metres) for classifying a layer offset against the
+# canonical EXTERIOR / CENTER / INTERIOR baselines. Tight enough that ordinary
+# millimetre-scale modelling intent always falls into the nearest baseline.
+BASELINE_OFFSET_TOLERANCE = 0.001
 
 
 def unjoin_walls(
@@ -188,11 +197,11 @@ class RequireLayeredElement(Exception):
 
 
 # --- Wall geometry math (pure) ------------------------------------------------
-# Tuple in / tuple out so these helpers run under ``pytest test/core/`` without
-# ``bpy`` or ``mathutils``. Callers convert ``mathutils.Vector`` at the boundary.
+# Tuple in / tuple out so these helpers run without ``bpy`` or ``mathutils``.
+# Callers convert ``mathutils.Vector`` at the boundary.
 
 
-def baseline_from_offset(offset: float, thickness: float, tolerance: float = 0.001) -> str:
+def baseline_from_offset(offset: float, thickness: float, tolerance: float = BASELINE_OFFSET_TOLERANCE) -> str:
     """Classify a numeric layer offset as EXTERIOR / CENTER / INTERIOR.
 
     Handles both POSITIVE and NEGATIVE direction_sense walls. Returns the
@@ -373,7 +382,7 @@ def are_axes_collinear(
     seg_a: tuple[tuple[float, float, float], tuple[float, float, float]],
     seg_b: tuple[tuple[float, float, float], tuple[float, float, float]],
     parallel_threshold: float = PARALLEL_DOT_THRESHOLD,
-    line_tolerance: float = 0.05,
+    line_tolerance: float = COLLINEAR_LINE_TOLERANCE,
 ) -> bool:
     """True if both axis segments lie on the same infinite line in plan.
 

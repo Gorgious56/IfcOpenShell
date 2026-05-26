@@ -73,7 +73,7 @@ import bonsai.core.style
 import bonsai.core.system
 import bonsai.core.tool
 import bonsai.tool as tool
-from bonsai.bim.ifc import IfcStore
+from bonsai.bim.ifc import IfcStore, get_cache_or_detect_lock
 
 if TYPE_CHECKING:
     from bonsai.bim.module.geometry.prop import (
@@ -115,7 +115,17 @@ class Geometry(bonsai.core.tool.Geometry):
 
     @classmethod
     def clear_cache(cls, element: ifcopenshell.entity_instance) -> None:
-        cache = IfcStore.get_cache()
+        # Cache acquisition can fail if the HDF5 file is locked by another
+        # process — degrade gracefully rather than aborting the caller's
+        # reimport flow. A stale cache entry is harmless; a raised exception
+        # prevents the actual mesh swap. The wrapper sets the project-panel
+        # warning flag on lock so the user sees one prominent notice instead
+        # of per-element log spam.
+        try:
+            cache = get_cache_or_detect_lock()
+        except Exception as exc:
+            print(f"clear_cache: skipping cache invalidation for {element} ({exc})")
+            return
         if cache and hasattr(element, "GlobalId"):
             cache.remove(element.GlobalId)
 
@@ -132,6 +142,14 @@ class Geometry(bonsai.core.tool.Geometry):
             if getattr(rep, "RepresentationIdentifier", None) == "Axis":
                 return True
         return False
+
+    @classmethod
+    def get_body_representation(cls, element: ifcopenshell.entity_instance) -> ifcopenshell.entity_instance | None:
+        """The element's ``Model/Body/MODEL_VIEW`` representation, or ``None``.
+        Single source for the ``(context, identifier, target_view)`` triple used
+        by every body-geometry reader across walls, slabs, doors, openings, and
+        feature decorators."""
+        return ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
 
     @classmethod
     def clear_modifiers(cls, obj: bpy.types.Object) -> None:
@@ -1202,11 +1220,27 @@ class Geometry(bonsai.core.tool.Geometry):
         cancel-style flow that want a "restore-or-clear-drift" semantic must gate
         on ObjectPlacement themselves and call ``record_object_position`` directly
         in the no-placement branch."""
+        assert element.ObjectPlacement is not None, (
+            "restore_placement_from_ifc requires ObjectPlacement — gate the caller "
+            "or use restore_or_rebaseline_placement for the restore-or-clear-drift semantic"
+        )
         matrix_np = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement).copy()
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
         matrix_np[:3, 3] *= unit_scale
         obj.matrix_world = tool.Loader.apply_blender_offset_to_matrix_world(obj, matrix_np)
         cls.record_object_position(obj)
+
+    @classmethod
+    def restore_or_rebaseline_placement(cls, obj: bpy.types.Object, element: ifcopenshell.entity_instance) -> None:
+        """Cancel-flow placement restore: revert ``obj.matrix_world`` to the committed
+        IFC placement; when the element has no ObjectPlacement, re-baseline the drift
+        checksum instead so a subsequent edit does not silently commit the discarded drag."""
+        if not tool.Ifc.is_moved(obj):
+            return
+        if element.ObjectPlacement is None:
+            cls.record_object_position(obj)
+            return
+        cls.restore_placement_from_ifc(obj, element)
 
     @classmethod
     def remove_connection(cls, connection: ifcopenshell.entity_instance) -> None:
@@ -1258,6 +1292,20 @@ class Geometry(bonsai.core.tool.Geometry):
         new_obj.matrix_world = obj.matrix_world
         bpy.data.objects.remove(obj)
         return new_obj
+
+    @classmethod
+    def detach_representation(cls, product: ifcopenshell.entity_instance) -> None:
+        """Replace ``product.Representation`` with a deep copy so the product
+        no longer shares its representation tree (mapped or direct) with any
+        other entity. The ``IfcGeometricRepresentationContext`` is excluded
+        from the copy so contexts stay file-singletons. No-op when the
+        product has no ``Representation`` attribute or it is unset."""
+        rep = getattr(product, "Representation", None)
+        if rep is None:
+            return
+        product.Representation = ifcopenshell.util.element.copy_deep(
+            tool.Ifc.get(), rep, exclude=["IfcGeometricRepresentationContext"]
+        )
 
     @classmethod
     def resolve_mapped_representation(
@@ -2266,7 +2314,7 @@ class Geometry(bonsai.core.tool.Geometry):
                 array_data = arrays_to_duplicate.get(obj, None)
                 tool.Model.handle_array_on_copied_element(new, array_data)
                 if array_data:
-                    for child in tool.Blender.Modifier.Array.get_all_children_objects(new):
+                    for child in tool.Array.get_all_children_objects(new):
                         child.select_set(True)
 
                 # TODO: add new array children to recreate their decomposition too
@@ -2363,8 +2411,8 @@ class Geometry(bonsai.core.tool.Geometry):
                 continue
 
             array_data = []
-            for modifier_data in tool.Blender.Modifier.Array.get_modifiers_data(array_parent):
-                children = set(tool.Blender.Modifier.Array.get_children_objects(modifier_data))
+            for modifier_data in tool.Array.get_modifiers_data(array_parent):
+                children = set(tool.Array.get_children_objects(modifier_data))
                 if children.issubset(selected_objects):
                     modifier_data["children"] = []
                     array_data.append(modifier_data)

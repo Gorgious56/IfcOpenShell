@@ -423,6 +423,7 @@ class Duplicate:
     def recreate_decompositions(cls, relationships, old_to_new): pass
     def recreate_connections(cls, relationship, old_to_new): pass
     def recreate_port_connections(cls, snapshot, old_to_new): pass
+    def consume_warnings(cls): pass
 
 
 @interface
@@ -1224,6 +1225,21 @@ class Voider:
 
 
 @interface
+class Array:
+    def bake_children_transform(cls, parent_element, item): pass
+    def constrain_children_to_parent(cls, parent_element): pass
+    def get_all_children_objects(cls, parent_element): pass
+    def get_all_objects(cls, parent_element): pass
+    def get_child_layer_index(cls, child_element): pass
+    def get_children_objects(cls, modifier_data): pass
+    def get_modifiers_data(cls, parent_element): pass
+    def get_parent_element(cls, element): pass
+    def get_parent_object(cls, element): pass
+    def remove_constraints(cls, parent_element): pass
+    def set_children_lock_state(cls, parent_element, item, lock_state): pass
+
+
+@interface
 class Slab:
     def read_geometry(cls, obj): pass
 
@@ -1241,6 +1257,7 @@ class Wall:
     def path_connection_location_world(cls, seg_self, self_conn_type, seg_other, other_conn_type, parallel_threshold): pass
     def read_geometry(cls, obj): pass
     def validate_for_parametric_edit(cls, obj): pass
+    def walk_connected_walls(cls, start_element, node_cap): pass
 
 
 @interface

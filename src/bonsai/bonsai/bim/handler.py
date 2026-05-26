@@ -37,7 +37,7 @@ from bonsai.bim.decorator_cache import (
     install_decorator_cache_handlers,
     uninstall_decorator_cache_handlers,
 )
-from bonsai.bim.ifc import IfcStore
+from bonsai.bim.ifc import IfcStore, get_cache_or_detect_lock
 from bonsai.bim.module.aggregate.decorator import AggregateDecorator
 from bonsai.bim.module.georeference.decorator import GeoreferenceDecorator
 from bonsai.bim.module.model.data import AuthoringData
@@ -176,7 +176,7 @@ def update_bim_tool_props():
     if is_annotation_tool:
         return
 
-    representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+    representation = tool.Geometry.get_body_representation(element)
     if not representation:
         return
 
@@ -407,9 +407,22 @@ def _apply_save_file_invariants() -> None:
     tool.Parametric.heal_stale_edit_flags()
     heal_inconsistent_array_edit_state(bpy.data.objects)
 
+    # Scene-persisted deferred actions must be re-validated against the IFC
+    # we're about to start from. Stale step-ids from a prior IFC reference
+    # the wrong entities once a different file is loaded — clear and let the
+    # in-progress import repopulate if it has gross elements.
+    tool.Project.get_project_props().pending_opening_recut.clear()
+
     if tool.Ifc.get() and bpy.data.is_saved:
         props = tool.Blender.get_bim_props()
         props.has_blend_warning = True
+
+    # Probe the H5 cooked-geometry cache so the multi-instance warning surfaces
+    # right after .blend load. Without this, the lock is only detected when a
+    # mutation triggers ``clear_cache`` — by which time the user has already
+    # made changes that may now conflict with the other Blender instance.
+    if tool.Ifc.get():
+        get_cache_or_detect_lock()
 
 
 def _apply_user_preferences() -> None:

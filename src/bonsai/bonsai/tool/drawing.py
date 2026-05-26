@@ -961,7 +961,7 @@ class Drawing(bonsai.core.tool.Drawing):
     def import_drawing(cls, drawing: ifcopenshell.entity_instance) -> bpy.types.Object:
         settings = ifcopenshell.geom.settings()
 
-        representation = ifcopenshell.util.representation.get_representation(drawing, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(drawing)
         assert representation
 
         shape = ifcopenshell.geom.create_shape(settings, drawing)
@@ -983,7 +983,7 @@ class Drawing(bonsai.core.tool.Drawing):
     def import_temporary_drawing_camera(cls, drawing: ifcopenshell.entity_instance) -> bpy.types.Object:
         settings = ifcopenshell.geom.settings()
 
-        representation = ifcopenshell.util.representation.get_representation(drawing, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(drawing)
         assert representation
 
         shape = ifcopenshell.geom.create_shape(settings, drawing)
@@ -1339,29 +1339,17 @@ class Drawing(bonsai.core.tool.Drawing):
             classes_split = [c for c in classes_split if c not in FONT_SIZES] + [font_size_str]
             classes = " ".join(classes_split)
 
-            ifc_file = tool.Ifc.get()
-            pset = tool.Pset.get_element_pset(element, "EPset_Annotation")
-            if not pset:
-                pset = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="EPset_Annotation")
-            ifcopenshell.api.pset.edit_pset(ifc_file, pset=pset, properties={"Classes": classes})
+            tool.Pset.upsert_pset(element, "EPset_Annotation", {"Classes": classes})
 
     @classmethod
     def edit_text_wrap_length(cls, obj: bpy.types.Object, wrap_length: int) -> None:
         element = tool.Ifc.get_entity(obj)
-        ifc_file = tool.Ifc.get()
-        pset = tool.Pset.get_element_pset(element, "EPset_Annotation")
-        if not pset:
-            pset = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="EPset_Annotation")
-        ifcopenshell.api.pset.edit_pset(ifc_file, pset=pset, properties={"Newline_At": wrap_length})
+        tool.Pset.upsert_pset(element, "EPset_Annotation", {"Newline_At": wrap_length})
 
     @classmethod
     def edit_text_symbol(cls, obj: bpy.types.Object, symbol: str) -> None:
         element = tool.Ifc.get_entity(obj)
-        ifc_file = tool.Ifc.get()
-        pset = tool.Pset.get_element_pset(element, "EPset_Annotation")
-        if not pset:
-            pset = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="EPset_Annotation")
-        ifcopenshell.api.pset.edit_pset(ifc_file, pset=pset, properties={"Symbol": symbol})
+        tool.Pset.upsert_pset(element, "EPset_Annotation", {"Symbol": symbol})
 
     @classmethod
     def edit_text_alignment(cls, obj: bpy.types.Object, alignment: str) -> None:
@@ -2686,7 +2674,7 @@ class Drawing(bonsai.core.tool.Drawing):
 
     @classmethod
     def get_extrusion_vector(cls, wall):
-        if body := ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW"):
+        if body := tool.Geometry.get_body_representation(wall):
             for item in ifcopenshell.util.representation.resolve_representation(body).Items:
                 while item.is_a("IfcBooleanResult"):
                     item = item.FirstOperand

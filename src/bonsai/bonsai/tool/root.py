@@ -53,7 +53,7 @@ class Root(bonsai.core.tool.Root):
     @classmethod
     def assign_body_styles(cls, element: ifcopenshell.entity_instance, obj: bpy.types.Object) -> None:
         # Should this even be here? Should it be in the geometry tool?
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         if body:
             [
                 tool.Geometry.run_style_add_style(obj=mat)
@@ -260,7 +260,7 @@ class Root(bonsai.core.tool.Root):
                 # Make sure that the array children also get reassigned to the correct aggregate
                 pset = ifcopenshell.util.element.get_pset(new[0], "BBIM_Array")
                 if pset:
-                    array_children = tool.Blender.Modifier.Array.get_all_children_objects(new[0])
+                    array_children = tool.Array.get_all_children_objects(new[0])
                     for obj in array_children:
                         bonsai.core.aggregate.assign_object(
                             tool.Ifc,

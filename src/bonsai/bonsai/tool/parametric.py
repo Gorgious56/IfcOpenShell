@@ -20,19 +20,34 @@
 
 """Registry and save-time auto-commit for parametric draft edits.
 
-Adding a new parametric element type is a single entry in ``EDIT_TYPES``."""
+The registry is consumed along two orthogonal axes:
+
+- **Predicate axis**: every entry carries an ``is_<name>`` total predicate. Used
+  by ``find_for_element``, save-flow auto-commit, and per-feature gizmo polls.
+- **Lifecycle axis**: a subset of entries flagged ``supports_build_edit_lifecycle=True``
+  share the ``Enable/Finish/CancelEditing<Type>`` operator shape and are wired
+  through ``build_edit_lifecycle``. The remainder declare their edit operators
+  directly because their lifecycle (per-attribute diff dispatch, layer-stack
+  editing, mid-spline gizmo drag, …) does not fit the shared mixin contract.
+
+Adding a new parametric element type is a single entry in ``EDIT_TYPES``;
+flag ``supports_build_edit_lifecycle`` only if the type's edit lifecycle matches
+one of the shared mixins in ``bim/parametric_lifecycle.py``."""
 
 from __future__ import annotations
 
+import logging
 import re
-import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import bpy
 
 import bonsai.core.tool
 import bonsai.tool as tool
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ifcopenshell import entity_instance
@@ -49,20 +64,28 @@ def _camel_case(name: str) -> str:
 
 @dataclass(frozen=True)
 class ParametricObject:
-    """One parametric element type's draft + enable + finish + cancel triad.
+    """One parametric element type's draft + enable + finish + cancel edit lifecycle.
 
     The ``name`` token drives every derived identifier: the
-    ``BIM<Name>Properties`` attribute on ``bpy.types.Object`` and the
+    ``BIM<Name>Properties`` attribute on ``bpy.types.Object``, the
     ``bim.enable_editing_<name>`` / ``bim.finish_editing_<name>`` /
-    ``bim.cancel_editing_<name>`` operator ``bl_idname``s.
+    ``bim.cancel_editing_<name>`` operator ``bl_idname``s, and the
+    ``tool.Parametric.is_<name>`` runtime predicate.
 
-    The paired runtime predicate ``tool.Blender.Modifier.is_<name>`` is part
-    of the contract and MUST be total — accept any IFC entity, return a
-    bool, never raise. A raising predicate breaks the save path for every
-    parametric type, not just its own."""
+    The predicate is part of the contract and MUST be total — accept any IFC
+    entity, return a bool, never raise. A raising predicate breaks the save
+    path for every parametric type, not just its own.
+
+    ``supports_build_edit_lifecycle`` marks entries whose edit lifecycle fits the
+    shared mixin contract (``_enable_targets`` / ``_finish_targets`` /
+    ``_cancel_targets``) and that therefore wire their operators through
+    ``build_edit_lifecycle``. Entries with bespoke edit lifecycles (per-attribute
+    diff dispatch, layer-stack editing, mid-spline gizmo drag) leave this
+    False and declare their operator classes directly."""
 
     name: str
     has_non_editable_path: bool = False
+    supports_build_edit_lifecycle: bool = False
 
     def __post_init__(self) -> None:
         if not _VALID_NAME_RE.match(self.name):
@@ -124,26 +147,30 @@ class Parametric(bonsai.core.tool.Parametric):
             self._data.clear()
             self._gen = None
 
-        def __bool__(self) -> bool:
-            return bool(self._data)
-
-        def __len__(self) -> int:
-            return len(self._data)
-
-        def __contains__(self, key) -> bool:
-            return key in self._data
-
     EDIT_TYPES: list[ParametricObject] = [
-        ParametricObject("door", has_non_editable_path=True),
-        ParametricObject("window", has_non_editable_path=True),
-        ParametricObject("stair", has_non_editable_path=True),
-        ParametricObject("railing"),
-        ParametricObject("roof"),
+        ParametricObject("door", has_non_editable_path=True, supports_build_edit_lifecycle=True),
+        ParametricObject("window", has_non_editable_path=True, supports_build_edit_lifecycle=True),
+        ParametricObject("stair", has_non_editable_path=True, supports_build_edit_lifecycle=True),
+        ParametricObject("railing", supports_build_edit_lifecycle=True),
+        ParametricObject("roof", supports_build_edit_lifecycle=True),
         ParametricObject("wall"),
-        ParametricObject("array"),
-        ParametricObject("pipe_segment", has_non_editable_path=True),
-        ParametricObject("duct_segment", has_non_editable_path=True),
+        ParametricObject("array", supports_build_edit_lifecycle=True),
+        ParametricObject("pipe_segment", has_non_editable_path=True, supports_build_edit_lifecycle=True),
+        ParametricObject("duct_segment", has_non_editable_path=True, supports_build_edit_lifecycle=True),
     ]
+
+    # Annotations for the uppercase constants populated from ``EDIT_TYPES`` by
+    # the binding loop at module bottom. Declared here so IDEs and type
+    # checkers see the attributes without running the loop.
+    DOOR: ClassVar[ParametricObject]
+    WINDOW: ClassVar[ParametricObject]
+    STAIR: ClassVar[ParametricObject]
+    RAILING: ClassVar[ParametricObject]
+    ROOF: ClassVar[ParametricObject]
+    WALL: ClassVar[ParametricObject]
+    ARRAY: ClassVar[ParametricObject]
+    PIPE_SEGMENT: ClassVar[ParametricObject]
+    DUCT_SEGMENT: ClassVar[ParametricObject]
 
     _geom_generation: int = 0
 
@@ -172,17 +199,36 @@ class Parametric(bonsai.core.tool.Parametric):
         return next((f for f in cls.EDIT_TYPES if f.name == name), None)
 
     @classmethod
+    def _safe_predicate(cls, feature: ParametricObject, element: entity_instance) -> bool:
+        """Resolve and invoke ``is_<feature.name>`` defensively. The contract is
+        that predicates are total (see ``ParametricObject`` docstring); a
+        regression that turns one predicate raising would otherwise break the
+        save path for every parametric type, not just its own."""
+        predicate = getattr(cls, f"is_{feature.name}", None)
+        if predicate is None:
+            return False
+        try:
+            return bool(predicate(element))
+        except Exception:
+            logger.warning(
+                "parametric predicate is_%s raised on %r",
+                feature.name,
+                element,
+                exc_info=True,
+            )
+            return False
+
+    @classmethod
     def find_for_element(cls, element: entity_instance) -> Optional[ParametricObject]:
         """Return the registry entry whose IFC type predicate matches ``element``."""
         for feature in cls.EDIT_TYPES:
-            predicate = getattr(tool.Blender.Modifier, f"is_{feature.name}", None)
-            if predicate is not None and predicate(element):
+            if cls._safe_predicate(feature, element):
                 return feature
         return None
 
     @classmethod
     def is_object_editing(cls, obj: bpy.types.Object, skip_name: Optional[str] = None) -> Optional[ParametricObject]:
-        """Return the registry entry whose triad is active on ``obj``, or None.
+        """Return the registry entry whose edit lifecycle is active on ``obj``, or None.
 
         ``skip_name`` excludes one entry from the scan, for callers that want
         to know if a *different* type is editing."""
@@ -205,8 +251,7 @@ class Parametric(bonsai.core.tool.Parametric):
         if feature is None:
             return None
         element = tool.Ifc.get_entity(obj)
-        predicate = getattr(tool.Blender.Modifier, f"is_{feature.name}", None)
-        if element is None or predicate is None or not predicate(element):
+        if element is None or not cls._safe_predicate(feature, element):
             getattr(obj, feature.props_attr).is_editing = False
             return None
         return feature
@@ -242,9 +287,10 @@ class Parametric(bonsai.core.tool.Parametric):
         that wrap would mutate IFC outside Bonsai's transaction system."""
         verb = bl_idname.removeprefix("bim.")
         op_cls = getattr(bpy.types, f"BIM_OT_{verb}", None)
-        assert op_cls is not None and issubclass(
-            op_cls, tool.Ifc.Operator
-        ), f"{bl_idname!r} must be a registered tool.Ifc.Operator subclass for undo-safe IFC mutation"
+        if op_cls is None or not issubclass(op_cls, tool.Ifc.Operator):
+            raise RuntimeError(
+                f"{bl_idname!r} must be a registered tool.Ifc.Operator subclass for undo-safe IFC mutation"
+            )
         getattr(bpy.ops.bim, verb)()
 
     @classmethod
@@ -263,9 +309,13 @@ class Parametric(bonsai.core.tool.Parametric):
                 try:
                     cls.run_bim_op(finish_op)
                     return True
-                except Exception as e:
-                    print(f"Bonsai: commit of {obj.name!r} via {finish_op} failed: {e}")
-                    traceback.print_exc()
+                except Exception:
+                    logger.warning(
+                        "commit of %r via %s failed",
+                        obj.name,
+                        finish_op,
+                        exc_info=True,
+                    )
                     return False
         finally:
             view_layer.objects.active = original_active
@@ -307,9 +357,24 @@ class Parametric(bonsai.core.tool.Parametric):
         return committed, failed
 
     @classmethod
+    def _assert_predicates_registered(cls) -> None:
+        """Loud at addon-enable if any ``EDIT_TYPES`` entry has no matching
+        ``is_<name>`` classmethod. Without this, a typo in the registry entry
+        produces a silent-False predicate that never matches — every
+        parametric draft of that type bypasses save-flow auto-commit."""
+        missing = [feature.name for feature in cls.EDIT_TYPES if not callable(getattr(cls, f"is_{feature.name}", None))]
+        if missing:
+            raise RuntimeError(
+                f"tool.Parametric.EDIT_TYPES has entries with no is_<name> predicate: {missing}. "
+                f"Add `is_<name>(cls, element) -> bool` classmethods on tool.Parametric, "
+                f"or remove the entries from EDIT_TYPES."
+            )
+
+    @classmethod
     def register_object_properties(cls, prop_module) -> None:
         """Attach ``bpy.types.Object.BIM<Name>Properties`` for every registered
         parametric type. Skips entries whose ``PropertyGroup`` is absent."""
+        cls._assert_predicates_registered()
         for feature in cls.EDIT_TYPES:
             prop_cls = getattr(prop_module, feature.props_attr, None)
             if prop_cls is None:
@@ -328,3 +393,213 @@ class Parametric(bonsai.core.tool.Parametric):
         empty if absent. Must register before ``GizmoPreferences``."""
         shared = getattr(ui_module, "GizmoPreferencesFeature", None)
         return [shared] if shared is not None else []
+
+    # --- Feature-kind predicates ------------------------------------------------
+    # One predicate per registered parametric type. Each is total: accepts any
+    # IFC entity (or None), returns a bool, never raises. Predicates live with
+    # the registry rather than ``tool.Blender.Modifier`` because they ARE the
+    # registry contract — ``find_for_element`` and ``_validated_editing_feature``
+    # resolve them by name. Coupling them on the same class makes a typo at
+    # registration time an immediate AttributeError instead of a silent None
+    # predicate that never matches.
+
+    @classmethod
+    def is_array(cls, element: entity_instance) -> bool:
+        """True if element is the PARENT of a Bonsai parametric array.
+
+        Array children also carry a ``BBIM_Array`` pset (their ``Parent``
+        field points back to the original), so checking pset presence alone
+        would falsely match them. The parent is distinguished by
+        ``pset.Parent == element.GlobalId``."""
+        import ifcopenshell.util.element
+
+        if element is None:
+            return False
+        pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+        if not pset:
+            return False
+        return pset.get("Parent") == element.GlobalId
+
+    @classmethod
+    def is_railing(cls, element: entity_instance) -> bool:
+        if element is None:
+            return False
+        return tool.Pset.get_element_pset(element, "BBIM_Railing") is not None
+
+    @classmethod
+    def is_roof(cls, element: entity_instance) -> bool:
+        if element is None:
+            return False
+        return tool.Pset.get_element_pset(element, "BBIM_Roof") is not None
+
+    @classmethod
+    def is_window(cls, element: entity_instance) -> bool:
+        if element is None:
+            return False
+        return tool.Pset.get_element_pset(element, "BBIM_Window") is not None
+
+    @classmethod
+    def is_door(cls, element: entity_instance) -> bool:
+        if element is None:
+            return False
+        return tool.Pset.get_element_pset(element, "BBIM_Door") is not None
+
+    @classmethod
+    def is_stair(cls, element: entity_instance) -> bool:
+        if element is None:
+            return False
+        return tool.Pset.get_element_pset(element, "BBIM_Stair") is not None
+
+    @classmethod
+    def is_wall(cls, element: entity_instance) -> bool:
+        """A wall is editable by the parametric gizmo if it is an IfcWall with LAYER2 usage.
+
+        Unlike doors/windows/stairs, walls do not carry a proprietary BBIM_Wall pset —
+        their parametric state lives in standard IFC (axis polyline, IfcMaterialLayerSetUsage,
+        IfcExtrudedAreaSolid). Any LAYER2 wall qualifies."""
+        if element is None or not element.is_a("IfcWall"):
+            return False
+        return tool.Model.get_usage_type(element) == "LAYER2"
+
+    @classmethod
+    def is_path_connectable_wall(cls, element: entity_instance) -> bool:
+        """An IfcWall that may participate in IfcRelConnectsPathElements joins —
+        either a LAYER2 parametric wall, or a fillet-corner wall whose body is
+        hand-built but whose axis still drives path connections.
+
+        Distinct from ``is_wall``: that predicate gates parametric edits that
+        would regenerate the body and flatten a curved fillet. Unjoin / join
+        gizmo polls and path-connection partner enumeration use this looser
+        predicate so fillet corners (which have no LAYER2 usage by spec) still
+        surface their join icons."""
+        if element is None or not element.is_a("IfcWall"):
+            return False
+        if tool.Model.get_usage_type(element) == "LAYER2":
+            return True
+        import ifcopenshell.util.element
+
+        return bool(ifcopenshell.util.element.get_pset(element, "BBIM_Wall", "IsFilletCorner"))
+
+    @classmethod
+    def is_pipe_segment(cls, element: entity_instance) -> bool:
+        return element is not None and element.is_a("IfcPipeSegment")
+
+    @classmethod
+    def is_duct_segment(cls, element: entity_instance) -> bool:
+        return element is not None and element.is_a("IfcDuctSegment")
+
+    @classmethod
+    def build_edit_lifecycle(
+        cls,
+        feature_name: str,
+        mixin: type,
+        labels: tuple[tuple[str, str], tuple[str, str], tuple[str, str]],
+        bl_options: Optional[set[str]] = None,
+        enable_extra_props: Optional[dict[str, Any]] = None,
+        enable_extra_kwargs: Optional[Callable[[Any], dict[str, Any]]] = None,
+        module_name: Optional[str] = None,
+    ) -> tuple[type, type, type]:
+        """Generate (Enable, Finish, Cancel) operator classes for a parametric type.
+
+        ``mixin`` provides ``_enable_targets`` / ``_finish_targets`` /
+        ``_cancel_targets`` (i.e. inherits from ``ParametricEditMixinBase`` or
+        a sibling). ``labels`` is ``((enable_label, enable_desc), …)`` in
+        Enable / Finish / Cancel order.
+
+        ``bl_idname`` and the Python class name come from the registry entry —
+        ``feature_name`` MUST already be in ``EDIT_TYPES``, otherwise a typo
+        produces an unregistered operator. Anchoring bl_idnames to the registry
+        eliminates the silent-mismatch failure mode where a hand-typed
+        ``bl_idname = "bim.enable_editing_dor"`` produces a class that
+        ``find_for_element`` never resolves to.
+
+        ``enable_extra_props`` declares extra ``bpy.props.*`` descriptors to
+        attach to the Enable class only (e.g. array's ``item: IntProperty``
+        carrying the target layer index across redo). When set,
+        ``enable_extra_kwargs`` must also be supplied: it receives the Enable
+        operator instance and returns a kwargs dict forwarded to
+        ``_enable_targets`` so the mixin's enable phase sees the extras.
+
+        ``module_name`` sets ``__module__`` on the generated classes — pass
+        ``__name__`` from the calling feature module so Blender's right-click
+        → Edit Source resolves to the feature module rather than the factory
+        site. Defaults to the factory's module, which is sub-optimal for
+        debugging but harmless."""
+        import bonsai.tool as _tool  # late import: tool/__init__.py wires this module last
+
+        feature = cls.find_by_name(feature_name)
+        if feature is None:
+            raise RuntimeError(
+                f"build_edit_lifecycle: {feature_name!r} not in EDIT_TYPES — add a "
+                f"ParametricObject entry before declaring its operators"
+            )
+        if not feature.supports_build_edit_lifecycle:
+            raise RuntimeError(
+                f"build_edit_lifecycle: {feature_name!r} has supports_build_edit_lifecycle=False — "
+                f"its edit lifecycle is bespoke. Either declare "
+                f"Enable/Finish/CancelEditing{_camel_case(feature_name)} as direct Operator "
+                f"subclasses, or flip the flag on the EDIT_TYPES entry if the type does fit "
+                f"the shared mixin contract."
+            )
+        if (enable_extra_props is None) != (enable_extra_kwargs is None):
+            raise RuntimeError(
+                f"build_edit_lifecycle({feature_name!r}): enable_extra_props and "
+                f"enable_extra_kwargs must be supplied together — extras with no "
+                f"kwargs builder are unreachable, kwargs with no extras have nothing to forward"
+            )
+        options = bl_options if bl_options is not None else {"REGISTER", "UNDO"}
+        base_classes = (mixin, bpy.types.Operator, _tool.Ifc.Operator)
+        capitalised = _camel_case(feature_name)
+
+        def _build(
+            action: str, bl_idname: str, label: str, desc: str, target_method: str, extras: Optional[dict]
+        ) -> type:
+            if extras and target_method == "_enable_targets":
+                assert enable_extra_kwargs is not None
+                kwargs_builder = enable_extra_kwargs
+
+                def _execute(self, context: bpy.types.Context) -> set[str]:
+                    return getattr(self, target_method)(context, **kwargs_builder(self))
+
+            else:
+
+                def _execute(self, context: bpy.types.Context) -> set[str]:
+                    return getattr(self, target_method)(context)
+
+            attrs: dict[str, Any] = {
+                "bl_idname": bl_idname,
+                "bl_label": label,
+                "bl_description": desc,
+                "bl_options": options,
+                "_execute": _execute,
+            }
+            if module_name is not None:
+                attrs["__module__"] = module_name
+            if extras:
+                # Blender's PropertyGroup machinery reads __annotations__ for bpy.props descriptors.
+                attrs["__annotations__"] = dict(extras)
+            return type(f"{action}Editing{capitalised}", base_classes, attrs)
+
+        return (
+            _build("Enable", feature.enable_op, labels[0][0], labels[0][1], "_enable_targets", enable_extra_props),
+            _build("Finish", feature.finish_op, labels[1][0], labels[1][1], "_finish_targets", None),
+            _build("Cancel", feature.cancel_op, labels[2][0], labels[2][1], "_cancel_targets", None),
+        )
+
+
+_edit_type_names = [entry.name for entry in Parametric.EDIT_TYPES]
+if len(set(_edit_type_names)) != len(_edit_type_names):
+    raise RuntimeError(
+        f"EDIT_TYPES name collision: {_edit_type_names}. Each name is the primary key "
+        f"for derived bl_idnames, BIM<Name>Properties attributes, is_<name> predicates, "
+        f"and the uppercase constant — a duplicate silently shadows the first entry."
+    )
+del _edit_type_names
+
+# Bind every registered ParametricObject as an uppercase class attribute so
+# call sites can reference ``tool.Parametric.ROOF`` directly. Renaming a
+# registry entry renames the constant; a typo at the call site surfaces as
+# AttributeError at module load.
+for _entry in Parametric.EDIT_TYPES:
+    setattr(Parametric, _entry.name.upper(), _entry)
+del _entry

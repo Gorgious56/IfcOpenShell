@@ -45,14 +45,34 @@ def reset_for_test() -> None:
 
 
 @bpy.app.handlers.persistent
-def _bump_decorator_cache_token(*_args: Any) -> None:
+def _bump_decorator_cache_token(*args: Any) -> None:
+    """depsgraph_update_post fires every animation frame and every driver
+    evaluation, even when no IFC-relevant ID block changed. Unconditional
+    bumping defeats the cache: an animated scene rebuilds every decorator
+    every viewport tick. Gate the depsgraph path on Object geometry or
+    transform updates; undo / redo / load have no depsgraph and always
+    invalidate.
+
+    Coverage assumption: ``TokenCache`` consumers key on Object identity
+    (depsgraph updates whose ``id`` is a ``bpy.types.Object``). Mesh /
+    Material / NodeTree updates that don't surface as an Object change
+    do NOT invalidate the token — a decorator that caches material- or
+    mesh-data-derived state must gate on a separate signal."""
     global _DECORATOR_CACHE_TOKEN
+    if len(args) >= 2:
+        depsgraph = args[1]
+        if depsgraph is not None and hasattr(depsgraph, "updates"):
+            if not any(
+                (getattr(u, "is_updated_geometry", False) or getattr(u, "is_updated_transform", False))
+                and hasattr(u, "id")
+                and isinstance(u.id, bpy.types.Object)
+                for u in depsgraph.updates
+            ):
+                return
     _DECORATOR_CACHE_TOKEN += 1
 
 
 def _hooks() -> tuple[Any, ...]:
-    # Four hooks cover every path that can free a bpy.types.Object out from
-    # under a decorator cache.
     return (
         bpy.app.handlers.depsgraph_update_post,
         bpy.app.handlers.undo_post,

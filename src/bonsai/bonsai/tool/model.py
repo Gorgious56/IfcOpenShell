@@ -841,7 +841,7 @@ class Model(bonsai.core.tool.Model):
         assert element or representation, "Either element or representation must be provided."
         if representation is None:
             assert element
-            representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            representation = tool.Geometry.get_body_representation(element)
             if not representation:
                 return []
         booleans = []
@@ -862,7 +862,7 @@ class Model(bonsai.core.tool.Model):
             return []
         boolean_ids = json.loads(pset["Data"])
         if representation is None:
-            representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            representation = tool.Geometry.get_body_representation(element)
             if not representation:
                 return []
         booleans = [b for b in cls.get_booleans(element, representation) if b.id() in boolean_ids]
@@ -951,7 +951,7 @@ class Model(bonsai.core.tool.Model):
                 # Revolved area check should happen inside bim.enable_editing_extrusion_axis
                 # but keep it here to trigger import_representation_items,
                 # so users will be able to at least move IfcRevolvedAreaSolid, until there will be a full support.
-                body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+                body = tool.Geometry.get_body_representation(element)
                 if body and any(
                     i.is_a("IfcRevolvedAreaSolid") for i in ifcopenshell.util.representation.resolve_base_items(body)
                 ):
@@ -1115,8 +1115,8 @@ class Model(bonsai.core.tool.Model):
             ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=array_pset, properties={"Data": json_data})
 
             for i in range(len(array_data)):
-                tool.Blender.Modifier.Array.set_children_lock_state(element, i, True)
-            tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+                tool.Array.set_children_lock_state(element, i, True)
+            tool.Array.constrain_children_to_parent(element)
 
     @classmethod
     def regenerate_array(
@@ -1153,12 +1153,17 @@ class Model(bonsai.core.tool.Model):
                 offset = base_offset * i
 
                 for obj in obj_stack:
+                    # IndexError when child_i is past the recorded children list
+                    # (count grew); RuntimeError when by_guid finds no entity (the
+                    # child was deleted outside the array op); AssertionError when
+                    # the IFC entity exists but its Blender object was unlinked.
+                    # All three fall through to duplication.
                     try:
                         global_id = array["children"][child_i]
                         child_element = tool.Ifc.get().by_guid(global_id)
                         child_obj = tool.Ifc.get_object(child_element)
                         assert child_obj
-                    except:
+                    except (IndexError, RuntimeError, AssertionError):
                         old_to_new, _ = tool.Geometry.duplicate_ifc_objects([parent_obj])
                         child_element = next(iter(old_to_new.values()))[0]
                         child_obj = tool.Ifc.get_object(child_element)
@@ -1205,13 +1210,14 @@ class Model(bonsai.core.tool.Model):
                 if obj:
                     tool.Geometry.delete_ifc_object(obj)
 
-            if array.get("mirror_to_host", True) and children_elements:
+            if array.get("per_child_opening", array.get("mirror_to_host", True)) and children_elements:
                 cls.mirror_parent_void_fillings_to_children(parent_element, children_elements)
 
             if array_i in array_layers_to_apply:
                 for child_element in children_elements:
                     pset = tool.Pset.get_element_pset(child_element, "BBIM_Array")
                     ifcopenshell.api.pset.remove_pset(tool.Ifc.get(), product=child_element, pset=pset)
+                    cls.unshare_opening_representation(child_element)
 
                 array["children"] = []
                 array["count"] = 1
@@ -1239,7 +1245,8 @@ class Model(bonsai.core.tool.Model):
 
         No-op when the parent is not a filling, when the host element cannot
         be resolved, or when the children list is empty. Opt out via the
-        per-layer ``mirror_to_host`` flag on ``BBIM_Array.Data``.
+        per-layer ``per_child_opening`` flag on ``BBIM_Array.Data`` (legacy
+        key ``mirror_to_host`` still honoured for round-trip with older files).
         """
         host = tool.Spatial.get_host_element(parent_element)
         if host is None or not children_elements:
@@ -1305,6 +1312,20 @@ class Model(bonsai.core.tool.Model):
             bonsai.core.geometry.switch_representation(
                 tool.Ifc, tool.Geometry, obj=voided_obj, representation=representation
             )
+
+    @classmethod
+    def unshare_opening_representation(cls, filling: ifcopenshell.entity_instance) -> None:
+        """Detach a filling's opening representation from any shared mapped body.
+
+        Required when a Bonsai array child is promoted to an independent
+        object: the array's per-child opening mirror builds each child's
+        opening representation as an ``IfcMappedRepresentation`` over the
+        parent opening's body. Without this detach, a later edit replacing
+        the parent body rewrites the shared ``IfcRepresentationMap`` and
+        reshapes the former-child's opening too."""
+        if not getattr(filling, "FillsVoids", None):
+            return
+        tool.Geometry.detach_representation(filling.FillsVoids[0].RelatingOpeningElement)
 
     @classmethod
     def replace_object_ifc_representation(
@@ -1529,7 +1550,7 @@ class Model(bonsai.core.tool.Model):
             if not obj.data:
                 continue
             element = tool.Ifc.get_entity(obj)
-            body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            body = tool.Geometry.get_body_representation(element)
             bonsai.core.geometry.switch_representation(
                 tool.Ifc,
                 tool.Geometry,
@@ -1901,7 +1922,7 @@ class Model(bonsai.core.tool.Model):
         from bonsai.bim.module.model.opening import FilledOpeningGenerator
 
         ifc_file = tool.Ifc.get()
-        fillings = {e: tool.Ifc.get_object(e) for e in tool.Ifc.get_all_element_occurrences(element)}
+        fillings = {e: tool.Ifc.get_object(e) for e in tool.Array.get_parametric_propagation_targets(element)}
 
         voided_objs = set()
         has_replaced_opening_representation = False
@@ -2891,14 +2912,18 @@ class Model(bonsai.core.tool.Model):
                 tool.Geometry.commit_placement_if_moved(obj)
                 queue.add((rel.RelatingElement, obj))
         for element, wall in queue:
-            if tool.Model.get_usage_type(element) == "LAYER2" and wall:
-                # Use layer custom offset
+            if not wall:
+                continue
+            is_layer2_usage = tool.Model.get_usage_type(element) == "LAYER2"
+            is_fillet_corner = bool(ifcopenshell.util.element.get_pset(element, "BBIM_Wall", "IsFilletCorner"))
+            if not (is_layer2_usage or is_fillet_corner):
+                continue
+            if is_layer2_usage:
                 custom_offset = tool.Model.get_material_layer_custom_offset(element, wall)
                 material = ifcopenshell.util.element.get_material(element)
                 if material.is_a("IfcMaterialLayerSetUsage") and custom_offset is not None:
                     material.OffsetFromReferenceLine = custom_offset
-
-                cls.recreate_wall(element, wall)
+            cls.recreate_wall(element, wall)
 
     @classmethod
     def regenerate_slab(cls, obj: bpy.types.Object) -> None:

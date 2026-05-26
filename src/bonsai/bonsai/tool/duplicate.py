@@ -69,6 +69,24 @@ class PortConnectionSnapshot:
 
 class Duplicate(bonsai.core.tool.Duplicate):
 
+    _pending_warnings: list[str] = []
+
+    @classmethod
+    def _emit_warning(cls, message: str) -> None:
+        """Buffer a warning for later retrieval by an operator. Falling through
+        to a print keeps the message in the Blender console for the headless /
+        no-operator code path."""
+        cls._pending_warnings.append(message)
+        print(f"Bonsai: WARNING — {message}")
+
+    @classmethod
+    def consume_warnings(cls) -> list[str]:
+        """Return and clear the buffered warnings — operators call this after
+        ``tool.Geometry.duplicate_ifc_objects`` to forward each to ``self.report``."""
+        warnings = cls._pending_warnings
+        cls._pending_warnings = []
+        return warnings
+
     @classmethod
     def get_decomposition_relationships(
         cls, objs: list[bpy.types.Object]
@@ -252,10 +270,8 @@ class Duplicate(bonsai.core.tool.Duplicate):
                 try:
                     tool.Ifc.run("attribute.edit_attributes", product=new_rel, attributes=priority_attrs)
                 except (RuntimeError, ifcopenshell.Error) as e:
-                    # No safe rollback path; surface the partial state so the user
-                    # knows the duplicate's priority lists may be empty.
-                    print(
-                        f"Bonsai: WARNING — connection priority restore failed for {new_rel}; "
+                    cls._emit_warning(
+                        f"connection priority restore failed for {new_rel}; "
                         f"duplicate has empty RelatingPriorities/RelatedPriorities: {e}"
                     )
 
@@ -280,14 +296,16 @@ class Duplicate(bonsai.core.tool.Duplicate):
 
                 expected_relating = snapshot.port_counts.get(relating_element)
                 if expected_relating is not None and len(new_relating_ports) != expected_relating:
-                    print(
-                        f"Bonsai: port reconnect skipped — duplicate has {len(new_relating_ports)} ports, snapshot had {expected_relating}"
+                    cls._emit_warning(
+                        f"port reconnect skipped — duplicate has {len(new_relating_ports)} ports, "
+                        f"snapshot had {expected_relating}"
                     )
                     continue
                 expected_related = snapshot.port_counts.get(related_element)
                 if expected_related is not None and len(new_related_ports) != expected_related:
-                    print(
-                        f"Bonsai: port reconnect skipped — duplicate has {len(new_related_ports)} ports, snapshot had {expected_related}"
+                    cls._emit_warning(
+                        f"port reconnect skipped — duplicate has {len(new_related_ports)} ports, "
+                        f"snapshot had {expected_related}"
                     )
                     continue
 
@@ -295,6 +313,9 @@ class Duplicate(bonsai.core.tool.Duplicate):
                     new_port_a = new_relating_ports[record.relating_port_index]
                     new_port_b = new_related_ports[record.related_port_index]
                 except IndexError:
+                    cls._emit_warning(
+                        f"port reconnect skipped — record references port index past the duplicate's port list"
+                    )
                     continue
                 try:
                     tool.Ifc.run(
@@ -304,4 +325,4 @@ class Duplicate(bonsai.core.tool.Duplicate):
                         direction=record.direction or "NOTDEFINED",
                     )
                 except (RuntimeError, ifcopenshell.Error) as e:
-                    print(f"Bonsai: port reconnect failed between duplicates: {e}")
+                    cls._emit_warning(f"port reconnect failed between duplicates: {e}")

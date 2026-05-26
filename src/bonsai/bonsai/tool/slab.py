@@ -61,7 +61,7 @@ class Slab(bonsai.core.tool.Slab):
         element = tool.Ifc.get_entity(obj)
         if not element or not tool.Blender.Modifier.is_slab(element):
             return None
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         if not representation:
             return None
         extrusion = tool.Model.get_extrusion(representation)

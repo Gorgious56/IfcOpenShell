@@ -1137,7 +1137,7 @@ class Loader(bonsai.core.tool.Loader):
 
     @classmethod
     def get_extrusion_vector(cls, wall):
-        if body := ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW"):
+        if body := tool.Geometry.get_body_representation(wall):
             for item in ifcopenshell.util.representation.resolve_representation(body).Items:
                 while item.is_a("IfcBooleanResult"):
                     item = item.FirstOperand
@@ -1217,7 +1217,7 @@ class Loader(bonsai.core.tool.Loader):
     ) -> bool:
         items = [i["item"] for i in ifcopenshell.util.representation.resolve_items(representation)]
         if len(items) == 1 and items[0].is_a("IfcSweptDiskSolid"):
-            if tool.Blender.Modifier.is_railing(element):
+            if tool.Parametric.is_railing(element):
                 return False
             return True
         elif len(items) and (  # See #2508 why we accommodate for invalid IFCs here
@@ -1225,7 +1225,7 @@ class Loader(bonsai.core.tool.Loader):
             and len({i.is_a() for i in items}) == 1
             and len({i.Radius for i in items}) == 1
         ):
-            if tool.Blender.Modifier.is_railing(element):
+            if tool.Parametric.is_railing(element):
                 return False
             return True
         return False

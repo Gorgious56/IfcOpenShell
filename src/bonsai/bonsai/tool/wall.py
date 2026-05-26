@@ -55,7 +55,7 @@ class Wall(bonsai.core.tool.Wall):
     def get_length_and_height(cls, wall: ifcopenshell.entity_instance) -> tuple[float, float] | None:
         """SI length and vertical height of a LAYER2 extruded wall, or ``None`` for
         non-parametric bodies (sweeps, brep, non-extrusion booleans)."""
-        representation = ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(wall)
         if not representation:
             return None
         extrusion = tool.Model.get_extrusion(representation)
@@ -76,7 +76,7 @@ class Wall(bonsai.core.tool.Wall):
         """``(min_x, max_x)`` of the wall's IFC reference line in wall-local SI metres,
         or ``None``. Anchors wall-edge gizmos at IFC-authoritative ends — ``obj.bound_box``
         would drift on trimmed walls or walls with end openings."""
-        representation = ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(wall)
         if not representation:
             return None
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
@@ -89,7 +89,7 @@ class Wall(bonsai.core.tool.Wall):
         """Slanted-extrusion angle (radians) of a LAYER2 wall, zero for vertical walls,
         ``None`` for non-parametric bodies. Callers that assume wall-local Z == world Z
         must gate on this being zero."""
-        representation = ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(wall)
         if not representation:
             return None
         extrusion = tool.Model.get_extrusion(representation)
@@ -100,11 +100,15 @@ class Wall(bonsai.core.tool.Wall):
     @classmethod
     def read_geometry(cls, obj: bpy.types.Object) -> WallGeometry | None:
         """Live wall geometry from IFC in SI metres/radians, or ``None`` for
-        non-LAYER2-extruded walls. Shared by gizmo positioning and draft initialisation."""
+        non-path-connectable walls. Shared by gizmo positioning and draft
+        initialisation. Fillet-corner walls carry their chord axis as the
+        reference line and report zero thickness / offset (material was
+        unassigned at construction); callers that need a layer-driven thickness
+        must gate on ``tool.Parametric.is_wall`` upstream."""
         element = tool.Ifc.get_entity(obj)
-        if not element or not tool.Blender.Modifier.is_wall(element):
+        if not element or not tool.Parametric.is_path_connectable_wall(element):
             return None
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         if not representation:
             return None
         extrusion = tool.Model.get_extrusion(representation)
@@ -168,7 +172,7 @@ class Wall(bonsai.core.tool.Wall):
             return (
                 "Wall has no IfcMaterialLayerSetUsage with LayerSetDirection AXIS2 (required for parametric editing)."
             )
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         if not representation:
             return "Wall has no Model/Body/MODEL_VIEW representation to drive parametric dimensions."
         if not tool.Model.get_extrusion(representation):
