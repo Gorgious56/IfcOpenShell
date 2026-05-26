@@ -200,15 +200,51 @@ def test_show_paths_off_short_circuits(patched_draw_env, monkeypatch):
     assert build.call_count == 0, "toggle-off must short-circuit before geometry build"
 
 
-def test_seed_skips_mep_element_without_axis_representation(patched_draw_env, monkeypatch):
-    """A selected IfcFlowSegment / IfcFlowFitting that lacks an IFC Axis
-    representation (e.g. custom BREP-only body) must not seed the overlay.
-    The decorator can only project elements with a real 1D axis to a
-    schematic path; falling back to mesh-derived geometry would draw a
-    misleading line."""
+def test_build_geometry_renders_fitting_without_axis_representation():
+    """Fittings draw from port positions, not from an axis representation;
+    a bend or junction with only a Body representation must still contribute
+    to the path so the schematic stays continuous across the fitting."""
+    decorator = MEPSystemPathDecorator()
+
+    segment = Mock()
+    segment.is_a.side_effect = lambda t: t == "IfcFlowSegment"
+    fitting = Mock()
+    fitting.is_a.side_effect = lambda t: t == "IfcFlowFitting"
+
+    def fake_has_axis(el):
+        return el is segment
+
+    with (
+        patch.object(tool.Geometry, "has_axis_representation", side_effect=fake_has_axis),
+        patch.object(tool.Ifc, "get_object", return_value=Mock()),
+        patch.object(
+            tool.Model,
+            "get_flow_segment_axis",
+            return_value=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        ),
+        patch.object(tool.System, "get_ports", return_value=[Mock(), Mock()]),
+        patch.object(
+            tool.System,
+            "get_port_world_position",
+            side_effect=[(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+        ),
+    ):
+        lines, _points = decorator._build_geometry([segment, fitting])
+
+    assert ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0)) in lines, (
+        "fitting without axis representation must still emit its port-to-port line"
+    )
+
+
+def test_fitting_seeds_path_overlay_even_without_axis_representation(patched_draw_env, monkeypatch):
+    """Any MEP element — segment or fitting — must be a valid seed for the
+    path overlay. Fittings (bends, tees, crosses) typically lack an Axis
+    representation but they're still path members; the seed gate must not
+    require axis presence, otherwise selecting a bend leaves the overlay
+    blank even though the bend is part of the connected network."""
     decorator = MEPSystemPathDecorator()
     element = Mock()
-    element.GlobalId = "guid-brep-only"
+    element.GlobalId = "guid-bend"
     obj, _ = _make_selected(element)
 
     build = Mock(return_value=([], []))
@@ -223,4 +259,4 @@ def test_seed_skips_mep_element_without_axis_representation(patched_draw_env, mo
     ) as ctx:
         decorator.draw(ctx)
 
-    assert build.call_count == 0, "axis-less seed must short-circuit before walk + geometry build"
+    assert build.call_count == 1, "fitting seed without axis must still walk + build geometry"

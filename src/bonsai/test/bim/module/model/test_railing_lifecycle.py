@@ -218,10 +218,10 @@ def test_finish_one_writes_when_draft_differs(patched_railing):
 
 def test_cancel_one_short_circuits_when_draft_matches_stored(patched_railing):
     """Cancel-without-changes is asymmetrically expensive without this guard:
-    ``switch_representation`` re-tessellates the IfcSweptDiskSolid and is
+    ``switch_representation`` re-triangulates the committed body and is
     visibly slow on a long handrail. When nothing changed, the mesh on
-    screen is still the committed IFC representation (the preview only
-    builds on a property change) — skip the reload entirely.
+    screen is still the committed representation (the preview only builds
+    on a property change) — skip the reload entirely.
 
     Behaviour now inherited from ``PathPreservingEditMixin``; railing keeps
     the coverage as the original consumer of the contract.
@@ -262,7 +262,7 @@ def test_restore_viewport_wall_mounted_handrail_switches_representation(patched_
     obj = _make_obj(props)
     patched_railing["tool"].Model.get_railing_props.return_value = props
     body_repr = mock.Mock(name="body_representation")
-    patched_railing["ifcopenshell"].util.representation.get_representation.return_value = body_repr
+    patched_railing["tool"].Geometry.get_body_representation.return_value = body_repr
 
     _RailingEditMixin._restore_viewport_after_cancel(obj, mock.Mock(name="context"))
 
@@ -292,12 +292,97 @@ def test_restore_viewport_frameless_panel_calls_module_bmesh_rebuild(patched_rai
 
 
 # ---------------------------------------------------------------------------
-# _get_railing_path_anchor: tests removed.
+# update_railing_modifier_ifc_data — IFC commit path
 #
-# The schematic-redesign branch replaced ``GizmoRailingEdition`` with
-# ``GizmoRailingSchematic``, which anchors via the schematic frame rather
-# than the polyline's first vertex. ``_get_railing_path_anchor`` was the
-# helper for the old anchor strategy and has been deleted along with the
-# old gizmo group. If schematic-mode gains a similar path-derived helper,
-# new tests should land here.
+# Both railing types must commit a tessellated body via
+# ``tool.Model.add_body_representation``. The committed body is the only
+# thing other IFC viewers and the importer see on reload, and a parametric
+# ``IfcSweptDiskSolid`` rep is not portable across IFC geometry kernels at
+# typical import tolerances — the body must be faceted to round-trip
+# reliably.
+#
+# WALL_MOUNTED_HANDRAIL additionally builds the parametric rep first so
+# ``switch_representation`` can fill the bmesh with full kernel
+# tessellation; the trailing ``add_body_representation`` then overwrites
+# the body with a faceted version of that high-fidelity bmesh.
 # ---------------------------------------------------------------------------
+
+
+def _patch_for_ifc_commit():
+    """Mock the railing module bindings that ``update_railing_modifier_ifc_data``
+    reaches for. ``bpy`` is intentionally left unpatched: the function calls
+    ``isinstance(mesh, bpy.types.Mesh)`` and patching ``bpy`` would replace
+    ``bpy.types.Mesh`` with a Mock, breaking the isinstance check at the
+    type-arity level."""
+    from bonsai.bim.module.model import railing
+
+    return mock.patch.multiple(
+        railing,
+        tool=mock.DEFAULT,
+        ifcopenshell=mock.DEFAULT,
+        bmesh=mock.DEFAULT,
+    )
+
+
+def test_update_ifc_data_wall_mounted_handrail_commits_tessellated_body():
+    """The WALL_MOUNTED_HANDRAIL commit must build the parametric rep so the
+    kernel tessellates the bmesh at full resolution, then overwrite the body
+    with a faceted version via ``add_body_representation``. The faceted
+    body is what the importer reads on reload — the parametric rep alone is
+    not portable across IFC geometry kernels."""
+    from bonsai.bim.module.model import railing
+
+    with _patch_for_ifc_commit() as patches:
+        obj = mock.Mock(name="obj")
+        ctx = mock.Mock(name="context")
+        ctx.active_object = obj
+        props = mock.Mock(
+            name="props",
+            railing_type="WALL_MOUNTED_HANDRAIL",
+            height=1.0,
+            use_manual_supports=False,
+            support_spacing=1.0,
+            railing_diameter=0.05,
+            clear_width=0.04,
+            terminal_type="180",
+        )
+        patches["tool"].Model.get_railing_props.return_value = props
+        patches["tool"].Ifc.get_entity.return_value = mock.Mock(name="element")
+        patches["tool"].Ifc.get_all_element_occurrences.return_value = []
+        patches["tool"].Model.get_modeling_bbim_pset_data.return_value = {
+            "data_dict": {"path_data": {"verts": [(0, 0, 0), (1, 0, 0)], "edges": [(0, 1)]}},
+        }
+        patches["ifcopenshell"].util.unit.calculate_unit_scale.return_value = 1.0
+        # obj.data must be a mock that fails the bpy.types.Mesh isinstance check
+        # so the normal-recalc branch short-circuits without needing a real Mesh.
+        obj.data = mock.Mock(name="non_mesh_data", spec=[])
+
+        railing.update_railing_modifier_ifc_data(ctx)
+
+        patches["ifcopenshell"].api.geometry.add_railing_representation.assert_called_once()
+        patches["tool"].Model.replace_object_ifc_representation.assert_called_once()
+        # The faceted-body commit MUST run after the parametric rep is in place,
+        # so the bmesh that ``switch_representation`` filled gets persisted.
+        patches["tool"].Model.add_body_representation.assert_called_once_with(obj)
+
+
+def test_update_ifc_data_frameless_panel_commits_tessellated_body():
+    """FRAMELESS_PANEL has always written through ``add_body_representation``
+    directly — pin that the unified path preserves the behaviour and never
+    invokes the WALL_MOUNTED_HANDRAIL parametric builder for this type."""
+    from bonsai.bim.module.model import railing
+
+    with _patch_for_ifc_commit() as patches:
+        obj = mock.Mock(name="obj")
+        ctx = mock.Mock(name="context")
+        ctx.active_object = obj
+        props = mock.Mock(name="props", railing_type="FRAMELESS_PANEL", height=1.0)
+        patches["tool"].Model.get_railing_props.return_value = props
+        patches["tool"].Ifc.get_entity.return_value = mock.Mock(name="element")
+        patches["tool"].Ifc.get_all_element_occurrences.return_value = []
+
+        railing.update_railing_modifier_ifc_data(ctx)
+
+        patches["tool"].Model.add_body_representation.assert_called_once_with(obj)
+        patches["ifcopenshell"].api.geometry.add_railing_representation.assert_not_called()
+        patches["tool"].Model.replace_object_ifc_representation.assert_not_called()

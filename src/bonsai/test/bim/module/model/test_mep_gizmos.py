@@ -374,11 +374,147 @@ def test_scale_for_config_returns_expected_ratio(config_name, expected_ratio):
         ENDPOINT_CONFIGS=GizmoMEPActions.ENDPOINT_CONFIGS,
         UNJOIN_CONFIGS=GizmoMEPActions.UNJOIN_CONFIGS,
         ENDPOINT_SCALE_RATIO=GizmoMEPActions.ENDPOINT_SCALE_RATIO,
-        UNJOIN_SCALE_BOOST=GizmoMEPActions.UNJOIN_SCALE_BOOST,
     )
     assert GizmoMEPActions._scale_for_config(stub, config_name) == pytest.approx(
         GizmoMEPActions.ICON_SCALE * expected_ratio
     )
+
+
+@pytest.mark.parametrize("config_name", ["unjoin_start", "unjoin_end", "unjoin_pair"])
+def test_scale_for_config_unjoin_matches_default_billboard_scale(config_name):
+    """Unjoin icons render at the default billboard scale regardless of
+    whether they're endpoint-anchored or row-anchored — destructive actions
+    deserve a full-size deliberate target, on par with the wall unjoin icon."""
+    from types import SimpleNamespace
+
+    from bonsai.bim.module.drawing import gizmos as gizmo
+    from bonsai.bim.module.model.mep import GizmoMEPActions
+
+    stub = SimpleNamespace(
+        ICON_SCALE=GizmoMEPActions.ICON_SCALE,
+        ENDPOINT_CONFIGS=GizmoMEPActions.ENDPOINT_CONFIGS,
+        UNJOIN_CONFIGS=GizmoMEPActions.UNJOIN_CONFIGS,
+        ENDPOINT_SCALE_RATIO=GizmoMEPActions.ENDPOINT_SCALE_RATIO,
+    )
+    assert GizmoMEPActions._scale_for_config(stub, config_name) == pytest.approx(gizmo.DEFAULT_BILLBOARD_SCALE)
+
+
+def _run_mep_extend_refresh(cursor_local_z, current_length=3.0):
+    """Drive ``_MEPSegmentEditionMixin._refresh_element_specific`` with a stub
+    ``self`` and a cursor at ``cursor_local_z`` along the segment's local Z.
+
+    ``mw`` is identity so ``cursor_local`` equals ``cursor_world``; the test
+    math focuses on the tracking contract rather than the transform. The
+    bound-box top is ``current_length`` to feed the split-icon visibility
+    window. Returns the stub ``self`` so callers can assert on per-icon state."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing import gizmos as gizmo_module
+    from bonsai.bim.module.model.mep import _MEPSegmentEditionMixin
+
+    def _icon():
+        return SimpleNamespace(hide=False, matrix_basis=None)
+
+    self_stub = SimpleNamespace(
+        extend_gizmo=_icon(),
+        split_gizmo=_icon(),
+        _frame_billboard_rot=Matrix.Identity(4),
+        is_gizmo_hidden_by_modal=lambda gz: False,
+        CURSOR_STACK_OFFSET=_MEPSegmentEditionMixin.CURSOR_STACK_OFFSET,
+    )
+    cursor_world = Vector((0.0, 0.0, cursor_local_z))
+    bound_box = [(0.0, 0.0, 0.0)] * 8
+    bound_box[2] = (0.0, 0.0, current_length)
+    active_obj = SimpleNamespace(bound_box=bound_box)
+    scene = SimpleNamespace(cursor=SimpleNamespace(location=cursor_world))
+    context = SimpleNamespace(scene=scene, active_object=active_obj)
+
+    with patch.object(gizmo_module, "billboarded_at", side_effect=lambda pos, rot: Matrix.Translation(pos)):
+        _MEPSegmentEditionMixin._refresh_element_specific(self_stub, context, Matrix.Identity(4), props=None)
+    return self_stub
+
+
+def test_mep_extend_gizmo_tracks_cursor_at_negative_local_z():
+    """The extend icon's anchor follows the cursor along the segment's
+    extrusion axis when the cursor sits below the origin (local Z < 0).
+    Clicking the icon there extends the segment's start (ATSTART), so the
+    icon must remain visible at the cursor anchor to surface the
+    affordance — not snap to the origin."""
+    self_stub = _run_mep_extend_refresh(cursor_local_z=-1.5, current_length=3.0)
+    assert self_stub.extend_gizmo.hide is False
+    assert self_stub.extend_gizmo.matrix_basis.translation.z == pytest.approx(-1.5)
+    # Cursor projection sits outside the segment's endpoint-clear window,
+    # so the split icon hides.
+    assert self_stub.split_gizmo.hide is True
+
+
+def test_mep_extend_gizmo_tracks_cursor_at_positive_local_z():
+    """The extend icon's anchor follows the cursor at positive local Z. The
+    split icon is also visible because the cursor projection sits inside
+    the segment's endpoint-clear window."""
+    self_stub = _run_mep_extend_refresh(cursor_local_z=1.5, current_length=3.0)
+    assert self_stub.extend_gizmo.hide is False
+    assert self_stub.extend_gizmo.matrix_basis.translation.z == pytest.approx(1.5)
+    assert self_stub.split_gizmo.hide is False
+
+
+def test_extend_segment_to_cursor_extends_nearest_endpoint():
+    """The extend operator extends or trims the nearest endpoint of the
+    segment to the cursor projection — it must not commit an absolute
+    length, which would collapse the segment to zero for any cursor
+    position before the segment origin."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from mathutils import Vector
+
+    from bonsai.bim.module.model import mep as mep_module
+    from bonsai.bim.module.model.profile import DumbProfileJoiner
+
+    obj_stub = object()
+    cursor_world = Vector((0.0, 0.0, -1.5))
+    fake_joiner = MagicMock(spec=DumbProfileJoiner)
+    context = SimpleNamespace(scene=SimpleNamespace(cursor=SimpleNamespace(location=cursor_world)))
+
+    with (
+        patch.object(mep_module, "_project_cursor_to_segment_local_z", return_value=(obj_stub, -1.5)),
+        patch.object(mep_module, "DumbProfileJoiner", return_value=fake_joiner),
+    ):
+        result = mep_module._extend_segment_to_cursor(context, is_pipe=True)
+
+    assert result == {"FINISHED"}
+    fake_joiner.join_E.assert_called_once_with(obj_stub, cursor_world)
+    # An absolute-length commit path would collapse the segment to ~0 at
+    # negative cursor Z. Pin its absence.
+    fake_joiner.set_depth.assert_not_called()
+
+
+def test_extend_segment_to_cursor_cancels_when_active_object_invalid():
+    """If the projection helper rejects (no IFC entity, wrong predicate),
+    the operator must cancel without dispatching any joiner mutation."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from mathutils import Vector
+
+    from bonsai.bim.module.model import mep as mep_module
+    from bonsai.bim.module.model.profile import DumbProfileJoiner
+
+    fake_joiner = MagicMock(spec=DumbProfileJoiner)
+    context = SimpleNamespace(scene=SimpleNamespace(cursor=SimpleNamespace(location=Vector((0.0, 0.0, 1.0)))))
+
+    with (
+        patch.object(mep_module, "_project_cursor_to_segment_local_z", return_value=(None, None)),
+        patch.object(mep_module, "DumbProfileJoiner", return_value=fake_joiner),
+    ):
+        result = mep_module._extend_segment_to_cursor(context, is_pipe=True)
+
+    assert result == {"CANCELLED"}
+    fake_joiner.join_E.assert_not_called()
+    fake_joiner.set_depth.assert_not_called()
 
 
 def test_mep_add_obstruction_position_and_mode_properties_exist():
@@ -1204,6 +1340,50 @@ def test_bend_preview_gizmo_group_is_registered():
     assert issubclass(GizmoBendPreview, bpy.types.GizmoGroup)
 
 
+def test_base_preview_finish_catches_runtime_error_from_dispatch():
+    """When the dispatched ``bim.<verb>`` operator reports ERROR + returns
+    CANCELLED, ``bpy.ops`` promotes that to RuntimeError. The finish base
+    must catch it and return CANCELLED — propagating the exception leaves
+    Blender's operator state half-broken and silently disables downstream
+    gizmo polls. Preview state must remain active so the user can re-tune."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from bonsai import tool
+    from bonsai.bim.module.model.mep import FinishBendPreview
+
+    class _Stand:
+        def __init__(self):
+            self.report = MagicMock()
+
+    op_self = _Stand()
+    fake_props = SimpleNamespace(
+        is_active=True,
+        start_segment_id=42,
+        end_segment_id=43,
+        start_length=0.1,
+        end_length=0.1,
+        radius=0.2,
+    )
+    context = SimpleNamespace(
+        screen=MagicMock(),
+        scene=SimpleNamespace(BIMPreviewProperties=SimpleNamespace(bend=fake_props)),
+    )
+
+    mock_ops_bim = MagicMock()
+    mock_ops_bim.mep_add_bend.side_effect = RuntimeError("synthetic dispatch error")
+
+    with (
+        patch.object(tool.Ifc, "get", return_value=MagicMock(name="ifc_file")),
+        patch.object(bpy.ops, "bim", new=mock_ops_bim),
+    ):
+        result = FinishBendPreview.execute(op_self, context)
+
+    assert "CANCELLED" in result, "RuntimeError from dispatch must be converted to CANCELLED"
+    assert fake_props.is_active is True, "failed dispatch must leave preview active for re-tune"
+    op_self.report.assert_called()
+
+
 def test_bim_bend_preview_properties_attached_to_scene():
     """The Scene PointerProperty must be bound in ``register()`` so
     ``EnableBendPreview`` / ``CancelBendPreview`` and the GPU decorator
@@ -1220,6 +1400,22 @@ def test_bend_preview_decorator_class_present():
 
     assert hasattr(BendPreviewDecorator, "install")
     assert hasattr(BendPreviewDecorator, "uninstall")
+
+
+def test_escape_cancels_active_bend_preview():
+    """Pressing Esc while a bend preview is active must clear its state.
+    Drives the registry-backed dispatch in ``preview_base`` from the
+    user-facing Esc operator end."""
+    preview = bpy.context.scene.BIMPreviewProperties.bend
+    preview.is_active = True
+    preview.start_segment_id = 42
+    preview.end_segment_id = 43
+
+    bpy.ops.bim.override_escape()
+
+    assert preview.is_active is False
+    assert preview.start_segment_id == 0
+    assert preview.end_segment_id == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1502,3 +1698,180 @@ def test_split_mep_segment_happy_path_calls_copy_class_set_depth_connect_port():
     assert kwargs["port1"] is seg1_end
     assert kwargs["port2"] is seg2_start
     assert kwargs["direction"] == "NOTDEFINED"
+
+
+# ---------------------------------------------------------------------------
+# MEP segment extend gizmo — view-aware mirror + hover-gated preview line
+# ---------------------------------------------------------------------------
+
+
+def _run_mep_refresh_element_specific(
+    *,
+    cursor_local,
+    mw=None,
+    billboard_rot=None,
+):
+    """Drive ``_MEPSegmentEditionMixin._refresh_element_specific`` with a stub
+    self. Returns ``self_stub.extend_gizmo`` so callers can inspect its
+    ``matrix_basis`` (translation + mirror sign)."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing import gizmos as gizmo_module
+    from bonsai.bim.module.model import mep as mep_module
+
+    extend = SimpleNamespace(hide=True, matrix_basis=None)
+    split = SimpleNamespace(hide=True, matrix_basis=None)
+
+    self_stub = SimpleNamespace(
+        extend_gizmo=extend,
+        split_gizmo=split,
+        CURSOR_STACK_OFFSET=mep_module._MEPSegmentEditionMixin.CURSOR_STACK_OFFSET,
+        _frame_billboard_rot=billboard_rot if billboard_rot is not None else Matrix.Identity(4),
+        is_gizmo_hidden_by_modal=lambda gz: False,
+    )
+
+    obj = SimpleNamespace(bound_box=((0.0, 0.0, 0.0),) * 8)
+    cursor = SimpleNamespace(location=(mw if mw is not None else Matrix.Identity(4)) @ Vector(cursor_local))
+    context = SimpleNamespace(active_object=obj, scene=SimpleNamespace(cursor=cursor))
+
+    with patch.object(
+        gizmo_module, "billboarded_at", side_effect=lambda pos, rot, scale=0.5: Matrix.Translation(pos)
+    ):
+        mep_module._MEPSegmentEditionMixin._refresh_element_specific(
+            self_stub, context, mw if mw is not None else Matrix.Identity(4), props=SimpleNamespace()
+        )
+    return extend
+
+
+def test_mep_extend_gizmo_no_mirror_when_origin_is_screen_left():
+    """Identity view, segment origin screen-left of the gizmo → no mirror."""
+    from mathutils import Matrix
+
+    extend = _run_mep_refresh_element_specific(cursor_local=(0.0, 0.0, 2.0))
+    # MEP segment extrudes along local Z; with identity view the screen-X delta
+    # is the world-Z delta projected by billboard_rot.transposed() = identity →
+    # origin_world - gizmo_world has Z component only, X component is zero, so
+    # no flip is triggered.
+    assert extend.matrix_basis is not None
+    assert extend.matrix_basis.col[0].x == pytest.approx(1.0)
+    # Sanity: translation should be at the projected cursor (local Z=2 in world).
+    assert extend.matrix_basis.translation.z == pytest.approx(2.0)
+
+
+def test_mep_extend_gizmo_mirrors_when_view_aligns_z_to_screen_x():
+    """View tipped so world -Z lands on screen +X → segment origin screen-right of
+    the gizmo → mirror engages."""
+    import math
+
+    from mathutils import Matrix
+
+    rot_y_90 = Matrix.Rotation(math.pi / 2, 4, "Y")
+    extend = _run_mep_refresh_element_specific(cursor_local=(0.0, 0.0, 2.0), billboard_rot=rot_y_90)
+    assert extend.matrix_basis is not None
+    assert extend.matrix_basis.col[0].x == pytest.approx(-1.0)
+
+
+def test_mep_extend_preview_line_drawn_at_positive_local_z():
+    """Cursor-local Z above the current end → line target lands on the cursor (no clamp)."""
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.model.decorator import MEPSegmentExtendPreviewDecorator
+
+    result = MEPSegmentExtendPreviewDecorator._compute_extend_preview_line(
+        matrix_world=Matrix.Identity(4),
+        cursor_world=Vector((0.0, 0.0, 3.5)),
+        current_length=2.0,
+    )
+    assert result is not None
+    current_end, target_end = result
+    assert tuple(current_end) == pytest.approx((0.0, 0.0, 2.0))
+    assert tuple(target_end) == pytest.approx((0.0, 0.0, 3.5))
+
+
+def test_mep_extend_preview_skips_draw_when_gizmo_not_hovered(monkeypatch):
+    """No hover on the extend gizmo → no stroke."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from mathutils import Matrix
+
+    from bonsai import tool
+    from bonsai.bim.module.model import decorator as decorator_module
+
+    obj = SimpleNamespace(matrix_world=Matrix.Identity(4), bound_box=((0.0, 0.0, 1.0),) * 8)
+    element = object()
+    region = SimpleNamespace(as_pointer=lambda: 12345)
+    cursor = SimpleNamespace(location=Matrix.Identity(4).to_translation())
+    context = SimpleNamespace(active_object=obj, region=region, scene=SimpleNamespace(cursor=cursor))
+
+    gizmo_prefs = SimpleNamespace(enabled=True)
+    prefs = SimpleNamespace(
+        gizmos=SimpleNamespace(pipe_segment=gizmo_prefs, duct_segment=gizmo_prefs),
+        decorator_color_selected=(0.0, 1.0, 0.0, 1.0),
+    )
+
+    stroke_calls = []
+
+    def _fake_stroke(*args, **kwargs):
+        stroke_calls.append((args, kwargs))
+
+    decorator = decorator_module.MEPSegmentExtendPreviewDecorator()
+
+    with (
+        patch.object(tool.Blender, "are_viewport_gizmos_enabled", return_value=True),
+        patch.object(tool.Blender, "get_addon_preferences", return_value=prefs),
+        patch.object(tool.Blender, "get_selected_objects", return_value=[obj]),
+        patch.object(tool.Ifc, "get_entity", return_value=element),
+        patch.object(tool.Parametric, "is_pipe_segment", return_value=True),
+        patch.object(tool.Parametric, "is_duct_segment", return_value=False),
+        patch.object(decorator_module, "_stroke_lines_alpha", side_effect=_fake_stroke),
+    ):
+        # No registered gizmo group instance for this region → hover-gate False →
+        # decorator must return early.
+        decorator.draw_line(context)
+
+    assert stroke_calls == [], "preview line drew despite no extend-gizmo hover"
+
+
+# ---------------------------------------------------------------------------
+# MEP bend body must be committed as a tessellated representation
+#
+# ``mep_bend_shape`` emits ``IfcSweptDiskSolid`` for circular profiles, which
+# is not portable across IFC geometry kernels at typical import tolerances
+# (the rendered mesh on reload silently drops the swept-disk items, leaving
+# the user with only the straight extrusion segments). The fix installs the
+# parametric rep to fill ``obj.data`` with the kernel triangulation, then
+# overwrites the body with a faceted version via ``add_body_representation``.
+# Without the second commit, the on-disk body is the unportable swept-disk
+# rep and the bug returns.
+# ---------------------------------------------------------------------------
+
+
+def test_mep_add_bend_commits_tessellated_body_after_parametric_rep():
+    """The bend-creation flow that calls ``mep_bend_shape`` must follow up
+    with ``add_body_representation`` in the same function — the parametric
+    rep's swept-disk items are not portable, the faceted overwrite is."""
+    import inspect
+
+    from bonsai.bim.module.model import mep
+
+    creator_src = None
+    for _name, obj in inspect.getmembers(mep, inspect.isclass):
+        try:
+            src = inspect.getsource(obj)
+        except (OSError, TypeError):
+            continue
+        if "mep_bend_shape" in src:
+            creator_src = src
+            break
+
+    assert creator_src is not None, "expected a class invoking mep_bend_shape to exist in mep.py"
+    assert "add_body_representation" in creator_src, (
+        "the operator that invokes mep_bend_shape must also call "
+        "tool.Model.add_body_representation to overwrite the parametric "
+        "IfcSweptDiskSolid body with a faceted one — without this, reload "
+        "through some IFC geometry kernels silently drops the bend"
+    )

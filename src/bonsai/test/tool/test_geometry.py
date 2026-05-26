@@ -365,6 +365,66 @@ class TestCommitPlacementIfMoved(NewFile):
         assert tuple(obj.scale) == (2.0, 2.0, 2.0)
 
 
+class TestRestoreOrRebaselinePlacement(NewFile):
+    """Pins the three-branch contract of the cancel-flow restore helper:
+    no-op when not moved; re-baseline the checksum when the element has no
+    ``ObjectPlacement``; restore + re-baseline otherwise."""
+
+    def _setup_obj(self) -> tuple[bpy.types.Object, ifcopenshell.file]:
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcProject")
+        obj = bpy.data.objects.new("Object", None)
+        bpy.context.scene.collection.objects.link(obj)
+        return obj, ifc
+
+    def test_skips_when_not_moved(self):
+        obj, ifc = self._setup_obj()
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        tool.Ifc.link(element, obj)
+        original_translation = Vector(obj.matrix_world.translation)
+        subject.record_object_position(obj)
+        assert tool.Ifc.is_moved(obj) is False
+
+        subject.restore_or_rebaseline_placement(obj, element)
+
+        assert np.allclose(np.array(obj.matrix_world.translation), np.array(original_translation))
+
+    def test_rebaselines_checksum_when_element_has_no_placement(self):
+        obj, ifc = self._setup_obj()
+        # IfcGridAxis is one of the few products that legitimately has no
+        # ObjectPlacement; here we just build the element and null its placement
+        # to exercise the no-placement branch.
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        element.ObjectPlacement = None
+        tool.Ifc.link(element, obj)
+        subject.record_object_position(obj)
+        obj.matrix_world.translation = Vector((7.0, 7.0, 7.0))
+        assert tool.Ifc.is_moved(obj) is True
+
+        subject.restore_or_rebaseline_placement(obj, element)
+
+        # matrix_world untouched (no IFC source to restore from), but the
+        # checksum re-baselined so a later Finish does not commit the discarded drag.
+        assert np.allclose(np.array(obj.matrix_world.translation), [7.0, 7.0, 7.0])
+        assert tool.Ifc.is_moved(obj) is False
+
+    def test_restores_when_element_has_placement(self):
+        obj, ifc = self._setup_obj()
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        tool.Ifc.link(element, obj)
+        ifcopenshell.api.geometry.edit_object_placement(ifc, product=element, matrix=np.eye(4), is_si=True)
+        obj.matrix_world.translation = Vector((0.0, 0.0, 0.0))
+        subject.record_object_position(obj)
+        obj.matrix_world.translation = Vector((3.0, 3.0, 3.0))
+        assert tool.Ifc.is_moved(obj) is True
+
+        subject.restore_or_rebaseline_placement(obj, element)
+
+        assert np.allclose(np.array(obj.matrix_world.translation), [0.0, 0.0, 0.0])
+        assert tool.Ifc.is_moved(obj) is False
+
+
 class TestRestorePlacementFromIfc(NewFile):
     """Pins the helper's contract: write the element's IFC placement onto
     ``obj.matrix_world`` and re-baseline the drift checksum so ``is_moved``
@@ -393,6 +453,26 @@ class TestRestorePlacementFromIfc(NewFile):
         assert np.allclose(np.array(obj.matrix_world.translation), [0.0, 0.0, 0.0])
         # Checksum re-baselined: is_moved no longer flags the object as drifted.
         assert tool.Ifc.is_moved(obj) is False
+
+    def test_asserts_on_element_without_object_placement(self):
+        """The documented precondition is ``element.ObjectPlacement is not None``.
+        Passing a placement-less element used to raise an opaque
+        ``AttributeError`` deep inside ``ifcopenshell.util.placement``;
+        the assert surfaces the failure at the API boundary with a message
+        that points the caller at ``restore_or_rebaseline_placement``."""
+        import pytest
+
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        element = ifcopenshell.api.root.create_entity(ifc, ifc_class="IfcWall")
+        # Element exists but has no ObjectPlacement (legitimate for some schema-permitted shapes).
+        assert element.ObjectPlacement is None
+        obj = bpy.data.objects.new("Object", None)
+        bpy.context.scene.collection.objects.link(obj)
+        tool.Ifc.link(element, obj)
+
+        with pytest.raises(AssertionError, match="restore_placement_from_ifc requires ObjectPlacement"):
+            subject.restore_placement_from_ifc(obj, element)
 
 
 class TestRemoveConnection(NewFile):

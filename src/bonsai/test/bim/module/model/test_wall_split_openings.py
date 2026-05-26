@@ -194,9 +194,10 @@ def test_opening_axis_extent_offset_cursor_inside_extent_returns_straddling_rang
 
 
 def _make_void_copy_mock(has_filling_rel=True):
-    """Build the ``void_copy`` MagicMock returned by ``copy_class`` so its
-    ``HasFillings`` / ``VoidsElements`` / ``ObjectPlacement`` shape matches
-    what ``_add_void_copy`` mutates."""
+    """Build the ``void_copy`` MagicMock returned by ``copy_class`` shaped
+    like the IfcOpeningElement ``_add_void_copy`` consumes — ``HasFillings``
+    populated when the source carried a filling rel, ``VoidsElements`` and
+    ``ObjectPlacement`` shaped so the production code can inspect them."""
     copy_placement = MagicMock(name="copy_placement")
     copy_placement.is_a = lambda klass: klass == "IfcLocalPlacement"
     void_relation = MagicMock(name="VoidsRelation")
@@ -207,24 +208,22 @@ def _make_void_copy_mock(has_filling_rel=True):
     return void_copy, void_relation, copy_placement
 
 
-def test_add_void_copy_strips_fillings_and_reparents_to_target_wall():
+def test_add_void_copy_strips_fillings_and_reparents_via_feature_api():
     """``_add_void_copy`` must create a pure-void IfcOpeningElement attached
-    to the target wall: the filling relationship copied along with the source
-    must be removed, ``VoidsElements[0].RelatingBuildingElement`` must point
-    at the target wall, and the representation must be a deep copy (not a
-    shared reference with the source)."""
+    to the target wall via ``ifcopenshell.api.feature.add_feature``. The
+    carried filling rel must be removed first; the void-rel rewiring and
+    placement re-parent both go through the API so owner history rotates
+    and the world matrix is preserved."""
     from bonsai.bim.module.model.wall import _add_void_copy
 
-    source_representation = MagicMock(name="source_representation")
     source_opening = MagicMock(name="source_opening")
-    source_opening.Representation = source_representation
+    source_opening.Representation = MagicMock(name="source_representation")
 
-    void_copy, void_relation, copy_placement = _make_void_copy_mock()
+    void_copy, _void_relation, _copy_placement = _make_void_copy_mock()
     carried_filling_rel = void_copy.HasFillings[0]
 
-    target_placement = MagicMock(name="target_placement")
     target_wall = MagicMock(name="target_wall")
-    target_wall.ObjectPlacement = target_placement
+    target_wall.ObjectPlacement = MagicMock(name="target_placement")
 
     ifc_file = MagicMock(name="ifc_file")
     deep_copy_result = MagicMock(name="copied_representation")
@@ -232,25 +231,20 @@ def test_add_void_copy_strips_fillings_and_reparents_to_target_wall():
     with (
         patch("bonsai.tool.Ifc.get", return_value=ifc_file),
         patch("ifcopenshell.api.root.copy_class", return_value=void_copy) as mock_copy_class,
+        patch("ifcopenshell.api.feature.add_feature") as mock_add_feature,
         patch("ifcopenshell.util.element.copy_deep", return_value=deep_copy_result),
     ):
         _add_void_copy(target_wall, source_opening)
 
-    # The carried-over filling relationship must be removed — the copy is a pure void.
-    ifc_file.remove.assert_called_once_with(carried_filling_rel)
-    # The void now points at the target wall, not the source's wall.
-    assert void_relation.RelatingBuildingElement is target_wall
-    # The placement is reparented under the target wall's local placement.
-    assert copy_placement.PlacementRelTo is target_placement
-    # The representation is deep-copied so future edits don't ripple back to source.
-    assert void_copy.Representation is deep_copy_result
     mock_copy_class.assert_called_once_with(ifc_file, product=source_opening)
+    ifc_file.remove.assert_called_once_with(carried_filling_rel)
+    mock_add_feature.assert_called_once_with(ifc_file, feature=void_copy, element=target_wall)
+    assert void_copy.Representation is deep_copy_result
 
 
 def test_add_void_copy_handles_source_with_no_fillings():
-    """If the source opening has no ``HasFillings`` (the copy_class result
-    inherits that), the loop over ``void_copy.HasFillings or ()`` must run
-    zero times — no spurious ``ifc_file.remove`` call."""
+    """A source with no carried filling rel must skip the ``remove`` loop;
+    relationship rewiring still goes through ``add_feature``."""
     from bonsai.bim.module.model.wall import _add_void_copy
 
     source_opening = MagicMock(name="source_opening")
@@ -264,10 +258,10 @@ def test_add_void_copy_handles_source_with_no_fillings():
     with (
         patch("bonsai.tool.Ifc.get", return_value=ifc_file),
         patch("ifcopenshell.api.root.copy_class", return_value=void_copy),
+        patch("ifcopenshell.api.feature.add_feature") as mock_add_feature,
         patch("ifcopenshell.util.element.copy_deep", return_value=MagicMock()),
     ):
         _add_void_copy(target_wall, source_opening)
 
     ifc_file.remove.assert_not_called()
-
-
+    mock_add_feature.assert_called_once_with(ifc_file, feature=void_copy, element=target_wall)

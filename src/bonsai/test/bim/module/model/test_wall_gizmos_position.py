@@ -87,15 +87,18 @@ def _make_position_gizmos_self():
     return stub
 
 
-def _run_position_gizmos(seg_a, seg_b, top_down=False, screen_up=(0.0, 1.0, 0.0)):
+def _run_position_gizmos(seg_a, seg_b, top_down=False, screen_up=(0.0, 1.0, 0.0), height_a=3.0, height_b=3.0):
     """Invoke `position_gizmos()` with two world-space wall axis segments.
 
     `seg_a` / `seg_b` are pairs of 3-tuples (start, end). The two walls are
-    treated as non-joined, non-collinear LAYER2 walls with a height of 3 m,
-    so the "intersect" branch runs end-to-end. ``top_down`` toggles the
-    plan-view branch in positioning, and ``screen_up`` is the world-space
-    screen-up vector callers can assert offsets against. Returns the stub
-    ``self`` so the caller can assert on per-icon ``.hide`` / position state."""
+    treated as non-joined LAYER2 walls; whether the classifier returns
+    ``"collinear"`` vs ``"intersect"`` vs ``"none"`` is decided by the
+    segment geometry itself. ``height_a`` / ``height_b`` set the per-wall
+    heights so callers can pin the ``max(wall_a_top, wall_b_top)`` math.
+    ``top_down`` toggles the plan-view branch, and ``screen_up`` is the
+    world-space screen-up vector callers can assert offsets against.
+    Returns the stub ``self`` so the caller can assert on per-icon
+    ``.hide`` / position state."""
     from mathutils import Matrix, Vector
 
     from bonsai import tool
@@ -104,8 +107,8 @@ def _run_position_gizmos(seg_a, seg_b, top_down=False, screen_up=(0.0, 1.0, 0.0)
 
     elem_a = object()
     elem_b = object()
-    geom_a = {"height": 3.0}
-    geom_b = {"height": 3.0}
+    geom_a = {"height": height_a}
+    geom_b = {"height": height_b}
     seg_a_vec = (Vector(seg_a[0]), Vector(seg_a[1]))
     seg_b_vec = (Vector(seg_b[0]), Vector(seg_b[1]))
 
@@ -287,6 +290,75 @@ def test_position_gizmos_no_extra_lift_in_perspective_view():
     assert extend_pos.y == pytest.approx(0.0)
 
 
+# Collinear-branch placement — Merge anchors above the taller wall's top so the
+# icon clears the wall bodies in perspective views, parity with the joined and
+# intersect branches.
+
+
+def test_position_gizmos_merges_collinear_walls_above_taller_top_in_perspective_view():
+    """Perspective view: Merge sits at the closest-endpoint XY midpoint and at
+    ``max(wall_a_top, wall_b_top) + ICON_TOP_LIFT`` along Z, so the icon clears
+    the wall bodies regardless of which of the two walls is taller."""
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
+    self_stub = _run_position_gizmos(
+        seg_a=((0.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        seg_b=((3.0, 0.0, 0.0), (5.0, 0.0, 0.0)),
+        top_down=False,
+        screen_up=(0.0, 1.0, 0.0),
+        height_a=2.4,
+        height_b=3.2,
+    )
+    assert self_stub.merge_icon.hide is False
+    assert self_stub.unjoin_icon.hide is True
+    assert self_stub.join_icon.hide is True
+    assert self_stub.extend_to_wall_icon.hide is True
+    assert self_stub.fillet_icon.hide is True
+    merge_pos = self_stub.merge_icon.matrix_basis.translation
+    assert merge_pos.x == pytest.approx(2.5)
+    assert merge_pos.y == pytest.approx(0.0)
+    assert merge_pos.z == pytest.approx(3.2 + GizmoWallJoinIntersection.ICON_TOP_LIFT)
+
+
+def test_position_gizmos_lifts_merge_above_boundary_in_top_down_view():
+    """Plan view: Merge keeps the wall-top Z anchor and additionally shifts along
+    screen-up by ``TOP_DOWN_INTERSECTION_CLEARANCE`` so the boundary point stays
+    visible below the icon — mirroring the joined / intersect branches."""
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
+    self_stub = _run_position_gizmos(
+        seg_a=((0.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        seg_b=((3.0, 0.0, 0.0), (5.0, 0.0, 0.0)),
+        top_down=True,
+        screen_up=(0.0, 1.0, 0.0),
+        height_a=2.4,
+        height_b=3.2,
+    )
+    merge_pos = self_stub.merge_icon.matrix_basis.translation
+    assert merge_pos.x == pytest.approx(2.5)
+    assert merge_pos.y == pytest.approx(GizmoWallJoinIntersection.TOP_DOWN_INTERSECTION_CLEARANCE)
+    assert merge_pos.z == pytest.approx(3.2 + GizmoWallJoinIntersection.ICON_TOP_LIFT)
+
+
+def test_position_gizmos_hides_non_merge_icons_for_collinear_walls():
+    """Collinear branch shows Merge alone — the four sibling icons (Unjoin,
+    Join, Extend, Fillet) must stay hidden so a future refactor that drops a
+    hide flag fails loudly."""
+    self_stub = _run_position_gizmos(
+        seg_a=((0.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        seg_b=((3.0, 0.0, 0.0), (5.0, 0.0, 0.0)),
+        top_down=False,
+        screen_up=(0.0, 1.0, 0.0),
+        height_a=2.4,
+        height_b=3.2,
+    )
+    assert self_stub.merge_icon.hide is False
+    assert self_stub.unjoin_icon.hide is True
+    assert self_stub.join_icon.hide is True
+    assert self_stub.extend_to_wall_icon.hide is True
+    assert self_stub.fillet_icon.hide is True
+
+
 # GizmoWallExtendVertically position_gizmos is unconditional — the top-down
 # case is rejected at poll() time, so position_gizmos never runs in plan view
 # and needs no per-view branch test.
@@ -302,7 +374,14 @@ def test_position_gizmos_no_extra_lift_in_perspective_view():
 # code switches to a screen-up stack in that case.
 
 
-def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0, 1.0, 0.0)):
+def _run_cursor_gizmos(
+    top_down,
+    *,
+    cursor_local=(0.5, 0.0, 1.5),
+    screen_up=(0.0, 1.0, 0.0),
+    billboard_rot=None,
+    anchor_x=0.0,
+):
     """Drive ``_position_cursor_anchored_gizmos`` with a stub ``self``.
 
     Returns the three icon stubs (extend_x, extend_z, split) so callers can
@@ -320,14 +399,14 @@ def _run_cursor_gizmos(top_down, *, cursor_local=(0.5, 0.0, 1.5), screen_up=(0.0
     extend_z = _icon()
     split = _icon()
 
-    props = SimpleNamespace(anchor_x=0.0, length=2.0, height=3.0, x_angle=0.0)
+    props = SimpleNamespace(anchor_x=anchor_x, length=2.0, height=3.0, x_angle=0.0)
 
     self_stub = SimpleNamespace(
         extend_x_gizmo=extend_x,
         extend_z_gizmo=extend_z,
         split_gizmo=split,
         CURSOR_STACK_OFFSET=wall_module.GizmoWallEdition.CURSOR_STACK_OFFSET,
-        _frame_billboard_rot=Matrix.Identity(4),
+        _frame_billboard_rot=billboard_rot if billboard_rot is not None else Matrix.Identity(4),
         is_gizmo_hidden_by_modal=lambda gz: False,
     )
     cursor = SimpleNamespace(location=Vector(cursor_local))
@@ -380,6 +459,307 @@ def test_cursor_gizmos_keep_z_stacking_in_perspective_view():
     assert extend_x.matrix_basis.translation.z == pytest.approx(0.0)
     assert extend_z.matrix_basis.translation.z == pytest.approx(1.5)
     assert split.matrix_basis.translation.z == pytest.approx(3.0)
+
+
+# ----------------------------------------------------------------------------
+# should_flip_extend_arrow — view-aware arrow mirroring for the horizontal extend
+# ----------------------------------------------------------------------------
+
+
+def test_should_flip_extend_arrow_returns_true_when_origin_is_screen_right():
+    """Identity view, origin at +X of the gizmo → flip."""
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing.gizmos import should_flip_extend_arrow
+
+    assert (
+        should_flip_extend_arrow(
+            gizmo_world=Vector((1.0, 0.0, 0.0)),
+            origin_world=Vector((2.0, 0.0, 0.0)),
+            billboard_rot=Matrix.Identity(4),
+        )
+        is True
+    )
+
+
+def test_should_flip_extend_arrow_returns_false_when_origin_is_screen_left():
+    """Identity view, origin at −X of the gizmo → no flip."""
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing.gizmos import should_flip_extend_arrow
+
+    assert (
+        should_flip_extend_arrow(
+            gizmo_world=Vector((2.0, 0.0, 0.0)),
+            origin_world=Vector((0.0, 0.0, 0.0)),
+            billboard_rot=Matrix.Identity(4),
+        )
+        is False
+    )
+
+
+def test_should_flip_extend_arrow_holds_canonical_in_epsilon_deadband():
+    """Within ``EXTEND_FLIP_EPSILON`` the helper resolves to no-flip — anti-flicker."""
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing.gizmos import (
+        EXTEND_FLIP_EPSILON,
+        should_flip_extend_arrow,
+    )
+
+    tiny = EXTEND_FLIP_EPSILON * 0.5
+    assert (
+        should_flip_extend_arrow(
+            gizmo_world=Vector((1.0, 0.0, 0.0)),
+            origin_world=Vector((1.0 + tiny, 0.0, 0.0)),
+            billboard_rot=Matrix.Identity(4),
+        )
+        is False
+    )
+
+
+def test_should_flip_extend_arrow_responds_to_view_rotation():
+    """Rotating the billboard 180° around world Z inverts the flip decision."""
+    import math
+
+    from mathutils import Matrix, Vector
+
+    from bonsai.bim.module.drawing.gizmos import should_flip_extend_arrow
+
+    args = dict(gizmo_world=Vector((2.0, 0.0, 0.0)), origin_world=Vector((0.0, 0.0, 0.0)))
+    # Identity view: origin screen-left → no flip.
+    assert should_flip_extend_arrow(billboard_rot=Matrix.Identity(4), **args) is False
+    # Rotate the camera 180° about world-Z — origin now projects to screen-right.
+    rot_180_z = Matrix.Rotation(math.pi, 4, "Z")
+    assert should_flip_extend_arrow(billboard_rot=rot_180_z, **args) is True
+
+
+def test_cursor_gizmos_extend_x_matrix_basis_mirrors_when_flip_required():
+    """Extend-X mirrors on local X when the helper signals a screen-right origin;
+    extend-Z and split keep their canonical orientation."""
+    import math
+
+    from mathutils import Matrix
+
+    rot_180_z = Matrix.Rotation(math.pi, 4, "Z")
+    extend_x, extend_z, split = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(1.5, 0.0, 3.5),  # above height (3.0) so extend_z doesn't Y-flip
+        billboard_rot=rot_180_z,
+        anchor_x=0.0,
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(-1.0)
+    assert extend_z.matrix_basis.col[1].y == pytest.approx(1.0)
+    assert split.matrix_basis.col[0].x == pytest.approx(1.0)
+
+
+def test_cursor_gizmos_extend_z_matrix_basis_mirrors_y_when_below_wall_height():
+    """Cursor below the wall top → extend-Z arrow flips so it points down."""
+    extend_x, extend_z, split = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(1.0, 0.0, 1.0),  # below height (3.0)
+    )
+    assert extend_z.matrix_basis.col[1].y == pytest.approx(-1.0)
+    assert extend_z.matrix_basis.col[0].x == pytest.approx(1.0)
+
+
+def test_cursor_gizmos_extend_z_no_mirror_when_above_wall_height():
+    """Cursor above the wall top → extend-Z keeps its canonical upward arrow."""
+    extend_x, extend_z, split = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(1.0, 0.0, 4.0),  # above height (3.0)
+    )
+    assert extend_z.matrix_basis.col[1].y == pytest.approx(1.0)
+
+
+# ----------------------------------------------------------------------------
+# WallGizmoPreviewDecorator._draw_cursor_split_preview — vertical cut line
+# ----------------------------------------------------------------------------
+
+
+_SPLIT_PREVIEW_RED = (1.0, 0.0, 0.0, 1.0)
+
+
+def _run_split_preview(
+    hovered,
+    *,
+    anchor_x=0.0,
+    length=2.0,
+    height=3.0,
+    cursor_local=(1.0, 0.0, 0.5),
+    matrix_world=None,
+):
+    """Drive ``_draw_cursor_split_preview`` and return ``(segments, color)``.
+    Returns ``([], None)`` when no line was drawn."""
+    from mathutils import Matrix, Vector
+
+    from bonsai import tool
+    from bonsai.bim.module.model import decorator as decorator_module
+
+    mw = matrix_world if matrix_world is not None else Matrix.Identity(4)
+    active_obj = SimpleNamespace(matrix_world=mw)
+    geom = {"anchor_x": anchor_x, "length": length, "height": height}
+    cursor = SimpleNamespace(location=mw @ Vector(cursor_local))
+    context = SimpleNamespace(scene=SimpleNamespace(cursor=cursor))
+    prefs = SimpleNamespace(
+        decorator_color_selected=(0.0, 1.0, 0.0, 1.0),
+        decorator_color_error=_SPLIT_PREVIEW_RED,
+    )
+
+    decorator = decorator_module.WallGizmoPreviewDecorator()
+    captured: dict = {"segments": [], "color": None}
+
+    def _capture_stroke(self_, ctx, segments, color):
+        captured["segments"].extend(segments)
+        captured["color"] = color
+
+    patches = [
+        patch.object(
+            decorator_module.WallGizmoPreviewDecorator,
+            "_active_layer2_wall_for_gizmo_preview",
+            return_value=active_obj,
+        ),
+        patch.object(
+            decorator_module.WallGizmoPreviewDecorator,
+            "_cursor_icon_hovered",
+            return_value=hovered,
+        ),
+        patch.object(tool.Wall, "read_geometry", return_value=geom),
+        patch.object(decorator_module.WallGizmoPreviewDecorator, "_stroke", _capture_stroke),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        decorator._draw_cursor_split_preview(context, prefs)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    return captured["segments"], captured["color"]
+
+
+def test_split_preview_draws_red_line_at_cursor_x_when_hovered():
+    """In-range cursor + hovered split → one segment from base (Z=0) to top (Z=3),
+    coloured with the destructive-action warning red."""
+    segments, color = _run_split_preview(hovered=True, length=2.0, height=3.0, cursor_local=(1.0, 0.0, 0.5))
+    assert len(segments) == 1
+    bottom, top = segments[0]
+    assert bottom[0] == pytest.approx(1.0)
+    assert bottom[1] == pytest.approx(0.0)
+    assert bottom[2] == pytest.approx(0.0)
+    assert top[0] == pytest.approx(1.0)
+    assert top[1] == pytest.approx(0.0)
+    assert top[2] == pytest.approx(3.0)
+    assert color == pytest.approx(_SPLIT_PREVIEW_RED[:3])
+
+
+def test_split_preview_endpoints_follow_wall_slope():
+    """Sloped wall (rotated about X): the line endpoints must ride the wall's
+    local Z axis, not strict world Z. With a 90° X-rotation the wall's local Z
+    aligns with world Y, so the top endpoint lands at Y=height (not Z=height)."""
+    import math
+
+    from mathutils import Matrix
+
+    rot_x_90 = Matrix.Rotation(math.pi / 2, 4, "X")
+    segments, _color = _run_split_preview(
+        hovered=True,
+        length=2.0,
+        height=3.0,
+        cursor_local=(1.0, 0.0, 0.0),
+        matrix_world=rot_x_90,
+    )
+    assert len(segments) == 1
+    bottom, top = segments[0]
+    assert tuple(bottom) == pytest.approx((1.0, 0.0, 0.0), abs=1e-6)
+    assert tuple(top) == pytest.approx((1.0, -3.0, 0.0), abs=1e-6)
+
+
+def test_split_preview_skips_draw_when_icon_not_hovered():
+    """No hover, no line."""
+    segments, _color = _run_split_preview(hovered=False)
+    assert segments == []
+
+
+def test_split_preview_skips_draw_when_cursor_outside_wall_span():
+    """Cursor outside ``[anchor_x, anchor_x + length]`` → no preview."""
+    segments, _color = _run_split_preview(hovered=True, length=2.0, cursor_local=(3.5, 0.0, 0.5))
+    assert segments == []
+
+
+# ----------------------------------------------------------------------------
+# WallGizmoPreviewDecorator._draw_cursor_extend_z_preview — new height line
+# ----------------------------------------------------------------------------
+
+
+def _run_extend_z_preview(
+    hovered,
+    *,
+    anchor_x=0.0,
+    length=2.0,
+    height=3.0,
+    cursor_local=(1.0, 0.0, 5.0),
+):
+    """Drive ``_draw_cursor_extend_z_preview`` and return the captured stroke
+    segments. ``mw`` is Identity, so ``cursor_local`` doubles as world coords."""
+    from mathutils import Matrix, Vector
+
+    from bonsai import tool
+    from bonsai.bim.module.model import decorator as decorator_module
+
+    active_obj = SimpleNamespace(matrix_world=Matrix.Identity(4))
+    geom = {"anchor_x": anchor_x, "length": length, "height": height}
+    cursor = SimpleNamespace(location=Vector(cursor_local))
+    context = SimpleNamespace(scene=SimpleNamespace(cursor=cursor))
+    prefs = SimpleNamespace(decorator_color_selected=(0.0, 1.0, 0.0, 1.0))
+
+    decorator = decorator_module.WallGizmoPreviewDecorator()
+    captured_segments: list = []
+
+    def _capture_stroke(self_, ctx, segments, color):
+        captured_segments.extend(segments)
+
+    patches = [
+        patch.object(
+            decorator_module.WallGizmoPreviewDecorator,
+            "_active_layer2_wall_for_gizmo_preview",
+            return_value=active_obj,
+        ),
+        patch.object(
+            decorator_module.WallGizmoPreviewDecorator,
+            "_cursor_icon_hovered",
+            return_value=hovered,
+        ),
+        patch.object(tool.Wall, "read_geometry", return_value=geom),
+        patch.object(decorator_module.WallGizmoPreviewDecorator, "_stroke", _capture_stroke),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        decorator._draw_cursor_extend_z_preview(context, prefs)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    return captured_segments
+
+
+def test_extend_z_preview_draws_one_line_from_base_to_gizmo_when_hovered():
+    """Identity matrix, gizmo at local Z=5 → segment from base (Z=0) to gizmo (Z=5)."""
+    segments = _run_extend_z_preview(hovered=True, length=2.0, height=3.0, cursor_local=(1.5, 0.0, 5.0))
+    assert len(segments) == 1
+    bottom, top = segments[0]
+    assert tuple(bottom) == pytest.approx((1.5, 0.0, 0.0))
+    assert tuple(top) == pytest.approx((1.5, 0.0, 5.0))
+
+
+def test_extend_z_preview_skips_draw_when_icon_not_hovered():
+    segments = _run_extend_z_preview(hovered=False)
+    assert segments == []
+
+
+def test_extend_z_preview_skips_draw_when_cursor_below_wall_base():
+    """Operator gate: new height must be > 0."""
+    segments = _run_extend_z_preview(hovered=True, cursor_local=(1.5, 0.0, 0.0))
+    assert segments == []
 
 
 # ----------------------------------------------------------------------------

@@ -163,21 +163,49 @@ PropertyGroup with ``is_active`` has an entry here."""
 
 
 def try_cancel_active_preview(context: bpy.types.Context) -> bool:
-    """Cancel whichever registered preview is currently active.
+    """Cancel every registered preview that is currently active.
 
-    Returns ``True`` iff a preview was cancelled. At most one preview is
-    active at a time in practice; the first match in ``PREVIEW_CANCEL_OPS``
-    wins.
+    Returns ``True`` iff at least one preview was cancelled. Multiple
+    previews can be simultaneously active (e.g. a stale bend preview opened
+    just before the user starts a wall fillet) — one Esc must clear them
+    all rather than forcing the user to tap Esc once per preview.
 
     Tags 3D viewports for redraw on success — the Esc keymap entry runs
     outside a viewport mouse event so the gizmo poll wouldn't re-evaluate
     until the next interaction without an explicit redraw."""
+    cancelled = False
     for attr, op_name in PREVIEW_CANCEL_OPS:
         if is_preview_active(context, attr):
             getattr(bpy.ops.bim, op_name)()
-            screen = context.screen
-            for area in screen.areas if screen else ():
-                if area.type == "VIEW_3D":
-                    area.tag_redraw()
-            return True
-    return False
+            cancelled = True
+    if cancelled:
+        screen = context.screen
+        for area in screen.areas if screen else ():
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+    return cancelled
+
+
+def discard_pending_previews(scene: bpy.types.Scene) -> None:
+    """Clear every active preview under ``Scene.BIMPreviewProperties`` so
+    saved preview state never resurfaces on file load.
+
+    Mirrors ``tool.Parametric.heal_stale_edit_flags`` for the object-level
+    parametric-edit lifecycle — except previews are *discarded* rather than
+    validated. A preview's only UI cue is its in-viewport widget; reloading
+    a ``.blend`` saved mid-preview restores the flag but not the surrounding
+    user attention, and a stuck ``is_active`` silently hides every sibling
+    gizmo poll gated on it.
+
+    Iterates ``PREVIEW_CANCEL_OPS`` so any preview registered for Esc
+    cancellation is automatically covered here too. Sets ``is_active``
+    directly rather than dispatching the cancel operator: load_post may
+    fire before ``bpy.context.screen`` is reattached, and the cancel
+    operators bail on ``context.screen is None``."""
+    preview = getattr(scene, "BIMPreviewProperties", None)
+    if preview is None:
+        return
+    for attr, _op_name in PREVIEW_CANCEL_OPS:
+        child = getattr(preview, attr, None)
+        if child is not None and getattr(child, "is_active", False):
+            child.is_active = False

@@ -22,7 +22,7 @@
 
 Invariants pinned here:
 
-* ``Modifier.Array.get_child_layer_index`` resolves the layer that produced
+* ``tool.Array.get_child_layer_index`` resolves the layer that produced
   a child by walking the parent's ``BBIM_Array.Data`` and matching the
   child's GlobalId. It is total — orphan children, missing pset, unparseable
   JSON, and "child not listed in any layer" all return ``None`` without
@@ -64,9 +64,7 @@ def _make_element(global_id: str, pset: dict | None = None) -> MagicMock:
     return el
 
 
-def _pset_side_effect_from_elements(
-    elements: list, attribute: str | None = None
-) -> callable:
+def _pset_side_effect_from_elements(elements: list, attribute: str | None = None) -> callable:
     """Return a ``get_pset`` side-effect that maps each element to its
     pre-built ``BBIM_Array`` pset (or its ``Data`` field). Anything else
     returns ``None``."""
@@ -88,7 +86,7 @@ def _pset_side_effect_from_elements(
 
 
 # ---------------------------------------------------------------------------
-# tool.Blender.Modifier.Array.get_child_layer_index
+# tool.Array.get_child_layer_index
 # ---------------------------------------------------------------------------
 
 
@@ -109,7 +107,7 @@ def test_get_child_layer_index_returns_zero_for_single_layer_child():
         ),
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file({"parent-guid": parent})),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(child)
+        result = tool.Array.get_child_layer_index(child)
 
     assert result == 0
 
@@ -137,7 +135,7 @@ def test_get_child_layer_index_returns_correct_index_for_multi_layer_child():
         ),
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file({"parent-guid": parent})),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(child_in_layer_1)
+        result = tool.Array.get_child_layer_index(child_in_layer_1)
 
     assert result == 1
 
@@ -154,7 +152,7 @@ def test_get_child_layer_index_returns_none_for_orphan_child():
         ),
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file({})),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(child)
+        result = tool.Array.get_child_layer_index(child)
 
     assert result is None
 
@@ -178,7 +176,7 @@ def test_get_child_layer_index_returns_none_when_child_not_in_any_layer():
         ),
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file({"parent-guid": parent})),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(stray_child)
+        result = tool.Array.get_child_layer_index(stray_child)
 
     assert result is None
 
@@ -192,7 +190,7 @@ def test_get_child_layer_index_returns_none_when_no_pset():
         "ifcopenshell.util.element.get_pset",
         side_effect=_pset_side_effect_from_elements([child]),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(child)
+        result = tool.Array.get_child_layer_index(child)
 
     assert result is None
 
@@ -212,7 +210,7 @@ def test_get_child_layer_index_returns_none_when_parent_self_reference():
         "ifcopenshell.util.element.get_pset",
         side_effect=_pset_side_effect_from_elements([parent]),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(parent)
+        result = tool.Array.get_child_layer_index(parent)
 
     assert result is None
 
@@ -232,7 +230,7 @@ def test_get_child_layer_index_returns_none_when_data_is_garbage_json():
         ),
         patch("bonsai.tool.Ifc.get", return_value=make_ifc_file({"parent-guid": parent})),
     ):
-        result = tool.Blender.Modifier.Array.get_child_layer_index(child)
+        result = tool.Array.get_child_layer_index(child)
 
     assert result is None
 
@@ -264,7 +262,7 @@ def test_gizmo_array_all_hover_calls_bbox_helper_with_resolved_parent_and_layer(
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=child_element),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_child_layer_index",
+            "bonsai.tool.Array.get_child_layer_index",
             return_value=2,
         ),
         patch(
@@ -295,7 +293,7 @@ def test_gizmo_array_all_hover_with_orphan_child_skips_bbox():
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=child_element),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_child_layer_index",
+            "bonsai.tool.Array.get_child_layer_index",
             return_value=None,
         ),
         patch("bonsai.bim.module.model.decorator.draw_array_layer_children_bbox") as draw_bbox,
@@ -328,7 +326,7 @@ def test_gizmo_array_all_hover_with_unresolvable_parent_guid_skips_bbox():
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=child_element),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_child_layer_index",
+            "bonsai.tool.Array.get_child_layer_index",
             return_value=0,
         ),
         patch(
@@ -439,7 +437,15 @@ def test_array_layer_indicator_ensure_shape_rebuilds_when_count_changed():
         # logic without depending on the actual tris layout.
         _build_tris=lambda: ((0.0, 0.0, 0.0),) * 3,
     )
-    GizmoArrayLayerIndicator._ensure_shape(ns)
+    # The rebuild branch calls ``batch_for_shader(_get_static_tris_shader(), ...)``
+    # which in turn calls ``gpu.shader.from_builtin(...)``; that raises in
+    # headless mode. Patch the GPU symbols to identity stubs — the test asserts
+    # the rebuild logic, not the GPU side-effect.
+    with (
+        patch("bonsai.bim.module.drawing.gizmos.batch_for_shader", return_value=object()),
+        patch("bonsai.bim.module.drawing.gizmos._get_static_tris_shader", return_value=object()),
+    ):
+        GizmoArrayLayerIndicator._ensure_shape(ns)
 
     assert ns._built_count == 5
     assert ns.custom_shape != ("OLD_SHAPE",)

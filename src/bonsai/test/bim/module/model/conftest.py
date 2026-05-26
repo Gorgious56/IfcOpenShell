@@ -195,10 +195,14 @@ def patched_tool():
                     stack.enter_context(patch.object(tool.Ifc, "get_entity", return_value=entity))
             if modifier_predicates:
                 for name, value in modifier_predicates.items():
+                    # Parametric feature-kind predicates live on tool.Parametric; the
+                    # remaining cardinality / non-parametric predicates (is_array_child,
+                    # is_slab, is_eligible_for_*) stay on tool.Blender.Modifier.
+                    target = tool.Parametric if hasattr(tool.Parametric, name) else tool.Blender.Modifier
                     if callable(value):
-                        stack.enter_context(patch.object(tool.Blender.Modifier, name, side_effect=value))
+                        stack.enter_context(patch.object(target, name, side_effect=value))
                     else:
-                        stack.enter_context(patch.object(tool.Blender.Modifier, name, return_value=value))
+                        stack.enter_context(patch.object(target, name, return_value=value))
             if view_top_down is not None:
                 stack.enter_context(patch.object(tool.Blender, "is_view_top_down", return_value=view_top_down))
             if screen_up is not None:

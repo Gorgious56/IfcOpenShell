@@ -101,15 +101,12 @@ def test_install_is_idempotent():
 
 
 def test_bump_handler_increments_token():
-    """The handler that depsgraph/undo/redo/load hooks call must increment
-    the module-level cache token. If it doesn't move, stale Object refs
-    survive in dependent caches."""
+    """undo / redo / load_post invoke the handler with at most one positional
+    argument (the scene or filepath). Every such call must bump the token —
+    those events legitimately invalidate every cached Object reference."""
     decorator_cache._bump_decorator_cache_token()
     assert decorator_cache.get_decorator_cache_token() == 1
-    # Blender's hook lists pass positional args (scene, depsgraph, …). The
-    # handler must accept them without raising — it's registered against
-    # four event types with different signatures.
-    decorator_cache._bump_decorator_cache_token("scene", "depsgraph")
+    decorator_cache._bump_decorator_cache_token("scene")
     assert decorator_cache.get_decorator_cache_token() == 2
 
 
@@ -119,3 +116,61 @@ def test_get_decorator_cache_token_reads_current_value():
     initial = decorator_cache.get_decorator_cache_token()
     decorator_cache._bump_decorator_cache_token()
     assert decorator_cache.get_decorator_cache_token() == initial + 1
+
+
+def test_depsgraph_update_with_no_object_changes_does_not_bump():
+    """depsgraph_update_post fires every animation frame, every driver
+    evaluation, and every UI-only state shift. None of those invalidate a
+    decorator's cached IFC-derived geometry — gating the bump is what makes
+    the ``TokenCache`` worth more than a per-frame recompute."""
+    from unittest.mock import MagicMock
+
+    initial = decorator_cache.get_decorator_cache_token()
+    depsgraph = MagicMock(name="depsgraph")
+    depsgraph.updates = []  # empty updates list — animation tick with no real changes
+    decorator_cache._bump_decorator_cache_token("scene", depsgraph)
+    assert (
+        decorator_cache.get_decorator_cache_token() == initial
+    ), "depsgraph_update_post with no Object changes must not bump the token"
+
+
+def test_depsgraph_update_with_object_geometry_change_bumps():
+    """When the depsgraph reports an Object geometry or transform change,
+    cached references may now point at a renamed / freed ID block. The token
+    must advance so dependent caches re-fetch on the next read."""
+    from unittest.mock import MagicMock
+
+    initial = decorator_cache.get_decorator_cache_token()
+    update = MagicMock(name="update")
+    update.is_updated_geometry = True
+    update.is_updated_transform = False
+    update.id = bpy.data.objects.new("dep_cache_probe", None)
+    try:
+        depsgraph = MagicMock(name="depsgraph")
+        depsgraph.updates = [update]
+        decorator_cache._bump_decorator_cache_token("scene", depsgraph)
+        assert decorator_cache.get_decorator_cache_token() == initial + 1
+    finally:
+        bpy.data.objects.remove(update.id, do_unlink=True)
+
+
+def test_depsgraph_update_with_non_object_change_does_not_bump():
+    """Material / NodeTree / Image updates fire depsgraph_update_post too
+    but never invalidate the decorator's Object-keyed caches. Filter them
+    out so a node-graph edit doesn't trigger a global cache rebuild."""
+    from unittest.mock import MagicMock
+
+    initial = decorator_cache.get_decorator_cache_token()
+    update = MagicMock(name="update")
+    update.is_updated_geometry = True
+    update.is_updated_transform = True
+    update.id = bpy.data.materials.new("dep_cache_probe_mat")
+    try:
+        depsgraph = MagicMock(name="depsgraph")
+        depsgraph.updates = [update]
+        decorator_cache._bump_decorator_cache_token("scene", depsgraph)
+        assert (
+            decorator_cache.get_decorator_cache_token() == initial
+        ), "Non-Object ID updates must not bump the decorator cache token"
+    finally:
+        bpy.data.materials.remove(update.id, do_unlink=True)

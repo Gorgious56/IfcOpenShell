@@ -679,7 +679,7 @@ def test_parametric_gizmo_group_props_getter_is_callable():
 
 # The callable-only contract tests above catch typo'd strings but not
 # wrong-but-callable bindings (e.g. a picker's ``element_checker`` mistakenly
-# pointing at ``tool.Blender.Modifier.is_window`` when it should be
+# pointing at ``tool.Parametric.is_window`` when it should be
 # ``is_door``). Those would silently pass at class-load and only surface when
 # the user clicks the gizmo on the wrong element. The tests below pin the
 # exact predicate / props lookup per subclass so any swap fails at
@@ -694,8 +694,8 @@ def test_cycle_operator_dispatch_routes_to_matching_modifier_and_props():
 
     # element_checker: (cycle_op, expected predicate or None when skip_element_check).
     element_checker_expectations = [
-        (CycleRailingType, tool.Blender.Modifier.is_railing),
-        (CycleRoofGenerationMethod, tool.Blender.Modifier.is_roof),
+        (CycleRailingType, tool.Parametric.is_railing),
+        (CycleRoofGenerationMethod, tool.Parametric.is_roof),
     ]
     for op, expected in element_checker_expectations:
         if expected is None:
@@ -726,8 +726,8 @@ def test_pick_operator_dispatch_routes_to_matching_modifier_and_props():
     from bonsai.bim.module.model.window import PickWindowType
 
     element_checker_expectations = [
-        (PickDoorType, tool.Blender.Modifier.is_door),
-        (PickWindowType, tool.Blender.Modifier.is_window),
+        (PickDoorType, tool.Parametric.is_door),
+        (PickWindowType, tool.Parametric.is_window),
         (PickStairType, None),  # skip_element_check=True — no checker bound
         (PickRailingTerminalType, None),  # skip_element_check=True — gate via resolve_active_props_for_edit
     ]
@@ -783,10 +783,10 @@ def test_pick_operator_wired_on_pick_type_operator_slot():
     operator wired into the cycle slot renders the wrong icon. Mirror of
     test_roof_gizmos.py::test_cycle_operator_wired_on_gizmo_group for the
     pick path."""
-    from bonsai.bim.module.drawing.gizmos import PickTypeMixin
     from bonsai.bim.module.model.door import GizmoDoorEdition, PickDoorType
     from bonsai.bim.module.model.stair import GizmoStairEdition, PickStairType
     from bonsai.bim.module.model.window import GizmoWindowEdition, PickWindowType
+    from bonsai.bim.parametric_lifecycle import PickTypeMixin
 
     expectations = [
         (PickDoorType, GizmoDoorEdition),

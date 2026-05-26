@@ -23,7 +23,7 @@
 Covers three surfaces that ship together as the first MEP dimension-gizmo
 feature:
 
-- ``tool.Blender.Modifier.is_pipe_segment`` / ``is_duct_segment`` predicates
+- ``tool.Parametric.is_pipe_segment`` / ``is_duct_segment`` predicates
   (registry contract — must be total).
 - ``_segment_world_length`` / ``_preview_segment_via_scale`` /
   ``_restore_segment_scale`` pure helpers driving the live preview.
@@ -68,8 +68,8 @@ def test_is_pipe_or_duct_segment_predicate_truth_table(ifc_class, is_pipe_expect
     from bonsai import tool
 
     probe = ifcopenshell.file(schema="IFC4").create_entity(ifc_class)
-    assert tool.Blender.Modifier.is_pipe_segment(probe) is is_pipe_expected
-    assert tool.Blender.Modifier.is_duct_segment(probe) is is_duct_expected
+    assert tool.Parametric.is_pipe_segment(probe) is is_pipe_expected
+    assert tool.Parametric.is_duct_segment(probe) is is_duct_expected
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +170,13 @@ def test_gizmo_group_class_wiring(gizmo_cls_name, bl_idname, is_element_predicat
 
     cls = getattr(mep, gizmo_cls_name)
     assert cls.bl_idname == bl_idname
-    # The element_type predicate must delegate to the matching Modifier.is_*.
-    predicate = getattr(tool.Blender.Modifier, is_element_predicate)
+    # The element_type predicate must delegate to the matching tool.Parametric.is_*.
+    predicate = getattr(tool.Parametric, is_element_predicate)
     fake_element = Mock()
     fake_element.is_a.return_value = True
-    with patch.object(tool.Blender.Modifier, is_element_predicate, side_effect=predicate) as p:
+    with patch.object(tool.Parametric, is_element_predicate, side_effect=predicate) as p:
         cls.is_element_type(fake_element)
-    assert p.called, f"{gizmo_cls_name}.is_element_type did not delegate to Modifier.{is_element_predicate}"
+    assert p.called, f"{gizmo_cls_name}.is_element_type did not delegate to Parametric.{is_element_predicate}"
 
 
 @pytest.mark.parametrize(
@@ -196,7 +196,7 @@ def test_gizmo_group_class_wiring(gizmo_cls_name, bl_idname, is_element_predicat
         ),
     ],
 )
-def test_gizmo_triad_bindings_reference_registered_operators(gizmo_cls_name, enable_op, finish_op, cancel_op):
+def test_gizmo_lifecycle_bindings_reference_registered_operators(gizmo_cls_name, enable_op, finish_op, cancel_op):
     """Catches the silent-regression where the gizmo's enable/finish/cancel
     string drifts away from the actual operator ``bl_idname``."""
     from bonsai.bim.module.model import mep
@@ -291,7 +291,7 @@ def test_gizmo_preferences_field_exists(feature_attr):
 
 
 # ---------------------------------------------------------------------------
-# Triad operators are registered
+# Lifecycle operators are registered
 # ---------------------------------------------------------------------------
 
 
@@ -405,6 +405,115 @@ def test_extend_preview_line_clamps_cursor_projection_to_minimum():
     assert tuple(start) == pytest.approx((0.0, 0.0, 1.0))
     # End clamped to min, not the raw -2.0.
     assert tuple(end) == pytest.approx((0.0, 0.0, 0.01))
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle drift handling — Enable / Finish / Cancel must commit / restore
+# matrix_world ↔ IFC ObjectPlacement at the appropriate lifecycle points.
+# The AST forward-compat guard pins "a drift hook IS called somewhere"; these
+# tests pin "the hook is called in the right branch with the right args."
+# ---------------------------------------------------------------------------
+
+
+def _make_segment_context(length=2.0, snap_length=2.0, scale_z=1.0):
+    """Build (context, props, obj, element) fakes for the MEP edit-lifecycle bases.
+    The bases access ``self.__class__._predicate`` / ``_props_getter`` so
+    callers must instantiate a concrete test subclass and call
+    ``instance._execute(context)`` rather than passing a Mock as ``self``."""
+    obj = Mock(name="obj")
+    obj.scale = Vector((1.0, 1.0, scale_z))
+    element = Mock(name="element")
+    props = Mock(name="props")
+    props.length = length
+    props.snap_length = snap_length
+    props.snap_object_scale_z = scale_z
+    props.mesh_dirty = False
+
+    context = Mock(name="context")
+    context.active_object = obj
+    return context, props, obj, element
+
+
+def _concrete_mep_mixin(props):
+    """Build a concrete ``_MEPSegmentEditMixin`` subclass that bypasses the
+    IFC predicate gate and returns the supplied ``props`` from ``_get_props``.
+    The unified mixin replaced the three-base-class lifecycle pattern; tests now
+    target the single mixin and override the two ParametricEditMixinBase
+    hooks instead of class-level ``_predicate`` / ``_props_getter``."""
+    from bonsai.bim.module.model.mep import _MEPSegmentEditMixin
+
+    class _ConcreteMEPMixin(_MEPSegmentEditMixin):
+        @classmethod
+        def _is_element_type(cls, element):
+            return True
+
+        @classmethod
+        def _get_props(cls, obj):
+            return props
+
+    return _ConcreteMEPMixin
+
+
+def test_enable_pipe_segment_commits_pre_edit_placement_drift():
+    """Enable must call ``commit_placement_if_moved(obj, apply_scale=False)``
+    BEFORE ``_segment_world_length`` captures ``snap_length``. Without the
+    commit, snap_length is read from a dragged matrix_world while the IFC
+    ObjectPlacement is stale — Finish's set_depth would then write
+    representation coords relative to the wrong origin."""
+    context, props, obj, element = _make_segment_context()
+    cls = _concrete_mep_mixin(props)
+
+    with (
+        patch("bonsai.bim.module.model.mep.tool") as mock_tool,
+        patch("bonsai.bim.parametric_lifecycle.tool", mock_tool),
+        patch("bonsai.bim.module.model.mep._segment_world_length", return_value=2.0),
+    ):
+        mock_tool.Ifc.get_entity.return_value = element
+        cls()._enable_targets(context)
+
+    mock_tool.Geometry.commit_placement_if_moved.assert_called_once_with(obj, apply_scale=False)
+
+
+def test_finish_pipe_segment_commits_drift_when_no_length_change():
+    """Finish without a length change must STILL commit matrix_world drift —
+    the bug class that motivated this guard. The conditional ``set_depth``
+    branch covers the length-changed path transitively; the unconditional
+    ``commit_placement_if_moved`` after the if/else closes the silent-drop
+    path."""
+    # length == snap_length → no-op session.
+    context, props, obj, element = _make_segment_context(length=2.0, snap_length=2.0)
+    cls = _concrete_mep_mixin(props)
+
+    with (
+        patch("bonsai.bim.module.model.mep.tool") as mock_tool,
+        patch("bonsai.bim.parametric_lifecycle.tool", mock_tool),
+        patch("bonsai.bim.module.model.mep.DumbProfileJoiner") as mock_joiner,
+        patch("bonsai.bim.module.model.mep._restore_segment_mesh_if_dirty"),
+        patch("bonsai.bim.module.model.mep._restore_segment_scale_to"),
+    ):
+        mock_tool.Ifc.get_entity.return_value = element
+        cls()._finish_targets(context)
+        mock_joiner.return_value.set_depth.assert_not_called()  # no-length branch
+
+    mock_tool.Geometry.commit_placement_if_moved.assert_called_once_with(obj)
+
+
+def test_cancel_pipe_segment_delegates_to_restore_or_rebaseline():
+    """Cancel must call ``tool.Geometry.restore_or_rebaseline_placement`` so
+    matrix_world reverts in lockstep with the props draft. The helper owns
+    the is_moved / ObjectPlacement gate."""
+    context, props, obj, element = _make_segment_context()
+    cls = _concrete_mep_mixin(props)
+
+    with (
+        patch("bonsai.bim.module.model.mep.tool") as mock_tool,
+        patch("bonsai.bim.parametric_lifecycle.tool", mock_tool),
+        patch("bonsai.bim.module.model.mep._restore_segment_mesh_if_dirty"),
+    ):
+        mock_tool.Ifc.get_entity.return_value = element
+        cls()._cancel_targets(context)
+
+    mock_tool.Geometry.restore_or_rebaseline_placement.assert_called_once_with(obj, element)
 
 
 def test_extend_preview_line_respects_object_rotation():

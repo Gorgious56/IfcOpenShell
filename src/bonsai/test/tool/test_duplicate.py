@@ -172,6 +172,7 @@ class TestRecreatePortConnections(NewFile):
         new_b = _add_segment_with_ports(ifc, n_ports=2)
         old_to_new = {seg_a: [new_a], seg_b: [new_b]}
 
+        subject.consume_warnings()  # clear any buffered warnings from earlier tests
         subject.recreate_port_connections(snapshot, old_to_new)
 
         new_ports_a = ifcopenshell.util.system.get_ports(new_a)
@@ -179,6 +180,24 @@ class TestRecreatePortConnections(NewFile):
         # mapping was deemed unsafe.
         for port in new_ports_a:
             assert ifcopenshell.util.system.get_connected_port(port) is None
+        # The skip must surface as a consumable warning so the operator can
+        # report it — silent topology breaks ship undetected otherwise.
+        warnings = subject.consume_warnings()
+        assert any(
+            "port reconnect skipped" in w for w in warnings
+        ), f"port-count divergence must enqueue a warning; got {warnings!r}"
+
+
+class TestConsumeWarnings(NewFile):
+    def test_drain_returns_and_clears(self):
+        """``consume_warnings`` is the operator's only window into the buffer;
+        a second call must observe an empty list so warnings can't double-fire."""
+        subject.consume_warnings()  # baseline
+        subject._emit_warning("first")
+        subject._emit_warning("second")
+        first_drain = subject.consume_warnings()
+        assert first_drain == ["first", "second"]
+        assert subject.consume_warnings() == []
 
 
 class TestRecreateConnectionsRestoresPriorities(NewFile):

@@ -41,6 +41,7 @@ import pytest
 
 import bonsai.tool as tool
 from bonsai.bim.module.geometry.operator import (
+    compute_array_dismantle_plan,
     count_implicit_array_children_in_selection,
     has_blocked_array_child_in_selection,
 )
@@ -91,7 +92,7 @@ def test_count_is_zero_when_no_array_in_selection():
 
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=element),
-        patch("bonsai.tool.Blender.Modifier.is_array", return_value=False),
+        patch("bonsai.tool.Parametric.is_array", return_value=False),
     ):
         result = count_implicit_array_children_in_selection({obj})
 
@@ -109,9 +110,9 @@ def test_count_is_zero_when_parent_plus_all_children_selected():
 
     with (
         patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
-        patch("bonsai.tool.Blender.Modifier.is_array", return_value=True),
+        patch("bonsai.tool.Parametric.is_array", return_value=True),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_all_children_objects",
+            "bonsai.tool.Array.get_all_children_objects",
             return_value=iter([child_a, child_b]),
         ),
     ):
@@ -128,9 +129,9 @@ def test_count_reports_all_children_when_parent_selected_alone():
 
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=parent_element),
-        patch("bonsai.tool.Blender.Modifier.is_array", return_value=True),
+        patch("bonsai.tool.Parametric.is_array", return_value=True),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_all_children_objects",
+            "bonsai.tool.Array.get_all_children_objects",
             return_value=iter([child_a, child_b]),
         ),
     ):
@@ -151,9 +152,9 @@ def test_count_reports_only_unselected_children_when_partial():
 
     with (
         patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
-        patch("bonsai.tool.Blender.Modifier.is_array", return_value=True),
+        patch("bonsai.tool.Parametric.is_array", return_value=True),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_all_children_objects",
+            "bonsai.tool.Array.get_all_children_objects",
             return_value=iter([child_a, child_b, child_c]),
         ),
     ):
@@ -181,9 +182,9 @@ def test_count_sums_across_distinct_array_parents():
 
     with (
         patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
-        patch("bonsai.tool.Blender.Modifier.is_array", return_value=True),
+        patch("bonsai.tool.Parametric.is_array", return_value=True),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_all_children_objects",
+            "bonsai.tool.Array.get_all_children_objects",
             side_effect=get_all_children_objects,
         ),
     ):
@@ -200,18 +201,21 @@ def test_count_sums_across_distinct_array_parents():
 def test_has_blocked_array_child_false_when_no_array_in_selection():
     obj = _make_obj("wall")
     element = MagicMock(name="element")
+    ifc_file = make_ifc_file()
 
     with (
         patch("bonsai.tool.Ifc.get_entity", return_value=element),
         patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=False),
+        patch("ifcopenshell.util.element.get_pset", return_value=None),
     ):
-        result = has_blocked_array_child_in_selection({obj})
+        result = has_blocked_array_child_in_selection({obj}, ifc_file)
 
     assert result is False
 
 
 def test_has_blocked_array_child_true_when_lone_child_selected():
     child_obj = _make_obj("child")
+    sibling_obj = _make_obj("sibling")  # same array layer, NOT in selection
     parent_obj = _make_obj("parent")
     child_element = MagicMock(name="child_element")
     parent_element = MagicMock(name="parent_element")
@@ -219,16 +223,24 @@ def test_has_blocked_array_child_true_when_lone_child_selected():
     ifc_file = make_ifc_file()
     ifc_file.by_guid.return_value = parent_element
 
+    layer_0 = {"layer": 0, "children": ["c-guid", "s-guid"]}
+
     with (
         patch("bonsai.tool.Ifc.get", return_value=ifc_file),
         patch("bonsai.tool.Ifc.get_entity", return_value=child_element),
         patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
         patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=True),
         patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0])),
+        patch(
+            "bonsai.tool.Array.get_children_objects",
+            side_effect=lambda layer: iter([child_obj, sibling_obj]),
+        ),
     ):
-        # The parent object isn't in the selection — the child is on its own,
-        # so the delete guard would silently skip it.
-        result = has_blocked_array_child_in_selection({child_obj})
+        # The parent object isn't in the selection — and the layer isn't fully
+        # selected (sibling is missing) — so the delete pipeline would silently
+        # skip the child.
+        result = has_blocked_array_child_in_selection({child_obj}, ifc_file)
 
     assert result is True
 
@@ -249,7 +261,7 @@ def test_has_blocked_array_child_false_when_parent_guid_unresolvable(capsys):
         patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=True),
         patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "missing-guid"}),
     ):
-        result = has_blocked_array_child_in_selection({child_obj})
+        result = has_blocked_array_child_in_selection({child_obj}, ifc_file)
 
     assert result is False
     assert "BBIM_Array" in capsys.readouterr().out
@@ -264,11 +276,13 @@ def test_has_blocked_array_child_false_when_parent_also_selected():
     ifc_file = make_ifc_file()
     ifc_file.by_guid.return_value = parent_element
 
+    layer_0 = {"layer": 0, "children": ["c-guid"]}
+
     def is_child(elem):
         return elem is child_element
 
     def get_entity(obj):
-        return child_element if obj is child_obj else MagicMock()
+        return child_element if obj is child_obj else parent_element
 
     with (
         patch("bonsai.tool.Ifc.get", return_value=ifc_file),
@@ -276,10 +290,12 @@ def test_has_blocked_array_child_false_when_parent_also_selected():
         patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
         patch("bonsai.tool.Blender.Modifier.is_array_child", side_effect=is_child),
         patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0])),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=lambda layer: iter([child_obj])),
     ):
         # Both parent and child selected → the dismantle path handles
         # cleanup, so no popup is needed.
-        result = has_blocked_array_child_in_selection({parent_obj, child_obj})
+        result = has_blocked_array_child_in_selection({parent_obj, child_obj}, ifc_file)
 
     assert result is False
 
@@ -288,6 +304,7 @@ def test_has_blocked_finds_child_when_other_array_parent_selected():
     """Selecting an unrelated array's parent does not unblock children of
     other arrays — the predicate checks each child's own parent."""
     child_x_obj = _make_obj("child_x")
+    sibling_x_obj = _make_obj("sibling_x")  # child_x's array-X layer sibling, NOT selected
     parent_y_obj = _make_obj("parent_y")
     parent_x_obj = _make_obj("parent_x")
     child_x_element = MagicMock(name="child_x_element")
@@ -295,7 +312,14 @@ def test_has_blocked_finds_child_when_other_array_parent_selected():
     parent_x_element = MagicMock(name="parent_x_element")
 
     ifc_file = make_ifc_file()
-    ifc_file.by_guid.return_value = parent_x_element
+
+    def by_guid(guid):
+        return {"x-guid": parent_x_element, "y-guid": parent_y_element}.get(guid)
+
+    ifc_file.by_guid.side_effect = by_guid
+
+    layer_x = {"layer": 0, "children": ["cx-guid", "sx-guid"]}
+    layer_y = {"layer": 0, "children": ["py-guid"]}
 
     def is_child(elem):
         # Only child_x is an array child; parent_y_element is its own
@@ -308,16 +332,194 @@ def test_has_blocked_finds_child_when_other_array_parent_selected():
     def get_object(elem):
         return {parent_x_element: parent_x_obj, parent_y_element: parent_y_obj}.get(elem)
 
+    def get_pset(element, name):
+        if element is child_x_element:
+            return {"Parent": "x-guid"}
+        if element is parent_y_element:
+            return {"Parent": "y-guid"}
+        return None
+
+    def get_modifiers_data(parent):
+        return iter([layer_x] if parent is parent_x_element else [layer_y])
+
+    def get_children_objects(layer):
+        return iter([child_x_obj, sibling_x_obj] if layer is layer_x else [])
+
     with (
         patch("bonsai.tool.Ifc.get", return_value=ifc_file),
         patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
         patch("bonsai.tool.Ifc.get_object", side_effect=get_object),
         patch("bonsai.tool.Blender.Modifier.is_array_child", side_effect=is_child),
-        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "x-guid"}),
+        patch("ifcopenshell.util.element.get_pset", side_effect=get_pset),
+        patch("bonsai.tool.Array.get_modifiers_data", side_effect=get_modifiers_data),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=get_children_objects),
     ):
-        result = has_blocked_array_child_in_selection({child_x_obj, parent_y_obj})
+        result = has_blocked_array_child_in_selection({child_x_obj, parent_y_obj}, ifc_file)
 
     assert result is True
+
+
+def test_has_blocked_false_when_all_layer_children_selected_without_parent():
+    """When every child of every array layer is in the selection — but the
+    parent is not — the executor dismantles the array cleanly. The dialog
+    predicate must agree and stay quiet; otherwise the user sees a modal
+    claiming the children are undeletable just before they are deleted."""
+    child_l0 = _make_obj("child_l0")
+    child_l1 = _make_obj("child_l1")
+    parent_obj = _make_obj("parent")
+    child_l0_element = MagicMock(name="child_l0_element")
+    child_l1_element = MagicMock(name="child_l1_element")
+    parent_element = MagicMock(name="parent_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.return_value = parent_element
+
+    layer_0 = {"layer": 0, "children": ["a"]}
+    layer_1 = {"layer": 1, "children": ["b"]}
+
+    def get_entity(obj):
+        return {child_l0: child_l0_element, child_l1: child_l1_element}.get(obj)
+
+    def get_children_objects(layer):
+        return iter([child_l0]) if layer is layer_0 else iter([child_l1])
+
+    with (
+        patch("bonsai.tool.Ifc.get", return_value=ifc_file),
+        patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
+        patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
+        patch("bonsai.tool.Blender.Modifier.is_array_child", return_value=True),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0, layer_1])),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=get_children_objects),
+    ):
+        result = has_blocked_array_child_in_selection({child_l0, child_l1}, ifc_file)
+
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# compute_array_dismantle_plan
+# ---------------------------------------------------------------------------
+
+
+def test_dismantle_plan_empty_when_no_array_in_selection():
+    obj = _make_obj("wall")
+    element = MagicMock(name="element")
+    ifc_file = make_ifc_file()
+
+    with (
+        patch("bonsai.tool.Ifc.get_entity", return_value=element),
+        patch("ifcopenshell.util.element.get_pset", return_value=None),
+    ):
+        plan, dismantled = compute_array_dismantle_plan({obj}, ifc_file)
+
+    assert plan == {}
+    assert dismantled == set()
+
+
+def test_dismantle_plan_full_dismantle_when_parent_selected():
+    """Parent in selection → every layer is dismantled regardless of which
+    children are also selected (the executor's full_dismantle branch)."""
+    parent_obj = _make_obj("parent")
+    child_a = _make_obj("child_a")
+    child_b = _make_obj("child_b")
+    parent_element = MagicMock(name="parent_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.return_value = parent_element
+
+    layer_0 = {"layer": 0, "children": ["a"]}
+    layer_1 = {"layer": 1, "children": ["b"]}
+
+    def get_children_objects(layer):
+        return iter([child_a]) if layer is layer_0 else iter([child_b])
+
+    with (
+        patch("bonsai.tool.Ifc.get_entity", return_value=parent_element),
+        patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0, layer_1])),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=get_children_objects),
+    ):
+        plan, dismantled = compute_array_dismantle_plan({parent_obj}, ifc_file)
+
+    # Layers walked in reverse: last layer first.
+    assert plan == {parent_element: [1, 0]}
+    assert dismantled == {child_a, child_b}
+
+
+def test_dismantle_plan_all_children_selected_without_parent():
+    """All children of every layer in selection, parent not — every layer
+    is still dismantled because each layer's child set is a subset of the
+    selection. This is the user's reported scenario."""
+    child_l0 = _make_obj("child_l0")
+    child_l1 = _make_obj("child_l1")
+    parent_obj = _make_obj("parent")
+    child_l0_element = MagicMock(name="child_l0_element")
+    child_l1_element = MagicMock(name="child_l1_element")
+    parent_element = MagicMock(name="parent_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.return_value = parent_element
+
+    layer_0 = {"layer": 0, "children": ["a"]}
+    layer_1 = {"layer": 1, "children": ["b"]}
+
+    def get_entity(obj):
+        return {child_l0: child_l0_element, child_l1: child_l1_element}.get(obj)
+
+    def get_children_objects(layer):
+        return iter([child_l0]) if layer is layer_0 else iter([child_l1])
+
+    with (
+        patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
+        patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0, layer_1])),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=get_children_objects),
+    ):
+        plan, dismantled = compute_array_dismantle_plan({child_l0, child_l1}, ifc_file)
+
+    assert plan == {parent_element: [1, 0]}
+    assert dismantled == {child_l0, child_l1}
+
+
+def test_dismantle_plan_breaks_when_higher_layer_partial():
+    """Reverse-walk stops at the first partially-selected layer. Layer 1
+    fully selected → dismantled. Layer 0 only partially selected → break,
+    layer 0 stays (even though some of its children are selected)."""
+    child_l0_a = _make_obj("child_l0_a")
+    child_l0_b = _make_obj("child_l0_b")  # NOT in selection
+    child_l1 = _make_obj("child_l1")
+    parent_obj = _make_obj("parent")
+    child_l0_a_element = MagicMock(name="child_l0_a_element")
+    child_l1_element = MagicMock(name="child_l1_element")
+    parent_element = MagicMock(name="parent_element")
+
+    ifc_file = make_ifc_file()
+    ifc_file.by_guid.return_value = parent_element
+
+    layer_0 = {"layer": 0, "children": ["a", "b"]}
+    layer_1 = {"layer": 1, "children": ["c"]}
+
+    def get_entity(obj):
+        return {child_l0_a: child_l0_a_element, child_l1: child_l1_element}.get(obj)
+
+    def get_children_objects(layer):
+        return iter([child_l0_a, child_l0_b]) if layer is layer_0 else iter([child_l1])
+
+    with (
+        patch("bonsai.tool.Ifc.get_entity", side_effect=get_entity),
+        patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
+        patch("ifcopenshell.util.element.get_pset", return_value={"Parent": "p-guid"}),
+        patch("bonsai.tool.Array.get_modifiers_data", return_value=iter([layer_0, layer_1])),
+        patch("bonsai.tool.Array.get_children_objects", side_effect=get_children_objects),
+    ):
+        plan, dismantled = compute_array_dismantle_plan({child_l0_a, child_l1}, ifc_file)
+
+    # Only layer 1 dismantled; layer 0 left alone because it's partial.
+    assert plan == {parent_element: [1]}
+    assert dismantled == {child_l1}
 
 
 # ---------------------------------------------------------------------------
@@ -347,13 +549,13 @@ def test_process_arrays_fully_dismantles_when_parent_selected_alone():
         patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
         patch("ifcopenshell.util.element.get_pset", return_value=fake_pset),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_modifiers_data",
+            "bonsai.tool.Array.get_modifiers_data",
             return_value=iter([layer_0, layer_1]),
         ),
         # Returning children not present in the selection ensures the
         # per-layer subset check fails for every layer.
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_children_objects",
+            "bonsai.tool.Array.get_children_objects",
             side_effect=lambda layer: iter([_make_obj(f"unselected-{layer['layer']}")]),
         ),
         _mock_bim_ops() as bim_ops,
@@ -411,11 +613,11 @@ def test_process_arrays_layer_by_layer_when_all_children_selected():
         patch("bonsai.tool.Ifc.get_object", return_value=parent_obj),
         patch("ifcopenshell.util.element.get_pset", side_effect=get_pset),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_modifiers_data",
+            "bonsai.tool.Array.get_modifiers_data",
             return_value=iter([layer_0, layer_1]),
         ),
         patch(
-            "bonsai.tool.Blender.Modifier.Array.get_children_objects",
+            "bonsai.tool.Array.get_children_objects",
             side_effect=get_children_objects,
         ),
         _mock_bim_ops() as bim_ops,

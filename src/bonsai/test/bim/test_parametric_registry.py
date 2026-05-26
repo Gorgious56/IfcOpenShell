@@ -29,7 +29,7 @@ registration and the silent-desync the framework exists to prevent will ship.
 These tests pin the registry-to-runtime contract: for every entry the operator
 ``bl_idname``s resolve to registered ``bpy.ops.bim.*`` callables, the
 ``PropertyGroup`` class is attached to ``bpy.types.Object``, and the per-type
-predicate exists on `tool.Blender.Modifier`."""
+predicate exists on `tool.Parametric`."""
 
 import types
 
@@ -78,8 +78,8 @@ def test_every_entry_has_property_group_attached(registry):
 def test_every_entry_has_modifier_predicate(registry):
     from bonsai import tool
 
-    missing = [e.name for e in registry if getattr(tool.Blender.Modifier, f"is_{e.name}", None) is None]
-    assert not missing, f"tool.Blender.Modifier missing is_<name> predicates: {missing}"
+    missing = [e.name for e in registry if getattr(tool.Parametric, f"is_{e.name}", None) is None]
+    assert not missing, f"tool.Parametric missing is_<name> predicates: {missing}"
 
 
 def test_every_predicate_does_not_raise_on_non_matching_element(registry):
@@ -102,7 +102,7 @@ def test_every_predicate_does_not_raise_on_non_matching_element(registry):
 
     raised = []
     for feature in registry:
-        predicate = getattr(tool.Blender.Modifier, f"is_{feature.name}", None)
+        predicate = getattr(tool.Parametric, f"is_{feature.name}", None)
         if predicate is None:
             continue
         try:
@@ -116,6 +116,52 @@ def test_every_predicate_does_not_raise_on_non_matching_element(registry):
     )
 
 
+def test_every_predicate_returns_false_for_none_element(registry):
+    """Predicates must also accept ``None`` — call sites in gizmo poll/draw
+    paths can land here when an IFC relationship's element ref is unset on a
+    malformed file. A raise here crashes the per-frame draw loop."""
+    from bonsai import tool
+
+    raised = []
+    truthy = []
+    for feature in registry:
+        predicate = getattr(tool.Parametric, f"is_{feature.name}", None)
+        if predicate is None:
+            continue
+        try:
+            result = predicate(None)
+        except Exception as e:
+            raised.append((feature.name, type(e).__name__, str(e)))
+            continue
+        if result:
+            truthy.append(feature.name)
+    assert not raised, f"is_<name> predicates raised on None: {raised}"
+    assert not truthy, f"is_<name> predicates returned truthy on None: {truthy}"
+
+
+def test_find_for_element_survives_raising_predicate(registry, monkeypatch):
+    """Defense in depth for the total-predicate contract: if a future edit
+    regresses one predicate to raise, the registry scan must still surface
+    the other parametric types' matches. Without this, every save loses
+    every other type's pending draft until the bad predicate is patched."""
+    from bonsai import tool
+
+    if len(registry) < 2:
+        pytest.skip("need >= 2 registry entries to test cross-type defense")
+
+    raising_feature = registry[0]
+    valid_feature = registry[1]
+
+    def _raises(_elem):
+        raise RuntimeError("simulated regression in is_<raising_feature>")
+
+    monkeypatch.setattr(tool.Parametric, f"is_{raising_feature.name}", _raises)
+    monkeypatch.setattr(tool.Parametric, f"is_{valid_feature.name}", lambda _elem: True)
+
+    probe = object()
+    assert tool.Parametric.find_for_element(probe) is valid_feature
+
+
 def _fake_editing_obj(registry, editing_names: set[str]):
     """Build a SimpleNamespace that mimics a bpy.types.Object — one
     ``BIM<Name>Properties`` attribute per registry entry, with ``is_editing``
@@ -127,7 +173,7 @@ def _fake_editing_obj(registry, editing_names: set[str]):
 
 
 def test_is_object_editing_returns_active_entry(registry):
-    """``is_object_editing`` returns the registry entry whose triad is active."""
+    """``is_object_editing`` returns the registry entry whose edit lifecycle is active."""
     from bonsai import tool
 
     target = registry[0]
@@ -136,7 +182,7 @@ def test_is_object_editing_returns_active_entry(registry):
 
 
 def test_is_object_editing_returns_none_when_no_edit_active(registry):
-    """No triad active → ``None``."""
+    """No edit lifecycle active → ``None``."""
     from bonsai import tool
 
     obj = _fake_editing_obj(registry, editing_names=set())
@@ -171,9 +217,9 @@ def test_get_pending_edits_self_heals_stale_is_editing_on_duplicates(registry, m
     phantom_obj.name = "phantom"
 
     monkeypatch.setattr(tool.Ifc, "get_entity", lambda obj: object())
-    monkeypatch.setattr(tool.Blender.Modifier, f"is_{valid_feature.name}", lambda _elem: True)
+    monkeypatch.setattr(tool.Parametric, f"is_{valid_feature.name}", lambda _elem: True)
     if phantom_feature.name != valid_feature.name:
-        monkeypatch.setattr(tool.Blender.Modifier, f"is_{phantom_feature.name}", lambda _elem: False)
+        monkeypatch.setattr(tool.Parametric, f"is_{phantom_feature.name}", lambda _elem: False)
 
     with mock.patch("bonsai.tool.parametric.bpy.data") as mock_data:
         mock_data.objects = [valid_obj, phantom_obj]
@@ -216,14 +262,14 @@ def test_predicate_is_not_consulted_when_no_is_editing_flag_set(registry, monkey
 
     monkeypatch.setattr(tool.Ifc, "get_entity", lambda _obj: object())
     for entry in registry:
-        monkeypatch.setattr(tool.Blender.Modifier, f"is_{entry.name}", _exploding_predicate)
+        monkeypatch.setattr(tool.Parametric, f"is_{entry.name}", _exploding_predicate)
 
     assert tool.Parametric._validated_editing_feature(obj) is None
 
 
 def test_missing_per_type_predicate_self_heals_stale_is_editing(registry, monkeypatch):
     """Defensive: if a registry entry's ``is_<name>`` predicate isn't
-    registered on ``tool.Blender.Modifier`` (partial init at addon enable,
+    registered on ``tool.Parametric`` (partial init at addon enable,
     extension swap, etc.), the registry treats the ``is_editing`` flag as
     stale rather than crashing the save path."""
     from bonsai import tool
@@ -232,7 +278,7 @@ def test_missing_per_type_predicate_self_heals_stale_is_editing(registry, monkey
     obj = _fake_editing_obj(registry, editing_names={feature.name})
     monkeypatch.setattr(tool.Ifc, "get_entity", lambda _obj: object())
     # Remove the predicate so getattr(..., None) returns None.
-    monkeypatch.delattr(tool.Blender.Modifier, f"is_{feature.name}", raising=False)
+    monkeypatch.delattr(tool.Parametric, f"is_{feature.name}", raising=False)
 
     assert tool.Parametric._validated_editing_feature(obj) is None
     assert getattr(obj, feature.props_attr).is_editing is False
@@ -258,9 +304,9 @@ def test_commit_pending_edits_for_selection_self_heals_stale_is_editing(registry
     phantom_obj.name = "phantom"
 
     monkeypatch.setattr(tool.Ifc, "get_entity", lambda _obj: object())
-    monkeypatch.setattr(tool.Blender.Modifier, f"is_{valid_feature.name}", lambda _elem: True)
+    monkeypatch.setattr(tool.Parametric, f"is_{valid_feature.name}", lambda _elem: True)
     if phantom_feature.name != valid_feature.name:
-        monkeypatch.setattr(tool.Blender.Modifier, f"is_{phantom_feature.name}", lambda _elem: False)
+        monkeypatch.setattr(tool.Parametric, f"is_{phantom_feature.name}", lambda _elem: False)
     monkeypatch.setattr(tool.Blender, "get_selected_objects", lambda: [valid_obj, phantom_obj])
 
     commit_calls: list[tuple[object, str]] = []
@@ -301,7 +347,7 @@ def test_heal_stale_edit_flags_runs_validation_over_all_objects(registry, monkey
     phantom_obj.name = "phantom"
     # Stub the predicate to discriminate by object identity.
     monkeypatch.setattr(tool.Ifc, "get_entity", lambda obj: obj)
-    monkeypatch.setattr(tool.Blender.Modifier, f"is_{feature.name}", lambda elem: elem is valid_obj)
+    monkeypatch.setattr(tool.Parametric, f"is_{feature.name}", lambda elem: elem is valid_obj)
 
     with mock.patch("bonsai.tool.parametric.bpy.data") as mock_data:
         mock_data.objects = [valid_obj, phantom_obj]
@@ -362,7 +408,7 @@ def test_invalid_names_are_rejected_at_construction(invalid_name):
 
 
 def test_is_object_editing_skip_name_excludes_matching_entry(registry):
-    """``skip_name`` masks the named entry even when its triad is active."""
+    """``skip_name`` masks the named entry even when its edit lifecycle is active."""
     from bonsai import tool
 
     target = registry[0]
@@ -423,6 +469,138 @@ def test_gizmo_pref_name_matches_registry(registry):
         f"each name must match a registry entry, or the runtime "
         f"``getattr(prefs.gizmos, gizmo_pref_name)`` lookup misses."
     )
+
+
+def test_classvar_annotations_match_edit_types(registry):
+    """The ``ClassVar[ParametricObject]`` annotations on ``Parametric`` for
+    the uppercase constants must enumerate exactly the same set of names as
+    ``EDIT_TYPES``. The annotations exist so IDEs / type checkers can resolve
+    ``tool.Parametric.ROOF`` at write time; a stale annotation surfaces a
+    constant that doesn't exist at runtime, a missing one hides a constant
+    from autocomplete."""
+    from bonsai import tool
+
+    # ``from __future__ import annotations`` keeps __annotations__ as strings,
+    # so a substring match on the declared type is enough — no need to
+    # resolve to a runtime ``typing.ClassVar`` object.
+    annotations = getattr(tool.Parametric, "__annotations__", {})
+    annotated = {name for name, ann in annotations.items() if "ClassVar[ParametricObject]" in str(ann)}
+    expected = {entry.name.upper() for entry in registry}
+    only_annotated = annotated - expected
+    only_expected = expected - annotated
+    assert not only_annotated and not only_expected, (
+        f"ClassVar annotations on tool.Parametric drift from EDIT_TYPES.\n"
+        f"  Annotated but not in EDIT_TYPES: {sorted(only_annotated)}\n"
+        f"  In EDIT_TYPES but not annotated: {sorted(only_expected)}\n"
+        f"Either add a ``<NAME>: ClassVar[ParametricObject]`` annotation or remove the stale one."
+    )
+
+
+def test_every_entry_is_bound_as_uppercase_class_attribute(registry):
+    """Every registered ParametricObject must be reachable as
+    ``tool.Parametric.<NAME_UPPERCASE>``, pointing at the same dataclass
+    instance held in ``EDIT_TYPES``. Renaming a registry entry renames the
+    constant — call-site typos surface as ``AttributeError`` at module load."""
+    from bonsai import tool
+
+    missing = []
+    mismatched = []
+    for entry in registry:
+        attr_name = entry.name.upper()
+        bound = getattr(tool.Parametric, attr_name, None)
+        if bound is None:
+            missing.append(attr_name)
+        elif bound is not entry:
+            mismatched.append((attr_name, bound, entry))
+    assert not missing, (
+        f"tool.Parametric missing uppercase constants for entries: {missing} — "
+        f"the post-class binding loop in tool/parametric.py must run unconditionally."
+    )
+    assert not mismatched, f"Uppercase constants do not point at the registry entry: {mismatched}"
+
+
+# ----------------------------------------------------------------------------
+# supports_build_edit_lifecycle — the registry flag that separates entries whose
+# edit lifecycle fits the shared mixin contract (and is wired via
+# ``build_edit_lifecycle``) from entries with bespoke edit operators. The flag
+# is the authoritative source — these tests pin it to reality so a drift
+# (factory call added without flipping the flag, or flag flipped without
+# the corresponding factory call) fails at CI rather than at first user
+# click on a half-wired edit lifecycle.
+# ----------------------------------------------------------------------------
+
+
+def _collect_build_edit_lifecycle_call_names() -> set[str]:
+    """Walk ``bim/module/model/*.py``, return the first-argument string of
+    every ``tool.Parametric.build_edit_lifecycle(...)`` call."""
+    import ast
+    import importlib
+    import inspect
+    import pkgutil
+
+    from bonsai.bim.module import model as model_pkg
+
+    names: set[str] = set()
+    for _finder, mod_name, _is_pkg in pkgutil.iter_modules(model_pkg.__path__):
+        full_name = f"{model_pkg.__name__}.{mod_name}"
+        try:
+            mod = importlib.import_module(full_name)
+            src = inspect.getsource(mod)
+        except Exception:
+            continue
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # tool.Parametric.build_edit_lifecycle(...)
+            if not (isinstance(func, ast.Attribute) and func.attr == "build_edit_lifecycle"):
+                continue
+            if not node.args:
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.add(first.value)
+    return names
+
+
+def test_build_edit_lifecycle_flag_matches_actual_call_sites(registry):
+    """The ``supports_build_edit_lifecycle`` flag on each EDIT_TYPES entry must
+    match the set of names actually passed to ``build_edit_lifecycle`` across
+    ``bim/module/model/*.py``. Catches drift in both directions:
+
+    - Flag set True but no factory call: indicates either an in-progress
+      migration or a stale flag — both surface as a clear error.
+    - Factory call exists but flag is False: caught at runtime by the
+      ``build_edit_lifecycle`` assertion, but this test catches it at CI time
+      before the operator registration ever runs."""
+    flagged = {entry.name for entry in registry if entry.supports_build_edit_lifecycle}
+    called = _collect_build_edit_lifecycle_call_names()
+    only_flagged = flagged - called
+    only_called = called - flagged
+    assert not only_flagged and not only_called, (
+        f"Drift between supports_build_edit_lifecycle flag and build_edit_lifecycle call sites.\n"
+        f"  Flagged True but no factory call: {sorted(only_flagged)}\n"
+        f"  Factory call exists but flag is False: {sorted(only_called)}\n"
+        f"Either flip the flag on the EDIT_TYPES entry, or remove the factory call."
+    )
+
+
+def test_build_edit_lifecycle_rejects_unflagged_entry():
+    """Direct unit test: calling ``build_edit_lifecycle`` for an entry whose
+    ``supports_build_edit_lifecycle`` is False must raise — bespoke-lifecycle
+    types must not silently get a half-wired edit lifecycle."""
+    from bonsai import tool
+    from bonsai.bim import parametric_lifecycle
+
+    # ``wall`` is a registry entry with supports_build_edit_lifecycle=False
+    # (bespoke edit lifecycle with diff-gated sub-operators).
+    with pytest.raises(RuntimeError, match="supports_build_edit_lifecycle=False"):
+        tool.Parametric.build_edit_lifecycle(
+            "wall",
+            parametric_lifecycle.FeatureModifierEditMixin,
+            labels=(("a", "b"), ("c", "d"), ("e", "f")),
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -488,3 +666,161 @@ def test_generation_keyed_cache_clear_drops_entries():
     cache.clear()
     result = cache.get_or_compute("k", lambda: "second")
     assert result == "second"
+
+
+# ----------------------------------------------------------------------
+# build_edit_lifecycle factory contract
+# ----------------------------------------------------------------------
+#
+# The factory is the bl_idname-anchoring middleware: every feature whose
+# operators are generated through it gets bl_idnames + Python class names
+# derived from the registry entry rather than hand-typed. These tests pin
+# the contract so a regression that breaks the MRO, the dispatch wiring,
+# or the bl_idname derivation surfaces at registry-test time rather than
+# at first-click in Blender.
+
+
+def test_build_edit_lifecycle_rejects_unregistered_name():
+    """A feature name not in EDIT_TYPES is a typo, not a quiet
+    no-registration — the factory asserts so the error is at module load."""
+    from bonsai import tool
+
+    class _DummyMixin:
+        pass
+
+    with pytest.raises(RuntimeError, match="not in EDIT_TYPES"):
+        tool.Parametric.build_edit_lifecycle(
+            "nonexistent",
+            _DummyMixin,
+            labels=(("E", ""), ("F", ""), ("C", "")),
+        )
+
+
+def test_build_edit_lifecycle_enforces_paired_extras():
+    """``enable_extra_props`` and ``enable_extra_kwargs`` must travel
+    together: extras without a kwargs builder are unreachable; a kwargs
+    builder without extras has nothing to forward. Either alone is a
+    misuse, not a quiet half-feature."""
+    from bonsai import tool
+
+    factory_entry = next((e for e in tool.Parametric.EDIT_TYPES if e.supports_build_edit_lifecycle), None)
+    if factory_entry is None:
+        pytest.skip("no factory-able entries to test the paired-extras contract")
+
+    class _DummyMixin:
+        pass
+
+    with pytest.raises(RuntimeError, match="enable_extra_props and enable_extra_kwargs"):
+        tool.Parametric.build_edit_lifecycle(
+            factory_entry.name,
+            _DummyMixin,
+            labels=(("E", ""), ("F", ""), ("C", "")),
+            enable_extra_props={"x": object()},
+            # missing enable_extra_kwargs
+        )
+
+
+def test_every_factory_able_entry_is_registered_as_operators(registry):
+    """The cross-check: every entry flagged ``supports_build_edit_lifecycle``
+    must have actual ``bim.enable_editing_<name>`` /
+    ``bim.finish_editing_<name>`` / ``bim.cancel_editing_<name>``
+    operators registered. The flag claims the entry is factory-wired;
+    this test verifies the feature module actually called
+    ``build_edit_lifecycle``."""
+    import bpy
+
+    missing = []
+    for entry in registry:
+        if not entry.supports_build_edit_lifecycle:
+            continue
+        for bl_idname in (entry.enable_op, entry.finish_op, entry.cancel_op):
+            verb = bl_idname.removeprefix("bim.")
+            if not hasattr(bpy.ops.bim, verb):
+                missing.append(bl_idname)
+    assert not missing, (
+        f"supports_build_edit_lifecycle=True but operators not registered: {missing}. "
+        f"Either the feature module is missing a build_edit_lifecycle call or the flag "
+        f"is set on an entry whose operators are still hand-coded."
+    )
+
+
+def test_factory_classes_match_registry_bl_idnames(registry):
+    """Pin that the bl_idname Blender sees on each factory-generated
+    operator is exactly ``feature.<verb>_op`` — anchoring this in the
+    registry is the whole point of the factory."""
+    import bpy
+
+    for entry in registry:
+        if not entry.supports_build_edit_lifecycle:
+            continue
+        for verb_attr, bl_idname in (
+            ("enable_op", entry.enable_op),
+            ("finish_op", entry.finish_op),
+            ("cancel_op", entry.cancel_op),
+        ):
+            verb = bl_idname.removeprefix("bim.")
+            op_cls = getattr(bpy.types, f"BIM_OT_{verb}", None)
+            assert op_cls is not None, f"{entry.name}: BIM_OT_{verb} not on bpy.types"
+            assert op_cls.bl_idname == bl_idname, (
+                f"{entry.name}.{verb_attr}: registry says {bl_idname!r} but "
+                f"the generated class declares bl_idname={op_cls.bl_idname!r}"
+            )
+
+
+def test_array_enable_carries_layer_index_int_property():
+    """Array's Enable operator takes an extra ``item: IntProperty`` (the
+    layer index). This must round-trip through Blender's annotation /
+    PropertyGroup machinery — pin so a factory regression that drops
+    ``__annotations__`` doesn't silently lose the redo-survivable layer
+    target."""
+    import bpy
+
+    op_cls = getattr(bpy.types, "BIM_OT_enable_editing_array", None)
+    assert op_cls is not None, "EnableEditingArray not registered"
+    annotations = getattr(op_cls, "__annotations__", {})
+    assert "item" in annotations, (
+        "EnableEditingArray.item annotation missing — the factory's extras "
+        "plumbing must attach the IntProperty to __annotations__"
+    )
+
+
+def test_edit_types_name_uniqueness_enforced_at_module_load():
+    """``EDIT_TYPES`` entry names are the primary key for every derived
+    identifier (bl_idname, props_attr, predicate, uppercase constant). A
+    duplicate would silently shadow the first entry — caught at module load
+    so the failure is at import, not at first user click in Blender."""
+    from bonsai.tool.parametric import Parametric
+
+    names = [entry.name for entry in Parametric.EDIT_TYPES]
+    assert len(set(names)) == len(names), (
+        f"Duplicate names in EDIT_TYPES: {names}. The post-list assertion in "
+        f"tool/parametric.py must run unconditionally."
+    )
+
+
+def test_factory_classes_carry_caller_module_attribution(registry):
+    """Pin that factory-generated operator classes report their feature
+    module via ``__module__`` (not the factory site). Blender's right-click
+    → Edit Source uses ``__module__`` to resolve the source location — a
+    regression that drops the ``module_name`` parameter would silently
+    route the link to ``bonsai.tool.parametric`` instead of the feature
+    module that owns the lifecycle."""
+    import bpy
+
+    factory_site = "bonsai.tool.parametric"
+    misattributed = []
+    for entry in registry:
+        if not entry.supports_build_edit_lifecycle:
+            continue
+        for verb in (entry.enable_op, entry.finish_op, entry.cancel_op):
+            op_cls = getattr(bpy.types, f"BIM_OT_{verb.removeprefix('bim.')}", None)
+            if op_cls is None:
+                continue
+            module = getattr(op_cls, "__module__", "")
+            if module == factory_site:
+                misattributed.append((entry.name, verb, module))
+    assert not misattributed, (
+        f"Factory-generated operators attributed to the factory site instead "
+        f"of their feature module: {misattributed}. The build_edit_lifecycle "
+        f"call must pass module_name=__name__."
+    )

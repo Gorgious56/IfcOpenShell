@@ -24,8 +24,8 @@ Smoke tests pin the operator surface, PropertyGroup, and umbrella wiring; the
 round-trip integration tests fire ``bim.create_wall_fillet`` against a real
 demo-template IFC project with two perpendicular walls and verify the result
 is the expected three-wall topology connected by ``IfcRelConnectsPathElements``,
-with the corner wall carrying a banana ``IfcArcIndex`` profile and a
-``BBIM_Wall.IsFilletCorner`` flag that pins it against recalculation."""
+with the corner wall carrying a tessellated banana profile (polyline arcs)
+and a ``BBIM_Wall.IsFilletCorner`` flag that pins it against recalculation."""
 
 import bpy
 import pytest
@@ -67,6 +67,23 @@ def test_cancel_when_not_active_returns_cancelled():
     preview.wall_fillet.is_active = False
     result = bpy.ops.bim.cancel_wall_fillet_preview()
     assert "CANCELLED" in result
+
+
+@pytest.mark.model
+def test_escape_cancels_active_wall_fillet_preview():
+    """Pressing Esc while a wall-fillet preview is active must clear its
+    state. Drives the registry-backed dispatch in ``preview_base`` from the
+    user-facing Esc operator end."""
+    preview = bpy.context.scene.BIMPreviewProperties.wall_fillet
+    preview.is_active = True
+    preview.wall_a_id = 17
+    preview.wall_b_id = 18
+
+    bpy.ops.bim.override_escape()
+
+    assert preview.is_active is False
+    assert preview.wall_a_id == 0
+    assert preview.wall_b_id == 0
 
 
 @pytest.mark.model
@@ -262,11 +279,14 @@ class TestCreateWallFilletRoundTrip(NewFile):
         assert elem_a in related_walls
         assert elem_b in related_walls
 
-    def test_corner_wall_body_uses_ifc_arc_index_for_curved_profile(self):
+    def test_corner_wall_body_uses_tessellated_polyline_profile(self):
         """The corner wall's Body must be an ``IfcExtrudedAreaSolid`` whose
-        ``SweptArea`` is an ``IfcArbitraryClosedProfileDef`` containing an
-        ``IfcIndexedPolyCurve`` with ``IfcArcIndex`` segments — that's the
-        IFC-native marker that this is a true rounded corner, not a chamfer."""
+        ``SweptArea`` is an ``IfcArbitraryClosedProfileDef`` wrapping an
+        ``IfcIndexedPolyCurve`` whose segments are exclusively
+        ``IfcLineIndex`` (no ``IfcArcIndex`` — that form has 3 control points
+        per arc, which many readers treat as a coarse polyline rather than an
+        analytical arc). At least 24 segments per arc gives a visually smooth
+        rendering and round-trips identically through any IFC reader."""
         import ifcopenshell.util.representation
 
         elem_a, elem_b = _create_perpendicular_wall_pair()
@@ -277,7 +297,6 @@ class TestCreateWallFilletRoundTrip(NewFile):
         body = ifcopenshell.util.representation.get_representation(corner, "Model", "Body", "MODEL_VIEW")
         assert body is not None, "Corner wall has no Model/Body representation."
 
-        # Drill down to the SweptArea profile and confirm IfcArcIndex segments.
         items = list(body.Items)
         assert len(items) == 1, f"Corner body should have exactly one item, got {len(items)}."
         extrusion = items[0]
@@ -286,8 +305,13 @@ class TestCreateWallFilletRoundTrip(NewFile):
         assert profile.is_a("IfcArbitraryClosedProfileDef"), f"Expected banana profile, got {profile.is_a()}."
         outer = profile.OuterCurve
         assert outer.is_a("IfcIndexedPolyCurve"), f"Expected IfcIndexedPolyCurve, got {outer.is_a()}."
-        arc_segments = [s for s in (outer.Segments or []) if s.is_a("IfcArcIndex")]
-        assert len(arc_segments) == 2, f"Expected 2 IfcArcIndex segments (outer + inner arc), got {len(arc_segments)}."
+
+        segments = list(outer.Segments or [])
+        arc_segments = [s for s in segments if s.is_a("IfcArcIndex")]
+        line_segments = [s for s in segments if s.is_a("IfcLineIndex")]
+        assert not arc_segments, f"Expected NO IfcArcIndex segments, got {len(arc_segments)}."
+        # 2 arcs of 24 chord segments each + at least 2 straight-edge closing segments.
+        assert len(line_segments) >= 48, f"Expected ~48+ line segments (24 per arc), got {len(line_segments)}."
 
     def test_corner_wall_carries_is_fillet_corner_pset(self):
         """The corner wall must carry ``BBIM_Wall.IsFilletCorner = True`` —
@@ -302,6 +326,145 @@ class TestCreateWallFilletRoundTrip(NewFile):
 
         corner = next(w for w in ifc_file.by_type("IfcWall") if w not in (elem_a, elem_b))
         assert ifcopenshell.util.element.get_pset(corner, "BBIM_Wall", "IsFilletCorner") is True
+
+    def test_corner_wall_has_no_material_layer_set_usage(self):
+        """The corner's material association must NOT be an
+        ``IfcMaterialLayerSetUsage`` — per IFC4, that association tells
+        importers to derive body geometry from axis swept along layer
+        thicknesses, which would discard the explicit banana body. A plain
+        ``IfcMaterial`` tag (no usage, no layer set) keeps a single
+        material reference available for QTOs and reporting while
+        disabling the parametric geometry-reconstruction hint."""
+        import ifcopenshell.util.element
+
+        elem_a, elem_b = _create_perpendicular_wall_pair()
+        ifc_file = tool.Ifc.get()
+        bpy.ops.bim.create_wall_fillet(wall_a_id=elem_a.id(), wall_b_id=elem_b.id(), radius=1.0)
+
+        corner = next(w for w in ifc_file.by_type("IfcWall") if w not in (elem_a, elem_b))
+        material = ifcopenshell.util.element.get_material(corner)
+        if material is not None:
+            assert not material.is_a("IfcMaterialLayerSetUsage"), (
+                f"Corner wall must not carry IfcMaterialLayerSetUsage; got {material.is_a()}."
+            )
+
+    def test_corner_wall_inherits_thickest_layer_material(self):
+        """The corner wall must carry a plain ``IfcMaterial`` whose value
+        equals the thickest ``IfcMaterialLayer.Material`` of wall A's
+        effective layer set. Wall A is the parameter source for every other
+        attribute the corner inherits (height, x_angle, layer thicknesses,
+        type), so the material tag follows the same source for visual /
+        QTO / colour coherence with the parent neighbour."""
+        import ifcopenshell.util.element
+
+        elem_a, elem_b = _create_perpendicular_wall_pair()
+        ifc_file = tool.Ifc.get()
+        bpy.ops.bim.create_wall_fillet(wall_a_id=elem_a.id(), wall_b_id=elem_b.id(), radius=1.0)
+
+        corner = next(w for w in ifc_file.by_type("IfcWall") if w not in (elem_a, elem_b))
+        corner_material = ifcopenshell.util.element.get_material(corner)
+        assert corner_material is not None, "Corner wall must carry a material tag."
+        assert corner_material.is_a() == "IfcMaterial", (
+            f"Corner material must be a plain IfcMaterial; got {corner_material.is_a()}."
+        )
+
+        layer_set = ifcopenshell.util.element.get_material(elem_a, should_skip_usage=True)
+        assert layer_set is not None and layer_set.is_a("IfcMaterialLayerSet"), (
+            "Fixture precondition: wall A's effective material must resolve to an IfcMaterialLayerSet."
+        )
+        layers_with_material = [layer for layer in layer_set.MaterialLayers if layer.Material is not None]
+        assert layers_with_material, "Fixture precondition: wall A's layer set must contain at least one material."
+        expected = max(layers_with_material, key=lambda layer: layer.LayerThickness or 0.0).Material
+        assert corner_material == expected, (
+            f"Corner material must match wall A's thickest layer ({expected.Name}); got {corner_material.Name}."
+        )
+
+    def test_neighbour_wall_body_does_not_extend_past_tangent(self):
+        """After a fillet runs, wall A's IFC body must end exactly at
+        ``tangent_a`` — neither short of it (gap) nor past it (overlap
+        through the corner). Importers (ARCHICAD) and Bonsai's own viewport
+        both read the body span as the wall's actual extent, so a body
+        that's longer than the axis shows up as the wall poking through
+        the curved corner."""
+        import ifcopenshell.util.placement
+        import ifcopenshell.util.representation
+        import numpy as np
+
+        elem_a, elem_b = _create_perpendicular_wall_pair()
+        ifc_file = tool.Ifc.get()
+        # Wall A goes from (0,0) to (5,0); wall B from (5,0) to (5,5). With
+        # radius 1.0, tangent_a is at (4,0), tangent_b at (5,1). Wall A
+        # should end at (4,0) in world coords — body length 4m.
+        bpy.ops.bim.create_wall_fillet(wall_a_id=elem_a.id(), wall_b_id=elem_b.id(), radius=1.0)
+
+        # Reference-line span IS the wall's axis length in IFC units.
+        ref = ifcopenshell.util.representation.get_reference_line(elem_a)
+        unit_scale = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
+        axis_length_si = float(np.linalg.norm(np.array(ref[1]) - np.array(ref[0]))) * unit_scale
+
+        # Body extrusion: the body profile's X extent (in wall-local coords)
+        # should match the axis length. The default rectangular profile is
+        # IfcRectangleProfileDef or IfcArbitraryClosedProfileDef. Read the
+        # profile's bounding-box X extent.
+        body = ifcopenshell.util.representation.get_representation(elem_a, "Model", "Body", "MODEL_VIEW")
+        extrusion = body.Items[0]
+        profile = extrusion.SweptArea
+        if profile.is_a("IfcRectangleProfileDef"):
+            body_x_extent_ifc = profile.XDim
+        else:
+            # IfcArbitraryClosedProfileDef → measure profile vertex X span.
+            outer = profile.OuterCurve
+            if outer.is_a("IfcIndexedPolyCurve"):
+                xs = [p[0] for p in outer.Points.CoordList]
+            else:
+                xs = [pt.Coordinates[0] for pt in outer.Points]
+            body_x_extent_ifc = max(xs) - min(xs)
+        body_length_si = body_x_extent_ifc * unit_scale
+
+        assert body_length_si == pytest.approx(axis_length_si, abs=1e-3), (
+            f"Wall A body length {body_length_si} should match axis length {axis_length_si} "
+            f"(diff {abs(body_length_si - axis_length_si)}); body extending past axis means "
+            f"the wall pokes through the fillet corner."
+        )
+
+    def test_corner_wall_has_no_type_association(self):
+        """The corner must not be defined by an ``IfcWallType`` (no
+        ``IfcRelDefinesByType``). Bonsai's downstream parametric paths
+        consult the wall type's layer set to regenerate occurrence geometry;
+        leaving the corner typed lets type-driven regeneration overwrite
+        the explicit banana body with a straight extrusion."""
+        elem_a, elem_b = _create_perpendicular_wall_pair()
+        ifc_file = tool.Ifc.get()
+        bpy.ops.bim.create_wall_fillet(wall_a_id=elem_a.id(), wall_b_id=elem_b.id(), radius=1.0)
+
+        corner = next(w for w in ifc_file.by_type("IfcWall") if w not in (elem_a, elem_b))
+        type_rels = [r for r in getattr(corner, "IsTypedBy", []) if r.is_a("IfcRelDefinesByType")]
+        assert not type_rels, f"Corner wall must not be typed; got {len(type_rels)} type rels."
+
+    def test_slanted_wall_rejects_fillet_creation(self):
+        """A wall with non-zero slope (slanted extrusion) cannot be filleted —
+        the banana profile builder assumes vertical extrusion, so a slanted
+        neighbour produces malformed corner geometry. The operator must
+        report ERROR and leave the project untouched (2 walls, 0
+        connections)."""
+        elem_a, elem_b = _create_perpendicular_wall_pair()
+        ifc_file = tool.Ifc.get()
+
+        # Slant wall A by tilting its body extrusion direction off vertical.
+        # ``tool.Wall.get_x_angle`` reads the angle from this direction; the
+        # operator's slope guard fires when the absolute angle exceeds a
+        # small tolerance.
+        body = next(
+            r for r in elem_a.Representation.Representations
+            if r.RepresentationIdentifier == "Body"
+        )
+        extrusion = body.Items[0]
+        extrusion.ExtrudedDirection.DirectionRatios = (0.0, 0.2, 0.9797958971132712)  # ~11.5° tilt
+
+        with pytest.raises(RuntimeError, match="slanted walls"):
+            bpy.ops.bim.create_wall_fillet(wall_a_id=elem_a.id(), wall_b_id=elem_b.id(), radius=1.0)
+        assert len(ifc_file.by_type("IfcWall")) == 2
+        assert len(ifc_file.by_type("IfcRelConnectsPathElements")) == 0
 
     def test_invalid_radius_overshoot_rejects_without_mutating(self):
         """A radius larger than the geometrically reachable limit should
@@ -319,9 +482,9 @@ class TestCreateWallFilletRoundTrip(NewFile):
         """A negative radius produces an INVERTED fillet — arc center on
         the opposite side, tangent points past the intersection, body
         between the two extended wall ends. Still 3 walls + 2 connections;
-        the corner's banana still carries ``IfcArcIndex`` segments because
-        the body builder uses ``abs(radius)`` for the banana radii; the
-        sign only flips the arc center's side."""
+        the corner's banana still carries two trimmed-circle arc segments
+        because the body builder uses ``abs(radius)`` for the banana radii;
+        the sign only flips the arc center's side."""
         import ifcopenshell.util.element
         import ifcopenshell.util.representation
 
@@ -339,12 +502,15 @@ class TestCreateWallFilletRoundTrip(NewFile):
         # regenerations need to preserve.
         assert ifcopenshell.util.element.get_pset(corner, "BBIM_Wall", "FilletRadius") == pytest.approx(-0.5)
 
-        # Banana profile still has two arc-index segments regardless of sign.
+        # Tessellated banana — many short line segments, no arc indices.
         body = ifcopenshell.util.representation.get_representation(corner, "Model", "Body", "MODEL_VIEW")
         extrusion = body.Items[0]
         outer = extrusion.SweptArea.OuterCurve
+        assert outer.is_a("IfcIndexedPolyCurve")
         arc_segments = [s for s in (outer.Segments or []) if s.is_a("IfcArcIndex")]
-        assert len(arc_segments) == 2
+        line_segments = [s for s in (outer.Segments or []) if s.is_a("IfcLineIndex")]
+        assert not arc_segments
+        assert len(line_segments) >= 48
 
     def test_wall_type_thickness_change_propagates_to_corner(self):
         """When a wall type's ``IfcMaterialLayer.LayerThickness`` changes,
@@ -364,19 +530,20 @@ class TestCreateWallFilletRoundTrip(NewFile):
 
         corner = next(w for w in ifc_file.by_type("IfcWall") if w not in (elem_a, elem_b))
 
-        # Read the corner's banana thickness from the start cap: the
-        # IfcCartesianPointList2D stores 6 points (3 outer arc + 3 inner
-        # arc), and points 1 (outer-at-start) and 6 (inner-at-start) sit
-        # on opposite radii at the corner's chord-local x=0 line. Their
-        # distance in chord-local coords IS the wall thickness.
+        # Banana thickness = distance between the polyline's first point
+        # (outer-arc start, on the outer radius at angle theta_a) and last
+        # point (inner-arc end, same angle theta_a but on the inner radius).
+        # These two points define the wall-cap straight edge, so the chord
+        # between them IS the wall thickness.
         unit_scale = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
 
         def _profile_thickness(wall):
             body = ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW")
-            outer = body.Items[0].SweptArea.OuterCurve
-            coords = outer.Points.CoordList
-            p1, p6 = coords[0], coords[5]
-            return ((p1[0] - p6[0]) ** 2 + (p1[1] - p6[1]) ** 2) ** 0.5 * unit_scale
+            outer_curve = body.Items[0].SweptArea.OuterCurve
+            coords = list(outer_curve.Points.CoordList)
+            p_first = coords[0]
+            p_last = coords[-1]
+            return ((p_first[0] - p_last[0]) ** 2 + (p_first[1] - p_last[1]) ** 2) ** 0.5 * unit_scale
 
         before = _profile_thickness(corner)
 

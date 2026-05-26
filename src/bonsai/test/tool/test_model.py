@@ -861,6 +861,37 @@ class TestMirrorParentVoidFillingsToChildren(NewFile):
         assert not ifc.by_type("IfcRelVoidsElement")
         assert not ifc.by_type("IfcRelFillsElement")
 
+    def test_unshare_opening_representation_replaces_representation_with_deep_copy(self):
+        """Directly exercising the helper: after the call, the filling's
+        opening must have a Representation entity distinct from any other
+        sibling's, so a subsequent body-replacement on the original cannot
+        cascade through it."""
+        wall_obj, door_obj = self._setup_door_in_wall()
+        door = tool.Ifc.get_entity(door_obj)
+        original_rep = door.FillsVoids[0].RelatingOpeningElement.Representation
+
+        subject.unshare_opening_representation(door)
+
+        detached_rep = door.FillsVoids[0].RelatingOpeningElement.Representation
+        assert detached_rep is not None
+        assert detached_rep != original_rep, (
+            "Opening Representation should be a distinct entity after detach — "
+            "got the original entity back."
+        )
+
+    def test_unshare_opening_representation_no_op_for_filling_without_fills_voids(self):
+        """A filling without ``FillsVoids`` (e.g. orphaned window with no
+        opening) is a defensible no-op — the helper must not crash and must
+        not mutate any unrelated entity."""
+        ifc = ifcopenshell.file()
+        tool.Ifc.set(ifc)
+        filling = ifc.createIfcDoor()
+        before = len(list(ifc))
+
+        subject.unshare_opening_representation(filling)
+
+        assert len(list(ifc)) == before
+
     def test_no_op_when_children_list_is_empty(self):
         wall_obj, door_obj = self._setup_door_in_wall()
         wall = tool.Ifc.get_entity(wall_obj)
@@ -894,7 +925,7 @@ class TestMirrorParentVoidFillingsToChildren(NewFile):
         assert len(filling_ids) == 3, "Each child must be the filling of its own opening"
         assert tool.Ifc.get_entity(door_obj).GlobalId in filling_ids
 
-    def test_opt_out_via_mirror_to_host_false_leaves_host_uncut(self):
+    def test_opt_out_via_per_child_opening_false_leaves_host_uncut(self):
         wall_obj, door_obj = self._setup_door_in_wall()
         wall = tool.Ifc.get_entity(wall_obj)
         baseline_openings = len(wall.HasOpenings)
@@ -905,7 +936,7 @@ class TestMirrorParentVoidFillingsToChildren(NewFile):
         props = tool.Model.get_array_props(door_obj)
         props.count = 3
         props.x = 1.0
-        props.mirror_to_host = False
+        props.per_child_opening = False
         bpy.ops.bim.edit_array(item=0)
 
         # Only the parent's original opening remains; children are free-floating.
@@ -997,6 +1028,387 @@ class TestMirrorParentVoidFillingsToChildren(NewFile):
             assert child.FillsVoids, f"Child {child.GlobalId} lost its filling on apply"
             host = child.FillsVoids[0].RelatingOpeningElement.VoidsElements[0].RelatingBuildingElement
             assert host == wall
+
+    def test_apply_detaches_child_opening_bodies_from_parent(self):
+        """After the apply path runs, every former child opening's body
+        representation must be a distinct entity from the parent's — so an
+        edit driving ``get_inverse`` on the parent body no longer cascades
+        via the shared ``IfcRepresentationMap`` into the former-children."""
+        wall_obj, door_obj = self._setup_door_in_wall()
+        door = tool.Ifc.get_entity(door_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        parent_opening = door.FillsVoids[0].RelatingOpeningElement
+        parent_body = ifcopenshell.util.representation.resolve_representation(
+            ifcopenshell.util.representation.get_representation(parent_opening, "Model", "Body", "MODEL_VIEW")
+        )
+
+        # Snapshot children before apply — afterwards the BBIM_Array pset
+        # (and its children list) is gone.
+        parent_pset_data = json.loads(ifcopenshell.util.element.get_pset(door, "BBIM_Array", "Data"))
+        child_guids = parent_pset_data[0]["children"]
+        children = [tool.Ifc.get().by_guid(g) for g in child_guids]
+
+        # Pre-apply sanity: children share the parent body via mapped representation —
+        # this is the bug-prone state the fix must dissolve.
+        for child in children:
+            child_opening = child.FillsVoids[0].RelatingOpeningElement
+            child_body = ifcopenshell.util.representation.resolve_representation(
+                ifcopenshell.util.representation.get_representation(child_opening, "Model", "Body", "MODEL_VIEW")
+            )
+            assert child_body == parent_body
+
+        self._activate(door_obj)
+        bpy.ops.bim.apply_array()
+
+        # Post-apply: each child opening's body must be its own deep-copy.
+        for child in children:
+            child_opening = child.FillsVoids[0].RelatingOpeningElement
+            child_body = ifcopenshell.util.representation.resolve_representation(
+                ifcopenshell.util.representation.get_representation(child_opening, "Model", "Body", "MODEL_VIEW")
+            )
+            assert child_body != parent_body, (
+                f"Child {child.GlobalId} opening body still shares the parent's entity "
+                f"after apply — independent edits will cascade across siblings."
+            )
+
+    def test_void_limit_skipped_openings_surface_in_pending_recut_and_apply_button_recuts(self):
+        """When an array's child openings push a host over ``void_limit``, the
+        importer skips opening subtractions and the host renders solid. The
+        load operator must surface the affected host on
+        ``BIMProjectProperties.pending_opening_recut`` so the Project panel
+        banner offers a one-click recut, and the apply operator must restore
+        the cuts when invoked."""
+        from pathlib import Path
+
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+
+        # Exceed the default void_limit so the wall lands in ``gross_elements`` on load.
+        array_count = tool.Project.get_project_props().void_limit + 5
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = array_count
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == array_count
+
+        wall_guid = wall.GlobalId
+        in_session_vertex_count = len(wall_obj.data.vertices)
+
+        ifc_path = Path("test/files/temp/test_void_limit_pending_recut.ifc").absolute()
+        ifc_path.parent.mkdir(parents=True, exist_ok=True)
+        bpy.ops.bim.save_project(filepath=str(ifc_path), should_save_as=True)
+
+        bpy.ops.bim.load_project(filepath=str(ifc_path))
+
+        reloaded_wall = tool.Ifc.get().by_guid(wall_guid)
+        reloaded_wall_obj = tool.Ifc.get_object(reloaded_wall)
+        assert reloaded_wall_obj is not None
+        reloaded_uncut_vertex_count = len(reloaded_wall_obj.data.vertices)
+
+        # Pending list contains the wall.
+        pending = tool.Project.get_project_props().pending_opening_recut
+        assert len(pending) == 1, f"Expected 1 pending entry, got {len(pending)}"
+        assert pending[0].ifc_definition_id == reloaded_wall.id()
+
+        # Wall is solid (kernel skipped cuts).
+        assert reloaded_uncut_vertex_count < in_session_vertex_count, (
+            f"Wall should have been loaded uncut: reloaded vertex count {reloaded_uncut_vertex_count} "
+            f"is not less than in-session cut count {in_session_vertex_count}."
+        )
+
+        # Apply operator restores the cuts and clears the list.
+        bpy.ops.bim.apply_pending_opening_cuts()
+
+        recut_wall_obj = tool.Ifc.get_object(reloaded_wall)
+        assert len(recut_wall_obj.data.vertices) == in_session_vertex_count, (
+            f"After apply: vertex count {len(recut_wall_obj.data.vertices)} does not match in-session {in_session_vertex_count}."
+        )
+        assert len(tool.Project.get_project_props().pending_opening_recut) == 0, "Pending list should be empty after apply."
+
+    def test_void_limit_pending_recut_select_picks_affected_blender_objects(self):
+        """The select operator must resolve every pending-recut entry to its
+        Blender object and replace the active selection with that set, so the
+        user can jump directly to the affected elements before deciding to
+        Apply or Dismiss."""
+        from pathlib import Path
+
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        wall_guid = wall.GlobalId
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = tool.Project.get_project_props().void_limit + 5
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        ifc_path = Path("test/files/temp/test_void_limit_select.ifc").absolute()
+        ifc_path.parent.mkdir(parents=True, exist_ok=True)
+        bpy.ops.bim.save_project(filepath=str(ifc_path), should_save_as=True)
+
+        bpy.ops.bim.load_project(filepath=str(ifc_path))
+
+        reloaded_wall = tool.Ifc.get().by_guid(wall_guid)
+        reloaded_wall_obj = tool.Ifc.get_object(reloaded_wall)
+        assert len(tool.Project.get_project_props().pending_opening_recut) == 1
+
+        # Pre-select something else so we can verify the operator replaces the
+        # selection rather than appending to it.
+        bpy.ops.object.select_all(action="DESELECT")
+        bpy.ops.bim.select_pending_opening_cuts()
+
+        selected = list(bpy.context.selected_objects)
+        assert selected == [reloaded_wall_obj]
+        assert bpy.context.view_layer.objects.active is reloaded_wall_obj
+
+    def test_void_limit_pending_recut_select_no_op_when_ifc_unloaded(self):
+        """The select operator must report a clean ``CANCELLED`` when invoked
+        with no loaded IFC, rather than crashing on ``None.by_id``."""
+        result = bpy.ops.bim.select_pending_opening_cuts()
+        assert result == {"CANCELLED"}
+
+    def test_void_limit_pending_recut_dismiss_clears_list_without_mutating_geometry(self):
+        """The dismiss button must clear the pending list without touching
+        any IFC entity or Blender mesh — the user can opt to leave the host
+        uncut on purpose (e.g. performance preference)."""
+        from pathlib import Path
+
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        wall_guid = wall.GlobalId
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = tool.Project.get_project_props().void_limit + 5
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        ifc_path = Path("test/files/temp/test_void_limit_dismiss.ifc").absolute()
+        ifc_path.parent.mkdir(parents=True, exist_ok=True)
+        bpy.ops.bim.save_project(filepath=str(ifc_path), should_save_as=True)
+
+        bpy.ops.bim.load_project(filepath=str(ifc_path))
+
+        reloaded_wall = tool.Ifc.get().by_guid(wall_guid)
+        reloaded_wall_obj = tool.Ifc.get_object(reloaded_wall)
+        before_vertex_count = len(reloaded_wall_obj.data.vertices)
+        assert len(tool.Project.get_project_props().pending_opening_recut) == 1
+
+        bpy.ops.bim.dismiss_pending_opening_cuts()
+
+        assert len(tool.Project.get_project_props().pending_opening_recut) == 0
+        # Geometry unchanged — dismiss is a no-op for the host mesh.
+        assert len(reloaded_wall_obj.data.vertices) == before_vertex_count
+
+    def test_array_child_openings_apply_to_wall_after_full_load_project_roundtrip(self):
+        """Full roundtrip: save the file to disk, ``bim.load_project`` it
+        back in a fresh session, and verify the wall mesh still has the
+        array-child openings cut into it. This is the user's exact
+        reproduction — opening a saved .ifc in a brand-new blend file."""
+        from pathlib import Path
+
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == 3
+
+        wall_guid = wall.GlobalId
+        in_session_vertex_count = len(wall_obj.data.vertices)
+
+        ifc_path = Path("test/files/temp/test_array_roundtrip.ifc").absolute()
+        ifc_path.parent.mkdir(parents=True, exist_ok=True)
+        bpy.ops.bim.save_project(filepath=str(ifc_path), should_save_as=True)
+
+        bpy.ops.bim.load_project(filepath=str(ifc_path))
+
+        ifc_file = tool.Ifc.get()
+        round_wall = ifc_file.by_guid(wall_guid)
+        assert len(round_wall.HasOpenings) == 3, "Wall lost openings after load_project"
+
+        round_wall_obj = tool.Ifc.get_object(round_wall)
+        assert round_wall_obj is not None
+        reloaded_vertex_count = len(round_wall_obj.data.vertices)
+        # The in-session wall was cut by 3 openings — the reloaded wall should
+        # have the same (cut) topology. A naked cube/box would have 8 verts.
+        assert reloaded_vertex_count == in_session_vertex_count, (
+            f"Wall mesh vertex count changed across save/load: in-session={in_session_vertex_count}, "
+            f"reloaded={reloaded_vertex_count} — array-child openings may not have been applied."
+        )
+
+    def test_array_child_openings_apply_to_wall_on_reimport(self):
+        """After an array creates per-child openings, the host wall's mesh
+        has the expected cuts. When the wall is re-imported by the geometry
+        kernel (the same path file-load uses), the cuts must still be present
+        — otherwise the wall appears solid where the children's openings
+        should subtract from it."""
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == 3
+
+        in_session_vertex_count = len(wall_obj.data.vertices)
+
+        # Force a fresh kernel re-import — equivalent to opening the .ifc in
+        # a new Blender session, but in-process.
+        wall_body = ifcopenshell.util.representation.get_representation(wall, "Model", "Body", "MODEL_VIEW")
+        assert wall_body is not None
+        tool.Geometry.reimport_element_representations(wall_obj, wall_body, apply_openings=True)
+
+        reimported_vertex_count = len(wall_obj.data.vertices)
+
+        # If the kernel applied the child openings, the reimported mesh should
+        # have the same (or near-same) vertex count as the in-session one. A
+        # drop close to "uncut cube" geometry (8 verts for a primitive cube)
+        # is the signature of the bug — openings stayed in the IFC but the
+        # kernel skipped them, so the wall renders solid.
+        assert reimported_vertex_count > 8, (
+            f"Wall mesh has only {reimported_vertex_count} vertices after kernel reimport — "
+            f"the child openings did not cut the wall (in-session had {in_session_vertex_count})."
+        )
+
+    def test_array_child_openings_survive_ifc_roundtrip(self):
+        """Diagnostic: after creating array-child openings via mirror, the
+        ``IfcOpeningElement`` + ``IfcRelVoidsElement`` + ``IfcRelFillsElement``
+        chain for each child must survive a textual IFC serialise/deserialise
+        round-trip without entities being dropped or relationships breaking."""
+        import ifcopenshell
+
+        wall_obj, door_obj = self._setup_door_in_wall()
+        wall = tool.Ifc.get_entity(wall_obj)
+        door = tool.Ifc.get_entity(door_obj)
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+        assert len(wall.HasOpenings) == 3
+
+        wall_guid = wall.GlobalId
+        door_guid = door.GlobalId
+        child_guids = json.loads(ifcopenshell.util.element.get_pset(door, "BBIM_Array", "Data"))[0]["children"]
+        assert len(child_guids) == 2
+
+        # Snapshot opening + filling entity counts so the round-trip can be
+        # compared against the in-session state.
+        before_openings = len(tool.Ifc.get().by_type("IfcOpeningElement"))
+        before_voids = len(tool.Ifc.get().by_type("IfcRelVoidsElement"))
+        before_fills = len(tool.Ifc.get().by_type("IfcRelFillsElement"))
+
+        # Serialise to text and parse back into a fresh in-memory file —
+        # mirrors what writing then re-opening the .ifc does at the entity
+        # level (representation reduction, ownership history walk, etc.).
+        roundtripped = ifcopenshell.file.from_string(tool.Ifc.get().to_string())
+
+        assert len(roundtripped.by_type("IfcOpeningElement")) == before_openings
+        assert len(roundtripped.by_type("IfcRelVoidsElement")) == before_voids
+        assert len(roundtripped.by_type("IfcRelFillsElement")) == before_fills
+
+        round_wall = roundtripped.by_guid(wall_guid)
+        round_door = roundtripped.by_guid(door_guid)
+        assert len(round_wall.HasOpenings) == 3
+        assert round_door.FillsVoids, "Parent door lost its filling after roundtrip"
+
+        for child_guid in child_guids:
+            child = roundtripped.by_guid(child_guid)
+            assert child.FillsVoids, f"Array child {child_guid} lost its filling after roundtrip"
+            child_opening = child.FillsVoids[0].RelatingOpeningElement
+            host = child_opening.VoidsElements[0].RelatingBuildingElement
+            assert host == round_wall, f"Child {child_guid} opening no longer voids the wall after roundtrip"
+            assert child_opening.Representation is not None, (
+                f"Child {child_guid} opening lost its Representation after roundtrip — the kernel will not cut the wall."
+            )
+
+    def test_apply_isolates_independent_children_from_parent_body_replacement(self):
+        """End-to-end contract: after apply, swapping the parent opening's body
+        representation (the pattern parametric-edit flows exercise via
+        ``ifc_file.get_inverse`` + ``replace_attribute``) must not rewrite
+        the former children's opening bodies. This is the user-visible
+        invariant — editing one independent former-sibling no longer
+        reshapes the others."""
+        wall_obj, door_obj = self._setup_door_in_wall()
+        door = tool.Ifc.get_entity(door_obj)
+        ifc_file = tool.Ifc.get()
+
+        self._activate(door_obj)
+        bpy.ops.bim.add_array()
+        bpy.ops.bim.enable_editing_array_item(item=0)
+        props = tool.Model.get_array_props(door_obj)
+        props.count = 3
+        props.x = 1.0
+        bpy.ops.bim.edit_array(item=0)
+
+        parent_pset_data = json.loads(ifcopenshell.util.element.get_pset(door, "BBIM_Array", "Data"))
+        children = [tool.Ifc.get().by_guid(g) for g in parent_pset_data[0]["children"]]
+
+        self._activate(door_obj)
+        bpy.ops.bim.apply_array()
+
+        # Capture each independent child's resolved body identity now.
+        before = {
+            child.GlobalId: ifcopenshell.util.representation.resolve_representation(
+                ifcopenshell.util.representation.get_representation(
+                    child.FillsVoids[0].RelatingOpeningElement, "Model", "Body", "MODEL_VIEW"
+                )
+            )
+            for child in children
+        }
+
+        # Simulate the body-replacement pattern: take the parent opening's
+        # resolved body and rewrite every inverse to point at a brand-new
+        # representation entity. If sharing wasn't severed, the children's
+        # bodies would be rewritten too.
+        parent_opening = door.FillsVoids[0].RelatingOpeningElement
+        old_parent_body = ifcopenshell.util.representation.resolve_representation(
+            ifcopenshell.util.representation.get_representation(parent_opening, "Model", "Body", "MODEL_VIEW")
+        )
+        new_body = ifcopenshell.util.element.copy_deep(
+            ifc_file, old_parent_body, exclude=["IfcGeometricRepresentationContext"]
+        )
+        for inverse in ifc_file.get_inverse(old_parent_body):
+            ifcopenshell.util.element.replace_attribute(inverse, old_parent_body, new_body)
+
+        for child in children:
+            after_body = ifcopenshell.util.representation.resolve_representation(
+                ifcopenshell.util.representation.get_representation(
+                    child.FillsVoids[0].RelatingOpeningElement, "Model", "Body", "MODEL_VIEW"
+                )
+            )
+            assert after_body == before[child.GlobalId], (
+                f"Independent former child {child.GlobalId} opening body changed when the "
+                f"parent's body was replaced — apply path failed to detach the mapped representation."
+            )
 
 
 class TestApplyIfcMaterialChanges(NewFile):

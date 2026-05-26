@@ -139,7 +139,7 @@ def test_slope_apply_value_clamps_at_near_vertical():
 # Cycle operator metadata
 # ----------------------------------------------------------------------------
 #
-# ``CycleRoofGenerationMethod`` plugs into ``gizmo.CycleTypeMixin`` so the
+# ``CycleRoofGenerationMethod`` plugs into ``CycleTypeMixin`` so the
 # HEIGHT ↔ ANGLE icon cycles through the two values. The mixin reads four
 # class attributes to do its work; if any drift, the cycle no-ops or
 # CANCELLED-loops in subtle ways. Pin them here.
@@ -152,7 +152,7 @@ def test_cycle_operator_class_metadata():
     from bonsai.bim.module.model.roof import CycleRoofGenerationMethod
 
     assert CycleRoofGenerationMethod.bl_idname == "bim.cycle_roof_generation_method"
-    assert CycleRoofGenerationMethod.element_checker == tool.Blender.Modifier.is_roof
+    assert CycleRoofGenerationMethod.element_checker == tool.Parametric.is_roof
     assert CycleRoofGenerationMethod.props_getter == tool.Model.get_roof_props
     assert CycleRoofGenerationMethod.type_attr == "generation_method"
     # The Literal resolves to ("HEIGHT", "ANGLE") — the mixin calls
@@ -187,8 +187,8 @@ def _cycle_stub_self(*, reverse: bool, props, element_is_target: bool = True):
     attributes."""
     from types import MethodType
 
-    from bonsai.bim.module.drawing.gizmos import TypeAccessorBase
     from bonsai.bim.module.model.roof import CycleRoofGenerationMethod
+    from bonsai.bim.parametric_lifecycle import TypeAccessorBase
 
     stub = SimpleNamespace(
         reverse=reverse,
@@ -207,7 +207,7 @@ def test_cycle_type_advances_forward():
     Literal. The stub injects ``element_checker`` / ``props_getter``
     directly so the method runs without a live IFC fixture."""
     from bonsai import tool
-    from bonsai.bim.module.drawing import gizmos as gizmo_module
+    from bonsai.bim import parametric_lifecycle as gizmo_module
 
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())
@@ -222,7 +222,7 @@ def test_cycle_type_reverse_walks_backward():
     """Shift+click sets ``reverse=True`` and walks the cycle in the other
     direction — from HEIGHT that means wrapping to ANGLE (the last item)."""
     from bonsai import tool
-    from bonsai.bim.module.drawing import gizmos as gizmo_module
+    from bonsai.bim import parametric_lifecycle as gizmo_module
 
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())
@@ -237,7 +237,7 @@ def test_cycle_type_cancels_when_active_is_not_a_roof():
     a stray cycle click on a wall mutating ``wall.generation_method`` (a
     non-existent attr) and silently no-oping or AttributeError-ing later."""
     from bonsai import tool
-    from bonsai.bim.module.drawing import gizmos as gizmo_module
+    from bonsai.bim import parametric_lifecycle as gizmo_module
 
     props = SimpleNamespace(generation_method="HEIGHT")
     context = SimpleNamespace(active_object=object())

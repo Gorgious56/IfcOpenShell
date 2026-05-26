@@ -228,7 +228,7 @@ def test_gizmo_groups_never_poll_simultaneously(selection_len):
         patch.object(tool.Blender, "get_addon_preferences", return_value=prefs),
         patch.object(tool.Blender, "get_selected_objects", return_value=set(selected)),
         patch.object(tool.Ifc, "get_entity", return_value=walls_element),
-        patch.object(tool.Blender.Modifier, "is_wall", return_value=True),
+        patch.object(tool.Parametric, "is_path_connectable_wall", return_value=True),
         patch.object(tool.Model, "get_usage_type", return_value="LAYER2"),
     ]
     for p in patches:
@@ -244,3 +244,36 @@ def test_gizmo_groups_never_poll_simultaneously(selection_len):
         f"len(selected)={selection_len}: both gizmo groups polled True — "
         f"join={join_polls}, unjoin={unjoin_polls}. They must partition the space."
     )
+
+
+def test_join_intersection_poll_accepts_layer2_plus_fillet_corner_pair():
+    """A LAYER2 wall + fillet-corner two-wall selection must surface join-state
+    icons. Per-icon gating inside the group's draw step keeps the fillet-only
+    icon hidden for this pair, but the group itself must poll True so the
+    unjoin icon at the existing junction remains clickable."""
+    from bonsai import tool
+    from bonsai.bim.module.model.wall import GizmoWallJoinIntersection
+
+    prefs = SimpleNamespace(gizmos=SimpleNamespace(draw_gizmos_in_3d_viewport=True))
+    layer2_obj = object()
+    fillet_obj = object()
+    selected = [layer2_obj, fillet_obj]
+    entities = {id(layer2_obj): object(), id(fillet_obj): object()}
+
+    def get_entity(obj):
+        return entities.get(id(obj))
+
+    patches = [
+        patch.object(tool.Blender, "get_addon_preferences", return_value=prefs),
+        patch.object(tool.Blender, "get_selected_objects", return_value=set(selected)),
+        patch.object(tool.Ifc, "get_entity", side_effect=get_entity),
+        patch.object(tool.Parametric, "is_path_connectable_wall", return_value=True),
+        patch("bonsai.bim.module.model.wall._wall_fillet_preview_active", return_value=False),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        assert GizmoWallJoinIntersection.poll(make_context(active=layer2_obj, selected=selected)) is True
+    finally:
+        for p in patches:
+            p.stop()

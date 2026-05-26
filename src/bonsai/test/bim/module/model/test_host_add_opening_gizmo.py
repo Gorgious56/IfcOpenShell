@@ -76,7 +76,7 @@ def _build_poll_callbacks(selected, active_kind, other_kind):
     ``"slab"``, ``"roof"``, ``"plain"`` (non-host IFC element), ``"mesh"``
     (no IFC entity), or ``None`` (object outside the selection set).
 
-    Wall recognition still goes through ``tool.Blender.Modifier.is_wall``
+    Wall recognition still goes through ``tool.Parametric.is_wall``
     (production: parametric LAYER2); slab/roof use ``is_a`` on the fake
     entity so the broadened class-based predicate is exercised."""
     sentinels = {kind: _FakeIfcEntity(_IFC_CLASS_BY_KIND[kind]) for kind in _IFC_CLASS_BY_KIND}
@@ -327,7 +327,7 @@ def test_is_supported_host_accepts_bare_ifc_slab():
 def test_is_supported_host_accepts_bare_ifc_roof():
     """The roof branch is class-based, not pset-based — a bare ``IfcRoof``
     imported from another IFC tool qualifies even without the Bonsai
-    BBIM_Roof parametric marker that ``tool.Blender.Modifier.is_roof``
+    BBIM_Roof parametric marker that ``tool.Parametric.is_roof``
     would require."""
     from bonsai.bim.module.model.host_add_opening_gizmo import is_supported_host
 
@@ -433,7 +433,7 @@ class TestAddOpeningPollOnForeignAuthoredSlab(NewFile):
 class TestAddOpeningPollOnForeignAuthoredRoof(NewFile):
     def test_poll_resolves_true_for_roof_without_bbim_pset(self):
         """A mesh-bodied ``IfcRoof`` promoted from a raw Blender mesh
-        carries no ``BBIM_Roof`` pset, so ``tool.Blender.Modifier.is_roof``
+        carries no ``BBIM_Roof`` pset, so ``tool.Parametric.is_roof``
         rejects it — yet the gizmo's widened predicate accepts any
         ``IfcRoof`` because the positioner only reads the bound box. This
         fixture mirrors how a foreign IFC roof loads (geometry + IFC
@@ -453,7 +453,7 @@ class TestAddOpeningPollOnForeignAuthoredRoof(NewFile):
         bpy.ops.bim.assign_class(ifc_class="IfcRoof")
         roof = tool.Ifc.get_entity(roof_obj)
         assert roof is not None and roof.is_a("IfcRoof")
-        assert tool.Blender.Modifier.is_roof(roof) is False
+        assert tool.Parametric.is_roof(roof) is False
         assert is_supported_host(roof) is True
 
         void_obj = bpy.data.objects.new("VoidMesh", bpy.data.meshes.new("VoidMesh"))

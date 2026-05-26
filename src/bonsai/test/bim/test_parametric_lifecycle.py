@@ -198,10 +198,12 @@ def test_feature_modifier_finish_one_clears_is_editing_and_writes_pset(patched_t
 
     assert props.is_editing is False
     assert obj in cls.representations_called
-    # edit_pset is called exactly once; properties key is "Data" wrapping JSON.
-    patched_tool_and_ifc["ifc"].api.pset.edit_pset.assert_called_once()
-    kwargs = patched_tool_and_ifc["ifc"].api.pset.edit_pset.call_args.kwargs
-    assert "properties" in kwargs and "Data" in kwargs["properties"]
+    # The pset write routes through tool.Pset.write_bbim_data, which serialises
+    # the gathered data dict as the "Data" property of the BBIM_<Type> pset.
+    patched_tool_and_ifc["tool"].Pset.write_bbim_data.assert_called_once()
+    args, _kwargs = patched_tool_and_ifc["tool"].Pset.write_bbim_data.call_args
+    assert args[1] == "BBIM_Door"
+    assert isinstance(args[2], dict)
 
 
 def test_feature_modifier_finish_one_exception_leaves_draft_in_progress(patched_tool_and_ifc):
@@ -251,40 +253,23 @@ def test_feature_modifier_finish_one_commits_placement_drift(patched_tool_and_if
     patched_tool_and_ifc["tool"].Geometry.commit_placement_if_moved.assert_called_once_with(obj)
 
 
-def test_feature_modifier_cancel_one_restores_placement_when_moved(patched_tool_and_ifc):
-    """Cancel restores matrix_world from IFC so a drag-then-cancel reverts
-    BOTH the draft pset (already covered above) and the placement."""
+def test_feature_modifier_cancel_one_delegates_to_restore_or_rebaseline(patched_tool_and_ifc):
+    """Cancel delegates to ``tool.Geometry.restore_or_rebaseline_placement`` which
+    owns the is_moved / ObjectPlacement gate (covered separately in
+    test/tool/test_geometry.py). The mixin contract is just "always call it"."""
     props = _FakeProps()
     props.is_editing = True
     obj = _make_obj(props)
     patched_tool_and_ifc["ifc"].util.element.get_pset.return_value = _make_pset_text(
         {"width": 900}, {"thickness": 60}, {"material": "steel"}
     )
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
 
     cls = _door_mixin_cls(match=True)
     cls._cancel_one(obj)
 
-    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_called_once_with(
+    patched_tool_and_ifc["tool"].Geometry.restore_or_rebaseline_placement.assert_called_once_with(
         obj, patched_tool_and_ifc["element"]
     )
-
-
-def test_feature_modifier_cancel_one_skips_placement_restore_when_not_moved(patched_tool_and_ifc):
-    """When nothing was dragged, Cancel must not touch matrix_world — the
-    restore path is an undo-only safeguard, never a forced refresh."""
-    props = _FakeProps()
-    props.is_editing = True
-    obj = _make_obj(props)
-    patched_tool_and_ifc["ifc"].util.element.get_pset.return_value = _make_pset_text(
-        {"width": 900}, {"thickness": 60}, {"material": "steel"}
-    )
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = False
-
-    cls = _door_mixin_cls(match=True)
-    cls._cancel_one(obj)
-
-    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_not_called()
 
 
 def test_feature_modifier_targets_loop_uses_iter_targets(patched_tool_and_ifc):
@@ -522,40 +507,23 @@ def test_path_preserving_finish_one_commits_placement_drift_on_no_change(patched
     assert not cls.pset_updates, "no-op finish must skip pset write"
 
 
-def test_path_preserving_cancel_one_restores_placement_when_moved(patched_tool_and_ifc):
-    """Cancel restores matrix_world from IFC when the user dragged during
-    the edit — symmetric to FeatureModifier Cancel."""
+def test_path_preserving_cancel_one_delegates_to_restore_or_rebaseline(patched_tool_and_ifc):
+    """Cancel delegates to ``tool.Geometry.restore_or_rebaseline_placement`` —
+    symmetric to FeatureModifier Cancel. The is_moved / ObjectPlacement gate
+    lives in the helper (covered in test/tool/test_geometry.py)."""
     props = _FakePathProps()
     props.is_editing = True
     obj = _make_obj(props)
     patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
         "data_dict": {"width": 200, "thickness": 10, "path_data": {"points": []}}
     }
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = True
 
     cls = _path_mixin_cls(match=True)
     cls._cancel_one(obj, mock.Mock(name="context"))
 
-    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_called_once_with(
+    patched_tool_and_ifc["tool"].Geometry.restore_or_rebaseline_placement.assert_called_once_with(
         obj, patched_tool_and_ifc["element"]
     )
-
-
-def test_path_preserving_cancel_one_skips_placement_restore_when_not_moved(patched_tool_and_ifc):
-    """No drag → no restore. Cancel must not touch matrix_world for an
-    unmoved object — the restore path is an undo-only safeguard."""
-    props = _FakePathProps()
-    props.is_editing = True
-    obj = _make_obj(props)
-    patched_tool_and_ifc["tool"].Model.get_modeling_bbim_pset_data.return_value = {
-        "data_dict": {"width": 200, "thickness": 10, "path_data": {"points": []}}
-    }
-    patched_tool_and_ifc["tool"].Ifc.is_moved.return_value = False
-
-    cls = _path_mixin_cls(match=True)
-    cls._cancel_one(obj, mock.Mock(name="context"))
-
-    patched_tool_and_ifc["tool"].Geometry.restore_placement_from_ifc.assert_not_called()
 
 
 # ----------------------------------------------------------------------
@@ -581,7 +549,7 @@ class _FakeArrayProps:
         self.z = 0.0
         self.use_local_space = True
         self.method = "OFFSET"
-        self.mirror_to_host = True
+        self.per_child_opening = True
 
 
 def _make_pset_layers(layers: list) -> str:
@@ -599,7 +567,7 @@ def patched_array():
         element = mock.Mock(name="array_element")
         mock_tool.Ifc.get_entity.return_value = element
         mock_tool.Ifc.get.return_value = mock.Mock(name="ifc_file")
-        mock_tool.Blender.Modifier.is_array.return_value = True
+        mock_tool.Parametric.is_array.return_value = True
         mock_ifc.util.unit.calculate_unit_scale.return_value = 1.0  # SI=1 to keep math obvious
         # tool.Model.get_array_props is rebound per-test to return the FakeProps.
         yield {
@@ -691,7 +659,7 @@ def test_array_enable_one_noop_when_element_not_array(patched_array):
     props = _FakeArrayProps()
     obj = _make_array_obj(props)
     patched_array["tool"].Model.get_array_props.return_value = props
-    patched_array["tool"].Blender.Modifier.is_array.return_value = False
+    patched_array["tool"].Parametric.is_array.return_value = False
 
     _ArrayEditMixin._enable_one(obj)
 
@@ -796,7 +764,7 @@ def test_array_cancel_one_rehydrates_and_clears(patched_array):
 
 
 # ----------------------------------------------------------------------
-# _ParametricEditMixinBase._resolve guard
+# ParametricEditMixinBase._resolve guard
 # ----------------------------------------------------------------------
 
 
@@ -898,3 +866,98 @@ def test_remove_array_layer_from_edit_poll_accepts_when_index_in_range():
 
     with patch("bonsai.bim.module.model.array.tool.Model.get_array_props", return_value=props):
         assert RemoveArrayLayerFromEdit.poll(ctx) is True
+
+
+# ----------------------------------------------------------------------
+# PickTypeMixin — modal() must return a terminating value (FINISHED /
+# CANCELLED) on LEFTMOUSE RELEASE, or the gizmo-click's modal handler
+# leaks and softlocks the viewport.
+# ----------------------------------------------------------------------
+
+
+def _make_pick_type_op():
+    from bonsai.bim.parametric_lifecycle import PickTypeMixin
+
+    op = PickTypeMixin.__new__(PickTypeMixin)
+    op._open_picker = mock.Mock(return_value={"INTERFACE"})
+    return op
+
+
+def test_pick_type_modal_release_terminates_handler():
+    """On LEFTMOUSE RELEASE, ``PickTypeMixin.modal()`` must return a value
+    that removes the modal handler Blender added in ``invoke()`` —
+    ``FINISHED`` or ``CANCELLED``, not ``INTERFACE`` or ``RUNNING_MODAL``.
+    A non-terminating return swallows every viewport event (pan, zoom,
+    scroll) until the user manually cancels, which is the textbook
+    Blender modal-handler leak."""
+    op = _make_pick_type_op()
+    context = mock.Mock(name="context")
+    event = mock.Mock(type="LEFTMOUSE", value="RELEASE")
+
+    result = op.modal(context, event)
+
+    assert result in ({"FINISHED"}, {"CANCELLED"}), (
+        f"modal() returned {result}; only FINISHED or CANCELLED remove the "
+        "modal handler. Returning INTERFACE leaves the viewport softlocked."
+    )
+    op._open_picker.assert_called_once_with(context)
+
+
+def test_pick_type_modal_release_does_not_register_undo_step():
+    """The modal-release branch must use ``CANCELLED`` (not ``FINISHED``)
+    so the picker invocation doesn't push a phantom undo step. The four
+    concrete ``PickType*`` subclasses declare ``bl_options = {REGISTER,
+    UNDO}``; a ``FINISHED`` return would mean Ctrl+Z had to be pressed
+    twice (once for the no-op picker open, once for the actual type
+    change). The picked-value write path is the only invocation that
+    should land in the undo stack."""
+    op = _make_pick_type_op()
+    context = mock.Mock(name="context")
+    event = mock.Mock(type="LEFTMOUSE", value="RELEASE")
+
+    result = op.modal(context, event)
+
+    assert result == {"CANCELLED"}, (
+        f"modal() returned {result}; expected CANCELLED so the no-op "
+        "picker-open invocation doesn't push an undo step."
+    )
+
+
+def _discover_pick_type_subclasses():
+    """Force-load the model feature so every ``PickTypeMixin`` subclass is
+    registered in ``__subclasses__``, then return them. Discovery (not
+    enumeration) means a future ``Pick*Type`` operator is covered the
+    moment its module is imported by ``bonsai.bim.module.model``."""
+    import bonsai.bim.module.model  # noqa: F401 — populates PickTypeMixin.__subclasses__
+    from bonsai.bim.parametric_lifecycle import PickTypeMixin
+
+    return PickTypeMixin.__subclasses__()
+
+
+_PICK_TYPE_SUBCLASSES = _discover_pick_type_subclasses()
+
+
+def test_pick_type_discovery_finds_known_subclasses():
+    """Discovery must return at least the four known ``Pick*Type``
+    operators — an empty or short list signals an import-order regression
+    that would silently neuter the inherit-central-modal guard below."""
+    discovered_names = {cls.__name__ for cls in _PICK_TYPE_SUBCLASSES}
+    expected = {"PickWindowType", "PickDoorType", "PickStairType", "PickRailingTerminalType"}
+    assert expected.issubset(discovered_names), (
+        f"PickTypeMixin subclass discovery missed {expected - discovered_names}. "
+        "Check that bonsai.bim.module.model imports the feature submodule."
+    )
+
+
+@pytest.mark.parametrize("cls", _PICK_TYPE_SUBCLASSES, ids=lambda c: c.__name__)
+def test_pick_type_subclasses_inherit_central_modal(cls):
+    """Every ``PickTypeMixin`` subclass must resolve ``modal`` to the
+    shared ``PickTypeMixin.modal`` — overriding it in a subclass would
+    re-introduce the viewport softlock if the override forgets to
+    terminate the handler."""
+    from bonsai.bim.parametric_lifecycle import PickTypeMixin
+
+    assert cls.modal is PickTypeMixin.modal, (
+        f"{cls.__name__}.modal must inherit unchanged from PickTypeMixin.modal — "
+        "overriding it risks re-introducing the modal-handler leak."
+    )

@@ -49,8 +49,13 @@ pytestmark = pytest.mark.wall
 # ----------------------------------------------------------------------------
 
 
-def _run_unjoin_single_poll(*, prefs_on, selection_len, is_wall, usage_type):
-    """Drive ``GizmoWallUnjoinSingle.poll()`` against one stubbed selection state."""
+def _run_unjoin_single_poll(*, prefs_on, selection_len, is_wall, usage_type, is_fillet_corner=False):
+    """Drive ``GizmoWallUnjoinSingle.poll()`` against one stubbed selection state.
+
+    ``is_wall`` here stands in for the looser ``is_path_connectable_wall`` gate
+    the poll uses — True for LAYER2 walls and for fillet-corner walls. The
+    ``is_fillet_corner`` flag distinguishes the two so non-LAYER2 + non-fillet
+    rejection can still be pinned."""
     from bonsai import tool
     from bonsai.bim.module.model.wall import GizmoWallUnjoinSingle
 
@@ -61,11 +66,13 @@ def _run_unjoin_single_poll(*, prefs_on, selection_len, is_wall, usage_type):
     def get_entity(obj):
         return element if (selected and obj is selected[0]) else None
 
+    active_obj = selected[0] if selected else None
     patches = [
         patch.object(tool.Blender, "get_addon_preferences", return_value=prefs),
+        patch.object(tool.Blender, "get_active_object", return_value=active_obj),
         patch.object(tool.Blender, "get_selected_objects", return_value=set(selected)),
         patch.object(tool.Ifc, "get_entity", side_effect=get_entity),
-        patch.object(tool.Blender.Modifier, "is_wall", return_value=is_wall),
+        patch.object(tool.Parametric, "is_path_connectable_wall", return_value=is_wall or is_fillet_corner),
         patch.object(tool.Model, "get_usage_type", return_value=usage_type),
     ]
     for p in patches:
@@ -97,7 +104,7 @@ def test_unjoin_single_poll_rejects_non_wall_element():
 
 
 def test_unjoin_single_poll_rejects_non_layer2_wall():
-    # LAYER2 filtering happens inside tool.Blender.Modifier.is_wall (it returns False for
+    # LAYER2 filtering happens inside tool.Parametric.is_wall (it returns False for
     # non-LAYER2 walls), so the poll's reliance on is_wall is what enforces the contract.
     # Mock production-accurately: is_wall=False for LAYER3 — the poll then rejects.
     assert _run_unjoin_single_poll(prefs_on=True, selection_len=1, is_wall=False, usage_type="LAYER3") is False
@@ -105,6 +112,23 @@ def test_unjoin_single_poll_rejects_non_layer2_wall():
 
 def test_unjoin_single_poll_rejects_when_gizmo_toggle_off():
     assert _run_unjoin_single_poll(prefs_on=False, selection_len=1, is_wall=True, usage_type="LAYER2") is False
+
+
+def test_unjoin_single_poll_accepts_fillet_corner_wall():
+    """A fillet-corner wall has no LAYER2 material usage by construction but
+    still owns its two path connections to the straight neighbours. The poll
+    must surface the unjoin gizmos for it; otherwise the user has no way to
+    disconnect the fillet from either side."""
+    assert (
+        _run_unjoin_single_poll(
+            prefs_on=True,
+            selection_len=1,
+            is_wall=False,
+            usage_type=None,
+            is_fillet_corner=True,
+        )
+        is True
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -524,3 +548,37 @@ def test_unjoin_wall_path_connection_reports_when_partner_missing():
     assert reports, "operator must self.report({'ERROR'}, ...) on missing partner"
     level, _ = reports[0]
     assert "ERROR" in level
+
+
+# ----------------------------------------------------------------------------
+# _iter_path_connections — partner enumeration must surface fillet corners
+# ----------------------------------------------------------------------------
+
+
+def test_iter_path_connections_surfaces_fillet_corner_partner():
+    """When a normal LAYER2 wall is connected to a fillet-corner wall, the
+    partner-enumeration walk must yield the fillet partner so the per-rel
+    unjoin gizmo can sit at the fillet-side junction. Filtering with the
+    strict LAYER2-only predicate would drop fillet corners from the partner
+    list even though their path connections remain authoritative."""
+    from bonsai import tool
+    from bonsai.bim.module.model.wall import _iter_path_connections
+
+    normal_wall = SimpleNamespace()
+    fillet_corner = SimpleNamespace()
+    rel = SimpleNamespace(
+        RelatedElement=fillet_corner,
+        RelatingConnectionType="ATEND",
+        RelatedConnectionType="NOTDEFINED",
+        is_a=lambda t: t == "IfcRelConnectsPathElements",
+    )
+    normal_wall.ConnectedTo = [rel]
+    normal_wall.ConnectedFrom = []
+
+    def is_path_connectable(element):
+        return element is fillet_corner
+
+    with patch.object(tool.Parametric, "is_path_connectable_wall", side_effect=is_path_connectable):
+        out = _iter_path_connections(normal_wall)
+
+    assert out == [(fillet_corner, "ATEND", "NOTDEFINED")]

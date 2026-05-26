@@ -321,3 +321,30 @@ class TestModifierPsetPredicatesReturnBool(NewFile):
         sentinel_pset = object()
         with patch.object(tool.Pset, "get_element_pset", return_value=sentinel_pset):
             assert predicate(object()) is True
+
+
+class TestViewportDecoratorRejectsMissingDrawMethod(NewFile):
+    """``__init_subclass__`` pins the contract that any subclass declaring
+    ``draw_method`` (or any entry in ``draw_methods``) names an attribute
+    the class actually exposes. Without this guard a typo in the string
+    defers the failure to the first redraw, far from the declaration."""
+
+    def test_subclass_with_missing_single_draw_method_raises(self):
+        with pytest.raises(TypeError, match="draw method"):
+            type("DecoratorWithBadDrawMethod", (subject.ViewportDecorator,), {"draw_method": "no_such_method"})
+
+    def test_subclass_with_missing_entry_in_draw_methods_raises(self):
+        with pytest.raises(TypeError, match="draw method"):
+            type(
+                "DecoratorWithBadDrawMethods",
+                (subject.ViewportDecorator,),
+                {"draw_methods": (("missing_method", "POST_VIEW"),)},
+            )
+
+    def test_subclass_with_present_method_is_accepted(self):
+        cls = type(
+            "DecoratorWithValidDrawMethod",
+            (subject.ViewportDecorator,),
+            {"draw_method": "draw", "draw": lambda self, context: None},
+        )
+        assert cls.draw_method == "draw"

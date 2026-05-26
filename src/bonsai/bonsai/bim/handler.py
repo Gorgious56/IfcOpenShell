@@ -40,6 +40,7 @@ from bonsai.bim.decorator_cache import (
 from bonsai.bim.ifc import IfcStore, get_cache_or_detect_lock
 from bonsai.bim.module.aggregate.decorator import AggregateDecorator
 from bonsai.bim.module.georeference.decorator import GeoreferenceDecorator
+from bonsai.bim.module.model import preview_base
 from bonsai.bim.module.model.data import AuthoringData
 from bonsai.bim.module.model.decorator import (
     ArrayPreviewDecorator,
@@ -493,3 +494,4 @@ def load_post(scene):
     _apply_save_file_invariants()
     _apply_user_preferences()
     _install_viewport_overlays()
+    preview_base.discard_pending_previews(scene)
