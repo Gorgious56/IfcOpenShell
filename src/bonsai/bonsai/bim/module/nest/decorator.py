@@ -93,6 +93,9 @@ class NestDecorator:
 
     @classmethod
     def uninstall(cls):
+        # FIXME: missing ``cls.handlers.clear()`` — each install / uninstall
+        # cycle leaves the removed handler refs in the list, and the next
+        # install appends onto stale entries.
         for handler in cls.handlers:
             try:
                 SpaceView3D.draw_handler_remove(handler, "WINDOW")
@@ -241,6 +244,9 @@ class NestModeDecorator:
 
     @classmethod
     def uninstall(cls):
+        # FIXME: missing ``cls.handlers.clear()`` — each install / uninstall
+        # cycle leaves the removed handler refs in the list, and the next
+        # install appends onto stale entries.
         for handler in cls.handlers:
             try:
                 SpaceView3D.draw_handler_remove(handler, "WINDOW")

@@ -651,7 +651,6 @@ class AddBoundary(bpy.types.Operator, tool.Ifc.Operator):
                 self.report({"ERROR"}, "1 element selected but it's not an IfcSpace - please, select IfcSpace..")
                 return {"CANCELLED"}
 
-            # New prototype, old code not yet removed. Still testing.
             res = self.auto_generate_boundaries(space, ifc_objects[space])
             if isinstance(res, str):
                 self.report({"ERROR"}, res)

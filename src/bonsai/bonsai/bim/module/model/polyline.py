@@ -453,6 +453,17 @@ class PolylineOperator:
         if event.type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             return {"PASS_THROUGH"}
 
+    def cancel(self, context: bpy.types.Context) -> None:
+        # Blender invokes ``cancel`` on workspace switch, window close, or
+        # script-driven modal termination — paths that bypass ``modal`` so
+        # ``handle_cancelation`` never runs. Without this hook the decorator
+        # and polyline state survive the cancellation. Uninstall is idempotent
+        # (it swallows ``ValueError`` for already-removed handlers) so the
+        # ESC path that already cleaned up doesn't double-uninstall.
+        PolylineDecorator.uninstall()
+        tool.Polyline.clear_polyline()
+        context.workspace.status_text_set(text=None)
+
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> None:
         PolylineDecorator.install(context)
         tool.Snap.clear_snapping_point()

@@ -24,6 +24,7 @@ from typing import Any
 import bmesh
 import bpy
 import ifcopenshell
+import ifcopenshell.api.attribute
 import ifcopenshell.api.geometry
 import ifcopenshell.api.pset
 import ifcopenshell.util.representation
@@ -38,7 +39,11 @@ from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model import prop
 from bonsai.bim.module.model.data import RailingData, refresh
 from bonsai.bim.module.model.decorator import ProfileDecorator
-from bonsai.bim.parametric_lifecycle import PathPreservingEditMixin
+from bonsai.bim.parametric_lifecycle import (
+    CycleTypeMixin,
+    PathPreservingEditMixin,
+    PickTypeMixin,
+)
 from bonsai.tool.cad import WELD_TOLERANCE
 
 V_ = tool.Blender.V_
@@ -72,32 +77,29 @@ def update_railing_modifier_ifc_data(context: bpy.types.Context) -> None:
     ifc_file = tool.Ifc.get()
 
     # type attributes
-    element.PredefinedType = "USERDEFINED"
+    ifcopenshell.api.attribute.edit_attributes(ifc_file, product=element, attributes={"PredefinedType": "USERDEFINED"})
     # occurrences attributes
     occurrences = tool.Ifc.get_all_element_occurrences(element)
     for occurrence in occurrences:
-        occurrence.ObjectType = props.railing_type
+        ifcopenshell.api.attribute.edit_attributes(
+            ifc_file, product=occurrence, attributes={"ObjectType": props.railing_type}
+        )
 
     # update pset
-    pset_common = tool.Pset.get_element_pset(element, "Pset_RailingCommon")
-    if not pset_common:
-        pset_common = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="Pset_RailingCommon")
-
-    ifcopenshell.api.pset.edit_pset(
-        ifc_file,
-        pset=pset_common,
-        properties={
-            "Height": props.height,
-        },
-    )
+    tool.Pset.upsert_pset(element, "Pset_RailingCommon", {"Height": props.height})
 
     if props.railing_type == "WALL_MOUNTED_HANDRAIL":
+        # Build the parametric rep first to populate ``obj.data`` with the
+        # kernel-tessellated bmesh; the trailing ``add_body_representation``
+        # then overwrites the committed body with a faceted version. The
+        # parametric rep uses ``IfcSweptDiskSolid`` which is not portable
+        # across IFC geometry kernels at typical import tolerances.
         body = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
-        pset_data = tool.Model.get_modeling_bbim_pset_data(bpy.context.active_object, "BBIM_Railing")
+        pset_data = tool.Model.get_modeling_bbim_pset_data(obj, "BBIM_Railing")
         path_data = pset_data["data_dict"]["path_data"]
         railing_path = [Vector(v) for v in path_data["verts"]]
         looped_path = path_data["edges"][-1][-1] == path_data["edges"][0][0]
-        si_conversion = ifcopenshell.util.unit.calculate_unit_scale(tool.Ifc.get())
+        si_conversion = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
 
         representation_data = {
             "context": body,
@@ -120,16 +122,11 @@ def update_railing_modifier_ifc_data(context: bpy.types.Context) -> None:
             bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
             tool.Blender.apply_bmesh(mesh, bm)
 
-    elif props.railing_type == "FRAMELESS_PANEL":
-        tool.Model.add_body_representation(obj)
+    tool.Model.add_body_representation(obj)
 
 
 def update_bbim_railing_pset(element: ifcopenshell.entity_instance, railing_data: dict[str, Any]) -> None:
-    pset = tool.Pset.get_element_pset(element, "BBIM_Railing")
-    if not pset:
-        pset = ifcopenshell.api.pset.add_pset(tool.Ifc.get(), product=element, name="BBIM_Railing")
-    railing_data = tool.Ifc.get().createIfcText(json.dumps(railing_data, default=list))
-    ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=pset, properties={"Data": railing_data})
+    tool.Pset.write_bbim_data(element, "BBIM_Railing", railing_data)
 
 
 def generate_wall_mounted_handrail_preview(
@@ -425,7 +422,6 @@ class AddRailing(bpy.types.Operator, tool.Ifc.Operator):
         refresh()
         update_railing_modifier_bmesh(context)
         update_railing_modifier_ifc_data(context)
-        tool.Model.add_body_representation(obj)
 
 
 class CopyRailingParameters(bpy.types.Operator, tool.Ifc.Operator):
@@ -476,7 +472,7 @@ class _RailingEditMixin(PathPreservingEditMixin):
 
     @classmethod
     def _is_element_type(cls, element):
-        return tool.Blender.Modifier.is_railing(element)
+        return tool.Parametric.is_railing(element)
 
     @classmethod
     def _get_props(cls, obj: bpy.types.Object):
@@ -503,7 +499,7 @@ class _RailingEditMixin(PathPreservingEditMixin):
         if props.railing_type == "WALL_MOUNTED_HANDRAIL":
             element = tool.Ifc.get_entity(obj)
             assert element
-            body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            body = tool.Geometry.get_body_representation(element)
             if body:
                 bonsai.core.geometry.switch_representation(
                     tool.Ifc,
@@ -515,41 +511,26 @@ class _RailingEditMixin(PathPreservingEditMixin):
         update_railing_modifier_bmesh(context)
 
 
-class EnableEditingRailing(_RailingEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.enable_editing_railing"
-    bl_label = "Enable Editing Railing"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._enable_targets(context)
-
-
-class CancelEditingRailing(_RailingEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.cancel_editing_railing"
-    bl_label = "Cancel Editing Railing"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._cancel_targets(context)
+EnableEditingRailing, FinishEditingRailing, CancelEditingRailing = tool.Parametric.build_edit_lifecycle(
+    "railing",
+    _RailingEditMixin,
+    labels=(
+        ("Enable Editing Railing", ""),
+        ("Finish Editing Railing", ""),
+        ("Cancel Editing Railing", ""),
+    ),
+    module_name=__name__,
+)
 
 
-class FinishEditingRailing(_RailingEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.finish_editing_railing"
-    bl_label = "Finish Editing Railing"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._finish_targets(context)
-
-
-class CycleRailingType(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
+class CycleRailingType(bpy.types.Operator, tool.Ifc.Operator, CycleTypeMixin):
     """Cycle railing_type (FRAMELESS_PANEL ↔ WALL_MOUNTED_HANDRAIL). Shift+click reverses."""
 
     bl_idname = "bim.cycle_railing_type"
     bl_label = "Cycle Railing Type"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = tool.Blender.Modifier.is_railing
+    element_checker = tool.Parametric.is_railing
     props_getter = tool.Model.get_railing_props
     type_literal = tool.Model.RailingType
     type_attr = "railing_type"
@@ -582,7 +563,7 @@ class ToggleRailingUseManualSupports(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class PickRailingTerminalType(bpy.types.Operator, tool.Ifc.Operator, gizmo.PickTypeMixin):
+class PickRailingTerminalType(bpy.types.Operator, tool.Ifc.Operator, PickTypeMixin):
     """Pick ``terminal_type`` for the active WALL_MOUNTED_HANDRAIL railing."""
 
     bl_idname = "bim.pick_railing_terminal_type"
@@ -760,7 +741,7 @@ class GizmoRailingSchematic(bpy.types.GizmoGroup, gizmo.BaseSchematicGizmoGroup)
 
     @classmethod
     def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
-        return tool.Blender.Modifier.is_railing(element)
+        return tool.Parametric.is_railing(element)
 
     @classmethod
     def schematic_cache_key(cls, props) -> tuple:
@@ -864,8 +845,7 @@ class GizmoRailingSchematic(bpy.types.GizmoGroup, gizmo.BaseSchematicGizmoGroup)
         through into parametric edit while the polyline mesh is open in EDIT
         mode mixes two distinct editing states and leaves a stale draft if
         they cancel out — block the entry point instead. The operator itself
-        is intentionally not guarded (callers via scripting can still invoke
-        it); this is the UX-level enforcement.
+        stays open to scripting callers; this is UX-only enforcement.
 
         The cycle icon defaults to the editing icon row (next to validate /
         cancel) via the parent's positioning. We move it to just above the
@@ -1046,9 +1026,8 @@ class GizmoRailingSchematic(bpy.types.GizmoGroup, gizmo.BaseSchematicGizmoGroup)
         # ── Handrail tube (hex cross-section in YZ, extruded along X) ──────
         # Centred on the rail centreline at (±(half_len - rail_inset),
         # rail_y, +clear_s) — in front of the wall plane at z=0. The tube
-        # is shorter than the wall so the wall visibly extends past it on
-        # both sides; the L-brackets sit at the tube ends, so the leftmost
-        # bracket no longer coincides with the wall's left edge.
+        # is shorter than the wall so the wall extends past it on both
+        # sides; L-brackets sit at the tube ends, inset from the wall edges.
         rail_inset = cls.SCHEMATIC_RAIL_INSET_FRAC
         rail_x_left = -half_len + rail_inset
         rail_x_right = half_len - rail_inset
@@ -1173,7 +1152,7 @@ def cancel_editing_railing_path(context: bpy.types.Context) -> set[str]:
     else:
         element = tool.Ifc.get_entity(obj)
         assert element
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         bonsai.core.geometry.switch_representation(
             tool.Ifc,
             tool.Geometry,

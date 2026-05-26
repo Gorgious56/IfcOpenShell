@@ -32,6 +32,7 @@ import bonsai.core.root
 import bonsai.tool as tool
 from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
+from bonsai.bim.parametric_lifecycle import ParametricEditMixinBase, PickTypeMixin
 from bonsai.tool.numeric_input import (
     IntegerInputState,
     run_integer_input_modal,
@@ -110,14 +111,10 @@ def update_ifc_stair_props(obj: bpy.types.Object) -> None:
         element.TreadLength = tread_length
 
     # update pset with ifc properties
-    pset_common = tool.Pset.get_element_pset(element, "Pset_StairFlightCommon")
-    if not pset_common:
-        pset_common = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="Pset_StairFlightCommon")
-
-    ifcopenshell.api.pset.edit_pset(
-        ifc_file,
-        pset=pset_common,
-        properties={
+    tool.Pset.upsert_pset(
+        element,
+        "Pset_StairFlightCommon",
+        {
             "NumberOfRiser": number_of_risers,
             "NumberOfTreads": props.number_of_treads,
             "RiserHeight": riser_height,
@@ -206,15 +203,7 @@ class AddStair(bpy.types.Operator, tool.Ifc.Operator):
 
         # Use the special method that includes custom_tread_lock for IFC storage
         stair_data = props.get_props_kwargs_for_ifc_export(convert_to_project_units=True)
-        pset = tool.Pset.get_element_pset(element, "BBIM_Stair")
-        if not pset:
-            pset = ifcopenshell.api.pset.add_pset(ifc_file, product=element, name="BBIM_Stair")
-
-        ifcopenshell.api.pset.edit_pset(
-            ifc_file,
-            pset=pset,
-            properties={"Data": tool.Ifc.get().createIfcText(json.dumps(stair_data))},
-        )
+        tool.Pset.write_bbim_data(element, "BBIM_Stair", stair_data)
 
         if obj.type == "EMPTY":
             obj = tool.Geometry.recreate_object_with_data(obj, data=bpy.data.meshes.new("temp"), is_global=True)
@@ -226,86 +215,92 @@ class AddStair(bpy.types.Operator, tool.Ifc.Operator):
         return {"FINISHED"}
 
 
-class CancelEditingStair(bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.cancel_editing_stair"
-    bl_label = "Cancel Editing Stair"
-    bl_description = "Cancel editing and revert stair parameters to their previous values"
-    bl_options = {"REGISTER"}
+class _StairEditMixin(ParametricEditMixinBase):
+    """Stair parametric-edit lifecycle.
 
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        obj = context.active_object
-        assert obj
-        element = tool.Ifc.get_entity(obj)
-        assert element
-        data = json.loads(ifcopenshell.util.element.get_pset(element, "BBIM_Stair", "Data"))
-        props = tool.Model.get_stair_props(obj)
-        # restore previous settings since editing was canceled
+    Stair sits between the door/window shape (write all general kwargs back to
+    the pset) and railing/roof (path_data preserved across edit). Stair uses
+    ``get_props_kwargs_for_ifc_export`` — wider than ``get_general_kwargs``
+    because it includes ``custom_tread_lock`` — and rebuilds geometry through
+    ``regenerate_stair_mesh`` + ``add_body_representation`` rather than a
+    representation switch."""
+
+    pset_name = "BBIM_Stair"
+
+    @classmethod
+    def _is_element_type(cls, element):
+        return tool.Parametric.is_stair(element)
+
+    @classmethod
+    def _get_props(cls, obj: bpy.types.Object):
+        return tool.Model.get_stair_props(obj)
+
+    @classmethod
+    def _enable_one(cls, obj: bpy.types.Object) -> None:
+        resolved = cls._resolve(obj)
+        if resolved is None:
+            return
+        element, props = resolved
+        cls._handle_drift_on_enable(obj)
+        data = json.loads(ifcopenshell.util.element.get_pset(element, cls.pset_name, "Data"))
         props.set_props_kwargs_from_ifc_data(data)
-        regenerate_stair_mesh(obj)
-        # Restore matrix_world from IFC. Without this an uncommitted drag
-        # survives the cancel and a later Finish silently commits it.
-        if tool.Ifc.is_moved(obj):
-            if element.ObjectPlacement is None:
-                tool.Geometry.record_object_position(obj)
-            else:
-                tool.Geometry.restore_placement_from_ifc(obj, element)
+        props.is_editing = True
 
-        props.is_editing = False
-
-        return {"FINISHED"}
-
-
-class FinishEditingStair(bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.finish_editing_stair"
-    bl_label = "Finish Editing Stair"
-    bl_description = "Apply changes and finish editing stair parameters"
-    bl_options = {"REGISTER"}
-
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        obj = context.active_object
-        assert obj
-        element = tool.Ifc.get_entity(obj)
-        assert element
-        props = tool.Model.get_stair_props(obj)
-
-        # Use the special method that includes custom_tread_lock for IFC storage
+    @classmethod
+    def _finish_one(cls, obj: bpy.types.Object, context: bpy.types.Context) -> None:
+        resolved = cls._resolve(obj)
+        if resolved is None:
+            return
+        element, props = resolved
         data = props.get_props_kwargs_for_ifc_export(convert_to_project_units=True)
         regenerate_stair_mesh(obj)
         tool.Model.add_body_representation(obj)
-
-        pset = tool.Pset.get_element_pset(element, "BBIM_Stair")
-        data = tool.Ifc.get().createIfcText(json.dumps(data))
-        ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=pset, properties={"Data": data})
-
-        # update IfcStairFlight properties
+        tool.Pset.write_bbim_data(element, cls.pset_name, data)
         update_ifc_stair_props(obj)
-        # Commit any in-edit matrix_world drift. Pset + representation writes
-        # above do not cover placement; without this an in-edit drag is silently
-        # dropped on Finish.
-        tool.Geometry.commit_placement_if_moved(obj)
+        cls._mark_type_thumbnail_dirty(element)
+        cls._handle_drift_on_finish(obj)
+        # Set only on success: if any IFC op above raised, the user's draft survives for retry.
         props.is_editing = False
-        return {"FINISHED"}
 
-
-class EnableEditingStair(bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.enable_editing_stair"
-    bl_label = "Enable Editing Stair"
-    bl_description = "Enter edit mode to modify stair parameters interactively"
-    bl_options = {"REGISTER"}
-
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        obj = context.active_object
-        assert obj
-        # Commit pre-edit matrix_world drift so Cancel's restore-from-IFC
-        # reads a fresh ObjectPlacement instead of snapping back past the drag.
-        tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
-        props = tool.Model.get_stair_props(obj)
-        element = tool.Ifc.get_entity(obj)
-        data = json.loads(ifcopenshell.util.element.get_pset(element, "BBIM_Stair", "Data"))
-        # required since we could load pset from .ifc and BIMStairProperties won't be set
+    @classmethod
+    def _cancel_one(cls, obj: bpy.types.Object) -> None:
+        resolved = cls._resolve(obj)
+        if resolved is None:
+            return
+        element, props = resolved
+        data = json.loads(ifcopenshell.util.element.get_pset(element, cls.pset_name, "Data"))
         props.set_props_kwargs_from_ifc_data(data)
-        props.is_editing = True
+        regenerate_stair_mesh(obj)
+        cls._handle_drift_on_cancel(obj, element)
+        props.is_editing = False
+
+    def _enable_targets(self, context: bpy.types.Context) -> set[str]:
+        for obj in self._iter_targets(context):
+            self._enable_one(obj)
         return {"FINISHED"}
+
+    def _finish_targets(self, context: bpy.types.Context) -> set[str]:
+        for obj in self._iter_targets(context):
+            self._finish_one(obj, context)
+        return {"FINISHED"}
+
+    def _cancel_targets(self, context: bpy.types.Context) -> set[str]:
+        for obj in self._iter_targets(context):
+            self._cancel_one(obj)
+        return {"FINISHED"}
+
+
+EnableEditingStair, FinishEditingStair, CancelEditingStair = tool.Parametric.build_edit_lifecycle(
+    "stair",
+    _StairEditMixin,
+    labels=(
+        ("Enable Editing Stair", "Enter edit mode to modify stair parameters interactively"),
+        ("Finish Editing Stair", "Apply changes and finish editing stair parameters"),
+        ("Cancel Editing Stair", "Cancel editing and revert stair parameters to their previous values"),
+    ),
+    bl_options={"REGISTER"},
+    module_name=__name__,
+)
 
 
 class RemoveStair(bpy.types.Operator, tool.Ifc.Operator):
@@ -436,7 +431,7 @@ class SetStairTreads(bpy.types.Operator):
         return f"Number of Treads: {input_str}_{validity}  |  Enter to confirm, Esc to cancel"
 
 
-class PickStairType(bpy.types.Operator, gizmo.PickTypeMixin):
+class PickStairType(bpy.types.Operator, PickTypeMixin):
     """Pick a stair type from a popup menu."""
 
     bl_idname = "bim.pick_stair_type"
@@ -602,7 +597,7 @@ class GizmoStairEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
 
     @classmethod
     def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
-        return tool.Blender.Modifier.is_stair(element)
+        return tool.Parametric.is_stair(element)
 
     def setup_element_specific_gizmos(self, context: bpy.types.Context) -> None:
         # Static open/closed lock pairs; consumer toggles visibility. The

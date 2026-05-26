@@ -18,7 +18,7 @@
 #
 # This file was generated with the assistance of an AI coding tool.
 
-"""Shared infrastructure for Bonsai's parametric preview flows.
+"""Shared helpers for Bonsai's parametric preview flows.
 
 Multiple Bonsai features follow the same Scene-level preview pattern:
 
@@ -27,29 +27,25 @@ Multiple Bonsai features follow the same Scene-level preview pattern:
     Gizmo<X>Preview    — polls on ``is_active``, surfaces tunable widgets +
                          validate/cancel icons.
     <X>PreviewDecorator — GPU lines drawn while ``is_active`` is True.
-    Finish<X>Preview   — dispatches to a final ``bim.<verb>`` operator with
-                         params read off the draft state, then clears it.
+    Finish<X>Preview   — direct ``bpy.ops.bim.<verb>(...)`` call with kwargs
+                         read off the draft state, then clears it.
     Cancel<X>Preview   — pure state reset.
 
-The MEP bend and wall fillet flows are the two current callers. Both share
-the lifecycle exactly; only the props-attribute name, ID/parameter field
-names, and the dispatch-op idname differ. This module centralises the
-cross-cutting helpers and the boilerplate base classes so adding a new
-preview triad doesn't duplicate all of it.
+The MEP bend and wall fillet flows are the two current callers. They write
+their Finish / Cancel operators directly, matching the convention used
+throughout the rest of ``bim/module/model/`` for operator-to-operator
+dispatch (explicit ``bpy.ops.bim.X(kwarg=value)`` at the call site, no
+string indirection). This module hosts the cross-cutting accessors only;
+no base class layer.
 
 The GPU draw-handler lifecycle for ``<X>PreviewDecorator`` lives on the
 feature-neutral ``tool.Blender.ViewportDecorator`` base, which every
-viewport decorator (preview or otherwise) inherits from.
-
-Layered design — non-preview Bonsai code can call ``get_preview_props`` /
-``is_preview_active`` to introspect the active preview without taking on
-the bigger Operator / Gizmo bases. The bases are purely opt-in for new
-preview triads."""
+viewport decorator (preview or otherwise) inherits from."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any
 
 import bpy
 
@@ -154,71 +150,34 @@ def sync_uncommitted_moves(objects: list) -> None:
         tool.Geometry.commit_placement_if_moved(obj, apply_scale=False)
 
 
-# --- Base classes for Finish / Cancel operators ------------------------------
+# --- Esc dispatch ------------------------------------------------------------
+
+PREVIEW_CANCEL_OPS: tuple[tuple[str, str], ...] = (
+    ("bend", "cancel_bend_preview"),
+    ("wall_fillet", "cancel_wall_fillet_preview"),
+)
+"""Registry of ``(child PointerProperty on Scene.BIMPreviewProperties, bim
+operator name)`` consulted by the Esc handler. Adding a new preview means
+appending one tuple; the forward-compat test pins that every preview
+PropertyGroup with ``is_active`` has an entry here."""
 
 
-class BasePreviewFinishOperator(bpy.types.Operator):
-    """Skeleton for ``Finish<X>Preview`` operators.
+def try_cancel_active_preview(context: bpy.types.Context) -> bool:
+    """Cancel whichever registered preview is currently active.
 
-    Subclasses set the class attributes ``PREVIEW_ATTR``,
-    ``DISPATCH_OPERATOR``, ``DISPATCH_PROP_MAP``, and ``RESET_FIELDS``; the
-    base class handles the shared lifecycle: read the preview props,
-    early-return if inactive or no IFC, dispatch via ``bpy.ops.bim.<op>``
-    with kwargs gathered from the props, clear the state on FINISHED.
+    Returns ``True`` iff a preview was cancelled. At most one preview is
+    active at a time in practice; the first match in ``PREVIEW_CANCEL_OPS``
+    wins.
 
-    ``RESET_FIELDS`` is a tuple of ``(field_name, reset_value)`` pairs so
-    drafts can mix integer IDs, floats (radii), enums, etc. without the
-    base needing to know each field's type."""
-
-    bl_options = {"REGISTER", "UNDO"}
-
-    # Subclass overrides — declared as ``ClassVar`` so they're class-only
-    # data, not Blender props on the operator instance.
-    PREVIEW_ATTR: ClassVar[str]
-    DISPATCH_OPERATOR: ClassVar[str]
-    DISPATCH_PROP_MAP: ClassVar[dict[str, str]]
-    RESET_FIELDS: ClassVar[tuple[tuple[str, Any], ...]]
-
-    def execute(self, context: bpy.types.Context):
-        props = get_preview_props(context, self.PREVIEW_ATTR)
-        if props is None or not props.is_active:
-            return {"CANCELLED"}
-        if tool.Ifc.get() is None:
-            self.report({"ERROR"}, "No IFC file loaded.")
-            return {"CANCELLED"}
-        kwargs = {kwarg: getattr(props, prop_attr) for kwarg, prop_attr in self.DISPATCH_PROP_MAP.items()}
-        op = getattr(bpy.ops.bim, self.DISPATCH_OPERATOR)
-        result = op(**kwargs)
-        # Only clear preview state on a successful commit — a failed
-        # dispatch (geometric error caught by the create operator) keeps
-        # the gizmos visible so the user can re-tune or cancel.
-        if "FINISHED" in result:
-            props.is_active = False
-            for field, reset_value in self.RESET_FIELDS:
-                setattr(props, field, reset_value)
-        return result
-
-
-class BasePreviewCancelOperator(bpy.types.Operator):
-    """Skeleton for ``Cancel<X>Preview`` operators.
-
-    Pure state reset — preview itself never mutates IFC, so cancel just
-    clears the draft fields. Subclasses set ``PREVIEW_ATTR`` and
-    ``RESET_FIELDS`` (tuple of ``(field_name, reset_value)`` pairs)."""
-
-    bl_options = {"REGISTER", "UNDO"}
-
-    PREVIEW_ATTR: ClassVar[str]
-    RESET_FIELDS: ClassVar[tuple[tuple[str, Any], ...]]
-
-    def execute(self, context: bpy.types.Context):
-        props = get_preview_props(context, self.PREVIEW_ATTR)
-        if props is None or not props.is_active:
-            # ESC routes here even when no preview is active; tell Blender
-            # nothing happened so the keymap can fall through to whichever
-            # other ESC handler is next.
-            return {"CANCELLED"}
-        props.is_active = False
-        for field, reset_value in self.RESET_FIELDS:
-            setattr(props, field, reset_value)
-        return {"FINISHED"}
+    Tags 3D viewports for redraw on success — the Esc keymap entry runs
+    outside a viewport mouse event so the gizmo poll wouldn't re-evaluate
+    until the next interaction without an explicit redraw."""
+    for attr, op_name in PREVIEW_CANCEL_OPS:
+        if is_preview_active(context, attr):
+            getattr(bpy.ops.bim, op_name)()
+            screen = context.screen
+            for area in screen.areas if screen else ():
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+            return True
+    return False

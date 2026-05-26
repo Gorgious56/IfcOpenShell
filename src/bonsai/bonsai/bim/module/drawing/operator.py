@@ -67,7 +67,7 @@ import bonsai.bim.module.drawing.svgwriter as svgwriter
 import bonsai.core.drawing as core
 import bonsai.core.geometry
 import bonsai.tool as tool
-from bonsai.bim.ifc import IfcStore
+from bonsai.bim.ifc import IfcStore, get_cache_or_detect_lock
 from bonsai.bim.module.drawing.data import DecoratorData, ElementValuesData
 from bonsai.bim.module.drawing.decoration import CutDecorator
 from bonsai.bim.module.drawing.prop import (
@@ -912,7 +912,7 @@ class CreateDrawing(bpy.types.Operator):
                 exporter.file = tool.Ifc.get()
                 invalidated_elements = exporter.sync_all_objects()
                 invalidated_guids = [e.GlobalId for e in invalidated_elements if hasattr(e, "GlobalId")]
-                if cache := IfcStore.get_cache():
+                if cache := get_cache_or_detect_lock():
                     [cache.remove(guid) for guid in invalidated_guids]
 
         # If we have already calculated it in the SVG in the past, don't recalculate
@@ -2281,7 +2281,7 @@ class ActivateModel(bpy.types.Operator):
             elements = elements_mutable
             while elements:
                 element = elements.pop()
-                model = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+                model = tool.Geometry.get_body_representation(element)
                 if not model:
                     continue
                 assert isinstance(obj := tool.Ifc.get_object(element), bpy.types.Object)

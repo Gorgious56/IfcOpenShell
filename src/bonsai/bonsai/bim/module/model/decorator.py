@@ -59,6 +59,20 @@ def highlight_color(color, alpha=0.1):
     return color
 
 
+class _LineSurfaceShaderMixin:
+    """``draw_batch`` for decorators that own a ``line_shader`` (LINES) and a
+    ``shader`` (everything else). Adopters set both attributes themselves before
+    the first ``draw_batch`` call."""
+
+    def draw_batch(self, shader_type: str, content_pos, color, indices=None) -> None:
+        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
+            return
+        shader = self.line_shader if shader_type == "LINES" else self.shader
+        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+
+
 def _stroke_lines_alpha(
     context: bpy.types.Context,
     segments: list[tuple[tuple[float, float, float], tuple[float, float, float]]],
@@ -93,7 +107,7 @@ def _stroke_lines_alpha(
     gpu.state.blend_set("NONE")
 
 
-class ProfileDecorator:
+class ProfileDecorator(_LineSurfaceShaderMixin):
     installed = None
 
     @classmethod
@@ -114,14 +128,6 @@ class ProfileDecorator:
         except ValueError:
             pass
         cls.installed = None
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_faces(self, bm, vertices_coords):
         """mutates original bm (triangulates it)
@@ -348,7 +354,7 @@ class ProfileDecorator:
         return points, listEdg
 
 
-class PolylineDecorator:
+class PolylineDecorator(_LineSurfaceShaderMixin):
     is_installed = False
     handlers = []
     event = None
@@ -393,6 +399,7 @@ class PolylineDecorator:
                 SpaceView3D.draw_handler_remove(handler, "WINDOW")
             except ValueError:
                 pass
+        cls.handlers.clear()
         cls.is_installed = False
 
     @classmethod
@@ -452,14 +459,6 @@ class PolylineDecorator:
         bm.free()
 
         return {"verts": verts, "edges": edges, "tris": tris}
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def shader_config(self, context):
         self.addon_prefs = tool.Blender.get_addon_preferences()
@@ -973,7 +972,7 @@ class PolylineDecorator:
             self.draw_batch("LINES", polyline_verts, colors.unselected, polyline_edges)
 
 
-class ProductDecorator(tool.Blender.ViewportDecorator):
+class ProductDecorator(_LineSurfaceShaderMixin, tool.Blender.ViewportDecorator):
     draw_method = "draw_product_preview"
 
     preview_mode: Optional[Literal["PROFILE_VERTICAL", "PROFILE_HORIZONTAL", "LAYER2", "LAYER3", "GENERIC"]]
@@ -1008,14 +1007,6 @@ class ProductDecorator(tool.Blender.ViewportDecorator):
                     self.obj_data = ItemDecorator.get_obj_data(relating_type_obj)
                     self.obj_data["raw_verts"] = [Vector(v) for v in self.obj_data["verts"]]
                     self.obj_matrix_i = relating_type_obj.matrix_world.inverted()
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_product_preview(self, context):
         def transparent_color(color, alpha=0.1):
@@ -1585,16 +1576,8 @@ class ProductDecorator(tool.Blender.ViewportDecorator):
         return data
 
 
-class WallAxisDecorator(tool.Blender.ViewportDecorator):
+class WallAxisDecorator(_LineSurfaceShaderMixin, tool.Blender.ViewportDecorator):
     draw_method = "draw_wall_axis"
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_wall_axis(self, context):
         colors = tool.Blender.get_decorator_colors()
@@ -1629,16 +1612,8 @@ class WallAxisDecorator(tool.Blender.ViewportDecorator):
                 self.draw_batch("LINES", arrow, colors.unselected, [(0, 1), (1, 2), (1, 3)])
 
 
-class SlabDirectionDecorator(tool.Blender.ViewportDecorator):
+class SlabDirectionDecorator(_LineSurfaceShaderMixin, tool.Blender.ViewportDecorator):
     draw_method = "draw_wall_axis"
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_wall_axis(self, context):
         colors = tool.Blender.get_decorator_colors()
@@ -1664,16 +1639,8 @@ class SlabDirectionDecorator(tool.Blender.ViewportDecorator):
             self.draw_batch("LINES", base, colors.selected, [(0, 1)])
 
 
-class FaceAreaDecorator(tool.Blender.ViewportDecorator):
+class FaceAreaDecorator(_LineSurfaceShaderMixin, tool.Blender.ViewportDecorator):
     draw_method = "draw_face_area"
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_face_area(self, context):
         def transparent_color(color, alpha=0.1):
@@ -1704,7 +1671,7 @@ class FaceAreaDecorator(tool.Blender.ViewportDecorator):
                 self.draw_batch("TRIS", data["verts"], transparent_color(decorator_color, alpha=0.5), data["tris"])
 
 
-class BoundingBoxDecorator(tool.Blender.ViewportDecorator):
+class BoundingBoxDecorator(_LineSurfaceShaderMixin, tool.Blender.ViewportDecorator):
     draw_methods = (
         ("draw_bounding_box_wire_cube", "POST_VIEW"),
         ("draw_dimension_text", "POST_PIXEL"),
@@ -1790,14 +1757,6 @@ class BoundingBoxDecorator(tool.Blender.ViewportDecorator):
             {"X": (7, 3), "Y": (7, 4), "Z": (7, 6)},
         ]
         return trihedron[best_origin]
-
-    def draw_batch(self, shader_type, content_pos, color, indices=None):
-        if not tool.Blender.validate_shader_batch_data(content_pos, indices):
-            return
-        shader = self.line_shader if shader_type == "LINES" else self.shader
-        batch = batch_for_shader(shader, shader_type, {"pos": content_pos}, indices=indices)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
 
     def draw_text_background(self, context, coords_dim, text_dim):
         padding = 5
@@ -2069,7 +2028,7 @@ def draw_array_layer_children_bbox(
 
 
 class ArrayPreviewDecorator(tool.Blender.ViewportDecorator):
-    """Faint bbox wireframe at each future array instance during the edit triad.
+    """Faint bbox wireframe at each future array instance during the edit lifecycle.
     Pure GPU preview gated on the array's draft props — no IFC mutation."""
 
     LINE_WIDTH = 1.2
@@ -2086,10 +2045,10 @@ class ArrayPreviewDecorator(tool.Blender.ViewportDecorator):
         if obj is None or not obj.bound_box:
             return
         element = tool.Ifc.get_entity(obj)
-        if not element or not tool.Blender.Modifier.is_array(element):
+        if not element or not tool.Parametric.is_array(element):
             return
         props = tool.Model.get_array_props(obj)
-        # Only preview during an active array triad — at rest the existing
+        # Only preview during an active array edit lifecycle — at rest the existing
         # children are real IFC objects with their own renderings.
         if not props.is_editing:
             return
@@ -2113,7 +2072,7 @@ class ArrayPreviewDecorator(tool.Blender.ViewportDecorator):
         """Return world-space (start, end) line segments for the bbox edges of
         every future instance (i = 1 … count-1; i = 0 is the parent itself)."""
         # Offset matches Model.regenerate_array's math. props.x/y/z are already
-        # in SI (the triad enable hydrates them via si_conversion), so no
+        # in SI (the edit-lifecycle Enable hydrates them via si_conversion), so no
         # unit_scale multiplier here.
         offset = Vector((props.x, props.y, props.z))
         if props.method == "DISTRIBUTE":
@@ -2148,7 +2107,7 @@ class ArraySelectionHighlightDecorator(tool.Blender.ViewportDecorator):
     - **Parent selected** (idle, not editing) — every existing child drawn
       in the *unselected* color at lower alpha. The parent is already
       visually flagged by Blender's selection outline. Suppressed during
-      an active array triad so the live ``ArrayPreviewDecorator`` wireframes
+      an active array edit lifecycle so the live ``ArrayPreviewDecorator`` wireframes
       (future-state, drag-driven) don't fight the existing-children overlay.
 
     Activation requires the array-family member to be BOTH active AND
@@ -2192,8 +2151,8 @@ class ArraySelectionHighlightDecorator(tool.Blender.ViewportDecorator):
 
         if tool.Blender.Modifier.is_array_child(element):
             self._draw_for_child(context, prefs, element, obj)
-        elif tool.Blender.Modifier.is_array(element):
-            # Parent selected. Suppressed during an active array triad —
+        elif tool.Parametric.is_array(element):
+            # Parent selected. Suppressed during an active array edit lifecycle —
             # ArrayPreviewDecorator already shows the (future) child positions
             # during drag; drawing the (current) ones too would double-draw.
             props = tool.Model.get_array_props(obj)
@@ -2339,7 +2298,7 @@ class ArraySelectionHighlightDecorator(tool.Blender.ViewportDecorator):
 
 
 class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
-    """Faint floor-plane preview lines that visualise where a click-to-act wall
+    """Hover-gated preview lines that visualise where a click-to-act wall
     gizmo's operator would move the wall geometry. Two state machines:
 
     - **Join intersection** — when exactly two non-joined, non-collinear,
@@ -2353,15 +2312,17 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
       nearer axis endpoint to the 3D cursor's projected X on the wall axis.
       Mirrors the visibility of the ``extend_x_gizmo`` icon in
       ``GizmoWallEdition``.
+    - **Split at cursor** — one world-vertical line at the cursor's projected X
+      from wall base to wall top, visualising the cut plane. Hover-gated on
+      ``split_gizmo``.
 
-    The decorator does NOT decide *whether* the underlying operators should
-    succeed — it is purely a visual cue, and is hidden by the same gizmo-
-    preferences toggle that hides the icons themselves."""
+    Purely a visual cue — hidden by the same gizmo-preferences toggle as the
+    icons themselves."""
 
     draw_method = "draw_lines"
 
     LINE_WIDTH = 1.5
-    LINE_ALPHA = 0.4
+    LINE_ALPHA = 0.8
 
     def draw_lines(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2372,6 +2333,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         self._draw_join_preview(context, prefs)
         self._draw_cursor_extend_preview(context, prefs)
         self._draw_cursor_extend_z_preview(context, prefs)
+        self._draw_cursor_split_preview(context, prefs)
 
     def _stroke(
         self,
@@ -2382,7 +2344,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         _stroke_lines_alpha(context, segments, color_rgb, self.LINE_WIDTH, self.LINE_ALPHA)
 
     def _draw_join_preview(self, context: bpy.types.Context, prefs: Any) -> None:
-        """Render the two faint floor-plane preview lines for the wall-join
+        """Render the two floor-plane preview lines for the wall-join
         intersection.
 
         Each wall contributes one line from its nearer axis endpoint to the
@@ -2407,7 +2369,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         elem_b = tool.Ifc.get_entity(selected[1])
         if elem_a is None or elem_b is None:
             return
-        if not tool.Blender.Modifier.is_wall(elem_a) or not tool.Blender.Modifier.is_wall(elem_b):
+        if not tool.Parametric.is_path_connectable_wall(elem_a) or not tool.Parametric.is_path_connectable_wall(elem_b):
             return
         # Lazy import to avoid a circular wall.py ↔ decorator.py dependency at
         # module load. The wall helpers are module-private but stable; the
@@ -2427,7 +2389,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         seg_a = _wall_axis_world_segment_from_geom(selected[0], geom_a)
         seg_b = _wall_axis_world_segment_from_geom(selected[1], geom_b)
         parallel_threshold = core_model.PARALLEL_DOT_THRESHOLD
-        collinear_tolerance = GizmoWallJoinIntersection.COLLINEAR_LINE_TOLERANCE
+        collinear_tolerance = core_model.COLLINEAR_LINE_TOLERANCE
         # Only the "intersect" state shows preview lines — joined / collinear /
         # parallel each have their own gizmo icons but no extension preview.
         # Destructuring the classifier's ``(state, intersection)`` return lets
@@ -2496,24 +2458,6 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         except (AttributeError, ReferenceError):
             return False, False
 
-    @staticmethod
-    def _lookup_active_instance(gizmo_cls: type, context: bpy.types.Context) -> Optional[Any]:
-        """Return the live ``GizmoGroup`` instance registered under
-        ``context.region``, or ``None`` if there isn't one. The per-region
-        weakref dict on the gizmo class is populated by ``setup()``; multi-
-        viewport setups put one entry per region in it, so each region's
-        decorator sees only its own region's hover state."""
-        instances = getattr(gizmo_cls, "_active_instances", None)
-        if not instances:
-            return None
-        region = getattr(context, "region", None)
-        if region is None:
-            return None
-        ref = instances.get(region.as_pointer())
-        if ref is None:
-            return None
-        return ref()
-
     def _active_layer2_wall_for_gizmo_preview(
         self, context: bpy.types.Context, prefs: Any
     ) -> Optional[bpy.types.Object]:
@@ -2531,7 +2475,7 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         if active not in selected or len(selected) != 1:
             return None
         element = tool.Ifc.get_entity(active)
-        if element is None or not tool.Blender.Modifier.is_wall(element):
+        if element is None or not tool.Parametric.is_wall(element):
             return None
         if tool.Model.get_usage_type(element) != "LAYER2":
             return None
@@ -2568,18 +2512,17 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
             return
         self._stroke(context, [(tuple(start_world), tuple(end_world))], tuple(prefs.decorator_color_selected[:3]))
 
-    def _draw_cursor_extend_z_preview(self, context: bpy.types.Context, prefs: Any) -> None:
-        """Render two vertical preview lines (one at each wall axis endpoint)
-        only while the cursor-anchored extend-Z icon gizmo is hovered. Each
-        line runs from the wall's current top to the cursor's Z, both in
-        world space — matching the height delta the extend-Z operator will
-        commit (which uses world Z, not wall-local Z, as the base)."""
+    def _draw_cursor_split_preview(self, context: bpy.types.Context, prefs: Any) -> None:
+        """Render one line at the cursor's projected X, from wall base to wall top
+        along the wall's local Z — the cut plane the split operator would commit.
+        Hover-gated on the split icon; coloured with the destructive-action warning
+        red to match the icon's own hover signal."""
         active = self._active_layer2_wall_for_gizmo_preview(context, prefs)
         if active is None:
             return
         from bonsai.bim.module.model.wall import GizmoWallEdition
 
-        if not self._cursor_icon_hovered(GizmoWallEdition, "extend_z_gizmo", context):
+        if not self._cursor_icon_hovered(GizmoWallEdition, "split_gizmo", context):
             return
         geom = tool.Wall.read_geometry(active)
         if geom is None:
@@ -2590,41 +2533,41 @@ class WallGizmoPreviewDecorator(tool.Blender.ViewportDecorator):
         if length <= 0 or height <= 0:
             return
         mw = active.matrix_world
-        base_z = mw.translation.z
-        current_top_z = base_z + height
-        cursor_z = context.scene.cursor.location.z
-        # Match the extend-Z operator's validity gate: new height must be > 0,
-        # i.e. cursor strictly above the wall base. A click below the base
-        # cancels with a WARNING; drawing the preview through the floor would
-        # invite a click that can't succeed.
-        if cursor_z <= base_z:
+        cursor_local = mw.inverted() @ context.scene.cursor.location
+        if not (anchor_x < cursor_local.x < anchor_x + length):
             return
-        if abs(cursor_z - current_top_z) < 1e-6:
-            return
-        start_xy = mw @ Vector((anchor_x, 0.0, 0.0))
-        end_xy = mw @ Vector((anchor_x + length, 0.0, 0.0))
-        start_top = (start_xy.x, start_xy.y, current_top_z)
-        end_top = (end_xy.x, end_xy.y, current_top_z)
-        start_target = (start_xy.x, start_xy.y, cursor_z)
-        end_target = (end_xy.x, end_xy.y, cursor_z)
-        self._stroke(
-            context,
-            [(start_top, start_target), (end_top, end_target)],
-            tuple(prefs.decorator_color_selected[:3]),
-        )
+        bottom_world = mw @ Vector((cursor_local.x, 0.0, 0.0))
+        top_world = mw @ Vector((cursor_local.x, 0.0, height))
+        self._stroke(context, [(tuple(bottom_world), tuple(top_world))], tuple(prefs.decorator_color_error[:3]))
 
-    def _cursor_icon_hovered(self, gizmo_cls: type, attr_name: str, context: bpy.types.Context) -> bool:
-        """True iff the gizmo group instance in the current region exposes a
-        gizmo under ``attr_name`` that reports as highlighted. Any access
-        exception is swallowed so a transient bpy-state hiccup never breaks
-        the draw loop."""
-        inst = self._lookup_active_instance(gizmo_cls, context)
-        if inst is None:
-            return False
-        try:
-            return bool(getattr(inst, attr_name).is_highlight)
-        except (AttributeError, ReferenceError):
-            return False
+    def _draw_cursor_extend_z_preview(self, context: bpy.types.Context, prefs: Any) -> None:
+        """Render one preview line at the cursor's projected X on the wall axis,
+        from the wall base to the gizmo's local Z — the new total height the
+        extend-Z operator would commit. Hover-gated on the extend-Z icon."""
+        active = self._active_layer2_wall_for_gizmo_preview(context, prefs)
+        if active is None:
+            return
+        from bonsai.bim.module.model.wall import GizmoWallEdition
+
+        if not self._cursor_icon_hovered(GizmoWallEdition, "extend_z_gizmo", context):
+            return
+        geom = tool.Wall.read_geometry(active)
+        if geom is None:
+            return
+        length = geom.get("length", 0.0)
+        height = geom.get("height", 0.0)
+        if length <= 0 or height <= 0:
+            return
+        mw = active.matrix_world
+        cursor_local = mw.inverted() @ context.scene.cursor.location
+        # New height must be > 0 for the operator to commit.
+        if cursor_local.z <= 0:
+            return
+        if abs(cursor_local.z - height) < 1e-6:
+            return
+        base_world = mw @ Vector((cursor_local.x, 0.0, 0.0))
+        top_world = mw @ Vector((cursor_local.x, 0.0, cursor_local.z))
+        self._stroke(context, [(tuple(base_world), tuple(top_world))], tuple(prefs.decorator_color_selected[:3]))
 
 
 def compute_mep_join_location() -> Optional[Vector]:
@@ -2632,14 +2575,6 @@ def compute_mep_join_location() -> Optional[Vector]:
     segments — the world location where a connecting fitting (bend /
     transition) would land. Returns None when prerequisites aren't met
     (wrong cardinality, mixed non-MEP).
-
-    Module-level pure helper. Used by ``GizmoMEPActions.position_gizmos``
-    to anchor the bend / transition icons at the predicted fitting
-    location. Previously lived as a static method on
-    ``BendMarkerDecorator`` (which also rendered an orange point at the
-    same location); the visual marker was removed at user request but
-    the geometry math is still needed for icon positioning, so it stays
-    here as a standalone callable.
     """
     selected = list(tool.Blender.get_selected_objects())
     if len(selected) != 2:
@@ -2661,28 +2596,15 @@ def compute_mep_join_location() -> Optional[Vector]:
 
 
 class MEPSegmentExtendPreviewDecorator(tool.Blender.ViewportDecorator):
-    """Faint preview line for the MEP segment extend-to-cursor gizmo.
-
-    When a single pipe/duct segment is active and the per-feature ``extend``
-    gizmo pref is on, renders one line from the segment's current end to the
-    cursor's projection on the segment's local Z (extrusion) axis. Mirrors
-    ``WallGizmoPreviewDecorator._draw_cursor_extend_preview`` but for MEP
-    segments — the line shows the delta the extend operator would commit.
-
-    Always-on draw handler (installed from ``bim/handler.py:load_post``,
-    uninstalled in ``bim/module/model/__init__.py:unregister``); self-gates
-    on the addon's gizmo-on-3d toggle and the per-feature ``extend`` toggle
-    every draw, so disabling either suppresses the line at no cost.
-    """
+    """Preview line for the MEP segment extend-to-cursor gizmo. Renders one line
+    from the segment's current end to the cursor's projection on the segment's
+    local Z axis when the extend icon is hovered. Self-gates every draw on the
+    viewport gizmo toggle and the per-feature ``extend`` pref."""
 
     draw_method = "draw_line"
 
     LINE_WIDTH = 1.5
-    LINE_ALPHA = 0.4
-    # Floor on the projected length. Matches the ``max(0.01, cursor_local.z)``
-    # clamp in ``bim.extend_pipe_segment_to_cursor`` / ``..._duct_..._cursor``
-    # so the preview line lands exactly where the operator commits.
-    MIN_PROJECTED_LENGTH = 0.01
+    LINE_ALPHA = 0.8
 
     def draw_line(self, context: bpy.types.Context) -> None:
         if not tool.Blender.are_viewport_gizmos_enabled():
@@ -2700,25 +2622,33 @@ class MEPSegmentExtendPreviewDecorator(tool.Blender.ViewportDecorator):
         if element is None:
             return
 
-        # Pick the matching per-feature gizmo pref so the preview line
-        # tracks the same on/off toggle as the icon itself.
-        if tool.Blender.Modifier.is_pipe_segment(element):
+        # Pick the matching per-feature gizmo pref + gizmo group class so the
+        # preview line tracks the same on/off toggle as the icon itself and
+        # gates on the same group's hover state.
+        from bonsai.bim.module.model.mep import (
+            GizmoDuctSegmentEdition,
+            GizmoPipeSegmentEdition,
+        )
+
+        if tool.Parametric.is_pipe_segment(element):
             gizmo_prefs = getattr(prefs.gizmos, "pipe_segment", None)
-        elif tool.Blender.Modifier.is_duct_segment(element):
+            gizmo_cls = GizmoPipeSegmentEdition
+        elif tool.Parametric.is_duct_segment(element):
             gizmo_prefs = getattr(prefs.gizmos, "duct_segment", None)
+            gizmo_cls = GizmoDuctSegmentEdition
         else:
             return
         if gizmo_prefs is None or not getattr(gizmo_prefs, "enabled", True):
             return
+        if not self._cursor_icon_hovered(gizmo_cls, "extend_gizmo", context):
+            return
 
         current_length = max(c[2] for c in active.bound_box) if active.bound_box else 0.0
-        line = self._compute_extend_preview_line(
-            active.matrix_world, context.scene.cursor.location, current_length, self.MIN_PROJECTED_LENGTH
-        )
+        line = self._compute_extend_preview_line(active.matrix_world, context.scene.cursor.location, current_length)
         if line is None:
             return
         start_world, end_world = line
-        color = tuple(prefs.decorations_colour[:3])
+        color = tuple(prefs.decorator_color_selected[:3])
         _stroke_lines_alpha(
             context,
             [(tuple(start_world), tuple(end_world))],
@@ -2732,25 +2662,18 @@ class MEPSegmentExtendPreviewDecorator(tool.Blender.ViewportDecorator):
         matrix_world: Matrix,
         cursor_world: Vector,
         current_length: float,
-        min_projected_length: float,
     ) -> Optional[tuple[Vector, Vector]]:
-        """Pure helper. Returns the (current_end_world, target_end_world) pair
-        the preview line should render, or ``None`` when no extend would
-        happen (degenerate segment, or projected length matches current).
-
-        Projection math mirrors ``_extend_segment_to_cursor`` in mep.py:
-        cursor → object-local space → take local-Z component → clamp to
-        ``min_projected_length`` → back to world. The delta worth visualising
-        runs from the segment's current end at local (0, 0, current_length)
-        to the new end at local (0, 0, projected_length)."""
+        """Returns ``(current_end_world, target_end_world)`` or ``None`` when no
+        extend would happen (degenerate segment, or cursor on the existing end).
+        Target follows the cursor's local Z unbounded — the line stays visible
+        past the segment origin even though the operator floors at its minimum."""
         if current_length <= 0:
             return None
         cursor_local = matrix_world.inverted() @ cursor_world
-        target_local_z = max(min_projected_length, cursor_local.z)
-        if abs(target_local_z - current_length) < 1e-6:
+        if abs(cursor_local.z - current_length) < 1e-6:
             return None
         current_end_world = matrix_world @ Vector((0.0, 0.0, current_length))
-        target_end_world = matrix_world @ Vector((0.0, 0.0, target_local_z))
+        target_end_world = matrix_world @ Vector((0.0, 0.0, cursor_local.z))
         return current_end_world, target_end_world
 
 
@@ -2942,50 +2865,37 @@ class WallFilletPreviewDecorator(tool.Blender.ViewportDecorator):
         return p2 if d2 >= d1 else p1
 
 
-class MEPSystemPathDecorator(tool.Blender.ViewportDecorator):
-    """Faint axis-line overlay tracing the schematic path of the selected
-    MEP element's connected distribution system.
+class _ConnectedNetworkPathDecorator(tool.Blender.ViewportDecorator):
+    """Shared scaffolding for "BFS-walk a connected IFC network from a selected
+    seed and overlay its schematic path" viewport decorators.
 
-    When ``BIMModelProperties.show_paths`` is on, every redraw the
-    decorator:
+    Subclasses implement three hooks:
 
-    1. Inspects ``context.selected_objects`` for any IfcFlowSegment /
-       IfcFlowFitting (via ``tool.System.is_mep_element``).
-    2. From the first MEP element found, BFS-walks all connected MEP
-       elements via ``tool.System.walk_connected_mep_elements`` (follows
-       ``IfcRelConnectsPorts`` in both directions, with a 5000-node cap).
-    3. For each segment in the walk, draws a faint line along its axis.
-    4. For each fitting, draws a "spider": lines from the fitting's origin
-       to each of its ports' world positions, so 2-port fittings (bends,
-       transitions) read as one continuous line and N-port fittings (tees,
-       crosses) show their connection topology.
+        ``_is_seed_element(element)``: True if ``element`` can seed a walk
+        ``_walk(start_element)``: list of network elements reachable from the seed
+        ``_build_geometry(connected)``: ``(lines, points)`` for one walk pass
 
-    Installed once per Blender session from ``bim/handler.py:load_post``
-    and uninstalled in ``bim/module/model/__init__.py:unregister``. The
-    install/uninstall lifecycle also runs from the toggle's update
-    callback in ``prop.py`` so flipping the property takes effect
-    immediately, no Blender restart needed.
+    Lifecycle each redraw: gate on ``BIMModelProperties.show_paths`` (the
+    shared toggle for all network-path overlays), find the first selected
+    seed element, walk the network (cached per seed-GUID per IFC file), and
+    render lines + connection-node dots. Geometry is memoised through a
+    ``TokenCache`` keyed on the decorator-cache token, so depsgraph / undo /
+    redo / load all invalidate the resolved world-space pass without
+    re-walking.
 
-    Cost when toggle is OFF: one attribute read on every redraw — the
-    decorator stays installed but the draw callback early-exits. Mirrors
-    ``WallAxisDecorator``'s self-gating pattern. When ON with no MEP
-    selection, costs one ``is_mep_element`` check per selected object.
-    """
+    Install / uninstall is driven by the central addon-load handler and
+    by the toggle's ``update`` callback, so flipping the property takes
+    effect immediately without a Blender restart."""
 
-    # Color + line width chosen to match ``WallAxisDecorator``'s primary
-    # reference-axis line — the MEP path overlay represents "what the user
-    # is currently inspecting", which is exactly what
-    # ``decorator_color_selected`` (the highlight color) is reserved for in
-    # Bonsai's palette convention. The earlier ``decorator_color_unselected``
-    # at 0.45 alpha was too faint to read against the typical viewport
-    # background — bumped here for readability against MEP elements that
-    # often sit against dark gridlines.
-    LINE_WIDTH = 3.5
+    # Line width + alpha chosen to match ``WallAxisDecorator``'s primary
+    # reference-axis line. Network-path overlays render in
+    # ``decorator_color_selected`` — Bonsai's palette slot for "what the user
+    # is currently inspecting".
+    LINE_WIDTH = 2.5
     LINE_ALPHA = 0.9
-    # Pixel size for the port-position dots drawn at every IfcDistributionPort
-    # on every traversed fitting. Slightly larger than the line width so the
-    # ports read as discrete connection nodes rather than line thickenings.
-    PORT_DOT_SIZE = 8.0
+    # Sized larger than LINE_WIDTH so connection nodes read as discrete
+    # points rather than line thickenings.
+    DOT_SIZE = 8.0
 
     def __init__(self) -> None:
         # Two-tier cache. Walk cache keyed on (start_guid, ifc_file): re-walk
@@ -2994,234 +2904,38 @@ class MEPSystemPathDecorator(tool.Blender.ViewportDecorator):
         self._cached_start_guid: str | None = None
         self._cached_ifc_file: Any = None
         self._cached_walk: list[Any] = []
-        # Geometry cache: shared TokenCache so the resolved world-space lines
-        # + port dots re-build on every depsgraph / undo / redo / load.
+        # Geometry cache: shared TokenCache so resolved world-space lines +
+        # dots re-build on every depsgraph / undo / redo / load.
         self._geom_cache: TokenCache[
             tuple[
                 list[tuple[tuple[float, float, float], tuple[float, float, float]]],
                 list[tuple[float, float, float]],
             ]
         ] = TokenCache()
+        # One-shot guard so a corrupted walk surfaces in the console once per
+        # decorator instance instead of every redraw.
+        self._walk_failure_logged: bool = False
 
-    def draw(self, context: bpy.types.Context) -> None:
-        model_props = tool.Model.get_model_props()
-        if not getattr(model_props, "show_paths", False):
-            return
-        ifc_file = tool.Ifc.get()
-        if ifc_file is None:
-            return
+    _ABSTRACT_HOOKS = ("_is_seed_element", "_walk", "_build_geometry")
 
-        # Walk from the first selected MEP element — the BFS pulls in the
-        # rest of its connected system. Disjoint systems show only the first.
-        start_element = None
-        for obj in context.selected_objects or []:
-            element = tool.Ifc.get_entity(obj)
-            if element is None or not tool.System.is_mep_element(element):
-                continue
-            if not tool.Geometry.has_axis_representation(element):
-                continue
-            start_element = element
-            break
-        if start_element is None:
-            self._cached_start_guid = None
-            self._cached_walk = []
-            return
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Pin the template-method contract at class-definition time, mirroring
+        # ViewportDecorator's draw_method check: a subclass that forgets to
+        # override one of the three hooks would otherwise pass class creation
+        # and only raise NotImplementedError on the first walk — deferred long
+        # past the offending declaration.
+        missing = [
+            name for name in cls._ABSTRACT_HOOKS if getattr(cls, name) is getattr(_ConnectedNetworkPathDecorator, name)
+        ]
+        if missing:
+            raise TypeError(f"{cls.__name__}: must override abstract hook(s) {sorted(missing)}")
 
-        start_guid = start_element.GlobalId
-        if start_guid == self._cached_start_guid and ifc_file is self._cached_ifc_file and self._cached_walk:
-            connected = self._cached_walk
-        else:
-            try:
-                connected = tool.System.walk_connected_mep_elements(start_element)
-            except Exception:
-                self._cached_walk = []
-                return
-            self._cached_start_guid = start_guid
-            self._cached_ifc_file = ifc_file
-            self._cached_walk = connected
-        if not connected:
-            return
+    def _is_seed_element(self, element: Any) -> bool:
+        raise NotImplementedError
 
-        prefs = tool.Blender.get_addon_preferences()
-        color = tuple(prefs.decorator_color_selected[:3])
-
-        lines, port_positions = self._geom_cache.get_or_compute(
-            (start_guid, id(ifc_file)),
-            lambda: self._build_geometry(connected),
-        )
-
-        if lines:
-            _stroke_lines_alpha(context, lines, color, self.LINE_WIDTH, self.LINE_ALPHA)
-
-        if port_positions:
-            # POINTS via UNIFORM_COLOR; point_size_set only affects the next batch.
-            point_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-            point_shader.bind()
-            point_shader.uniform_float("color", (*color, self.LINE_ALPHA))
-            gpu.state.point_size_set(self.PORT_DOT_SIZE)
-            gpu.state.blend_set("ALPHA")
-            batch = batch_for_shader(point_shader, "POINTS", {"pos": port_positions})
-            batch.draw(point_shader)
-            gpu.state.blend_set("NONE")
-
-    def _build_geometry(
-        self,
-        connected: list[Any],
-    ) -> tuple[
-        list[tuple[tuple[float, float, float], tuple[float, float, float]]],
-        list[tuple[tuple[float, float, float], float, float, float]],
-    ]:
-        """Resolve world-space line segments + port dots for one walk pass.
-
-        Returns ``(lines, port_positions)``. Never raises; skips degenerate
-        elements."""
-        lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
-        port_positions: list[tuple[float, float, float]] = []
-        for element in connected:
-            if not tool.Geometry.has_axis_representation(element):
-                continue
-            if element.is_a("IfcFlowSegment"):
-                obj = tool.Ifc.get_object(element)
-                if obj is None:
-                    continue
-                start_world, end_world = tool.Model.get_flow_segment_axis(obj)
-                lines.append((tuple(start_world), tuple(end_world)))
-                # Segment ports sit at the two axis endpoints — emit a dot
-                # at each so the connection node is visible regardless of
-                # whether the neighbouring element is a fitting (which would
-                # also emit dots) or another segment (which wouldn't).
-                port_positions.append(tuple(start_world))
-                port_positions.append(tuple(end_world))
-            elif element.is_a("IfcFlowFitting"):
-                obj = tool.Ifc.get_object(element)
-                if obj is None:
-                    continue
-                ports = tool.System.get_ports(element)
-                port_world_positions = [tool.System.get_port_world_position(p) for p in ports]
-                # Two visualisations depending on fitting cardinality:
-                # - 2 ports (transition, coupler, bend): draw ONE line port-
-                #   to-port. The "spider from origin" pattern produced V-shaped
-                #   flares because the fitting's local origin is often offset
-                #   from the port positions, so origin → port1 + origin → port2
-                #   gave two angled lines that didn't follow the actual path.
-                #   Port-to-port keeps the schematic flowing through the
-                #   fitting as a single continuous segment.
-                # - 3+ ports (tee, cross, branching fittings): keep the
-                #   spider-from-origin pattern. Drawing all N*(N-1)/2 port
-                #   pairs would clutter the view at high N (N=4 → 6 lines);
-                #   the spider gives one line per port and centers the
-                #   branching point at the fitting's origin.
-                if len(port_world_positions) == 2:
-                    lines.append((tuple(port_world_positions[0]), tuple(port_world_positions[1])))
-                elif len(port_world_positions) >= 3:
-                    origin = obj.matrix_world.translation
-                    for port_pos in port_world_positions:
-                        lines.append((tuple(origin), tuple(port_pos)))
-                # 0-port and 1-port fittings: nothing to draw (degenerate or
-                # endpoint-only). Ports still emit dots below either way.
-                for port_pos in port_world_positions:
-                    port_positions.append(tuple(port_pos))
-        return lines, port_positions
-
-
-class WallSystemPathDecorator(tool.Blender.ViewportDecorator):
-    """Faint axis-line overlay tracing the connected wall network from the
-    selected wall.
-
-    When ``BIMModelProperties.show_paths`` is on, every redraw the
-    decorator:
-
-    1. Inspects ``context.selected_objects`` for any ``IfcWall``.
-    2. From the first wall found, BFS-walks all connected walls via
-       ``tool.Wall.walk_connected_walls`` (follows
-       ``IfcRelConnectsPathElements`` in both directions, with a 5000-node
-       cap).
-    3. For each wall in the walk, draws a line along its world-space
-       reference axis (from ``tool.Wall.get_world_reference_line``).
-    4. For each axis endpoint, draws a vertex dot so the user can see
-       where each wall starts and stops.
-
-    Mirror of ``MEPSystemPathDecorator``: same two-tier cache pattern (walk
-    cache invalidated by selection / file-reload, geometry cache invalidated
-    by depsgraph / undo / redo / load via the decorator cache token), same
-    install / uninstall lifecycle.
-
-    Cost when toggle is OFF: one attribute read on every redraw — the
-    decorator stays installed but the draw callback early-exits.
-    """
-
-    LINE_WIDTH = 3.5
-    LINE_ALPHA = 0.9
-    VERTEX_DOT_SIZE = 8.0
-
-    def __init__(self) -> None:
-        self._cached_start_guid: str | None = None
-        self._cached_ifc_file: Any = None
-        self._cached_walk: list[Any] = []
-        self._geom_cache: TokenCache[
-            tuple[
-                list[tuple[tuple[float, float, float], tuple[float, float, float]]],
-                list[tuple[float, float, float]],
-            ]
-        ] = TokenCache()
-
-    def draw(self, context: bpy.types.Context) -> None:
-        model_props = tool.Model.get_model_props()
-        if not getattr(model_props, "show_paths", False):
-            return
-        ifc_file = tool.Ifc.get()
-        if ifc_file is None:
-            return
-
-        start_element = None
-        for obj in context.selected_objects or []:
-            element = tool.Ifc.get_entity(obj)
-            if element is None or not element.is_a("IfcWall"):
-                continue
-            if not tool.Geometry.has_axis_representation(element):
-                continue
-            start_element = element
-            break
-        if start_element is None:
-            self._cached_start_guid = None
-            self._cached_walk = []
-            return
-
-        start_guid = start_element.GlobalId
-        if start_guid == self._cached_start_guid and ifc_file is self._cached_ifc_file and self._cached_walk:
-            connected = self._cached_walk
-        else:
-            try:
-                connected = tool.Wall.walk_connected_walls(start_element)
-            except Exception:
-                self._cached_walk = []
-                return
-            self._cached_start_guid = start_guid
-            self._cached_ifc_file = ifc_file
-            self._cached_walk = connected
-        if not connected:
-            return
-
-        prefs = tool.Blender.get_addon_preferences()
-        color = tuple(prefs.decorator_color_selected[:3])
-
-        lines, vertex_positions = self._geom_cache.get_or_compute(
-            (start_guid, id(ifc_file)),
-            lambda: self._build_geometry(connected),
-        )
-
-        if lines:
-            _stroke_lines_alpha(context, lines, color, self.LINE_WIDTH, self.LINE_ALPHA)
-
-        if vertex_positions:
-            point_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-            point_shader.bind()
-            point_shader.uniform_float("color", (*color, self.LINE_ALPHA))
-            gpu.state.point_size_set(self.VERTEX_DOT_SIZE)
-            gpu.state.blend_set("ALPHA")
-            batch = batch_for_shader(point_shader, "POINTS", {"pos": vertex_positions})
-            batch.draw(point_shader)
-            gpu.state.blend_set("NONE")
+    def _walk(self, start_element: Any) -> list[Any]:
+        raise NotImplementedError
 
     def _build_geometry(
         self,
@@ -3230,9 +2944,157 @@ class WallSystemPathDecorator(tool.Blender.ViewportDecorator):
         list[tuple[tuple[float, float, float], tuple[float, float, float]]],
         list[tuple[float, float, float]],
     ]:
-        """Resolve world-space reference-line segments + endpoint dots for
-        one walk pass. Skips walls whose Blender object or reference line
-        can't be resolved — never raises."""
+        """Resolve world-space line segments + connection-node dots for one
+        walk pass. Returns ``(lines, points)``. Never raises; skips degenerate
+        elements."""
+        raise NotImplementedError
+
+    def draw(self, context: bpy.types.Context) -> None:
+        model_props = tool.Model.get_model_props()
+        if not getattr(model_props, "show_paths", False):
+            return
+        ifc_file = tool.Ifc.get()
+        if ifc_file is None:
+            return
+
+        start_element = None
+        for obj in context.selected_objects or []:
+            element = tool.Ifc.get_entity(obj)
+            if element is None or not self._is_seed_element(element):
+                continue
+            start_element = element
+            break
+        if start_element is None:
+            self._cached_start_guid = None
+            self._cached_walk = []
+            return
+
+        start_guid = start_element.GlobalId
+        if start_guid == self._cached_start_guid and ifc_file is self._cached_ifc_file and self._cached_walk:
+            connected = self._cached_walk
+        else:
+            try:
+                connected = self._walk(start_element)
+            except Exception:
+                if not self._walk_failure_logged:
+                    import traceback
+
+                    traceback.print_exc()
+                    self._walk_failure_logged = True
+                self._cached_walk = []
+                return
+            self._cached_start_guid = start_guid
+            self._cached_ifc_file = ifc_file
+            self._cached_walk = connected
+        if not connected:
+            return
+
+        prefs = tool.Blender.get_addon_preferences()
+        color = tuple(prefs.decorator_color_selected[:3])
+
+        lines, points = self._geom_cache.get_or_compute(
+            (start_guid, id(ifc_file)),
+            lambda: self._build_geometry(connected),
+        )
+
+        if lines:
+            _stroke_lines_alpha(context, lines, color, self.LINE_WIDTH, self.LINE_ALPHA)
+
+        if points:
+            # POINTS via UNIFORM_COLOR; point_size_set only affects the next batch.
+            point_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            point_shader.bind()
+            point_shader.uniform_float("color", (*color, self.LINE_ALPHA))
+            gpu.state.point_size_set(self.DOT_SIZE)
+            gpu.state.blend_set("ALPHA")
+            batch = batch_for_shader(point_shader, "POINTS", {"pos": points})
+            batch.draw(point_shader)
+            gpu.state.blend_set("NONE")
+
+
+class MEPSystemPathDecorator(_ConnectedNetworkPathDecorator):
+    """Schematic-path overlay for the selected MEP element's connected
+    distribution system.
+
+    Walk: BFS through ``IfcRelConnectsPorts`` from the first selected MEP
+    element. Segments render as one axis line + endpoint dots. Fittings
+    render as:
+
+    - 2-port (transition, coupler, bend): one line port-to-port, keeping
+      the schematic continuous through the fitting. The "spider from
+      origin" pattern produces V-shaped flares when the fitting's local
+      origin is offset from its ports.
+    - 3+-port (tee, cross, branching): spider from origin to each port.
+      Drawing all N*(N-1)/2 port pairs would clutter the view at high N
+      (N=4 → 6 lines); the spider gives one line per port.
+    - 0-port / 1-port: degenerate, no lines (dots still emit)."""
+
+    def _is_seed_element(self, element: Any) -> bool:
+        return tool.System.is_mep_element(element)
+
+    def _walk(self, start_element: Any) -> list[Any]:
+        return tool.System.walk_connected_mep_elements(start_element)
+
+    def _build_geometry(
+        self,
+        connected: list[Any],
+    ) -> tuple[
+        list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+        list[tuple[float, float, float]],
+    ]:
+        lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        port_positions: list[tuple[float, float, float]] = []
+        for element in connected:
+            if element.is_a("IfcFlowSegment"):
+                if not tool.Geometry.has_axis_representation(element):
+                    continue
+                obj = tool.Ifc.get_object(element)
+                if obj is None:
+                    continue
+                start_world, end_world = tool.Model.get_flow_segment_axis(obj)
+                lines.append((tuple(start_world), tuple(end_world)))
+                # Segment ports sit at the two axis endpoints — emit dots so
+                # the connection node is visible whether the neighbour is a
+                # fitting (also emits) or another segment (doesn't).
+                port_positions.append(tuple(start_world))
+                port_positions.append(tuple(end_world))
+            elif element.is_a("IfcFlowFitting"):
+                obj = tool.Ifc.get_object(element)
+                if obj is None:
+                    continue
+                ports = tool.System.get_ports(element)
+                port_world_positions = [tool.System.get_port_world_position(p) for p in ports]
+                if len(port_world_positions) == 2:
+                    lines.append((tuple(port_world_positions[0]), tuple(port_world_positions[1])))
+                elif len(port_world_positions) >= 3:
+                    origin = obj.matrix_world.translation
+                    for port_pos in port_world_positions:
+                        lines.append((tuple(origin), tuple(port_pos)))
+                for port_pos in port_world_positions:
+                    port_positions.append(tuple(port_pos))
+        return lines, port_positions
+
+
+class WallSystemPathDecorator(_ConnectedNetworkPathDecorator):
+    """Schematic-path overlay for the selected wall's connected wall network.
+
+    Walk: BFS through ``IfcRelConnectsPathElements`` from the first selected
+    wall. Each wall renders as one reference-line segment + a dot at each
+    axis endpoint."""
+
+    def _is_seed_element(self, element: Any) -> bool:
+        return element.is_a("IfcWall") and tool.Geometry.has_axis_representation(element)
+
+    def _walk(self, start_element: Any) -> list[Any]:
+        return tool.Wall.walk_connected_walls(start_element)
+
+    def _build_geometry(
+        self,
+        connected: list[Any],
+    ) -> tuple[
+        list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+        list[tuple[float, float, float]],
+    ]:
         lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
         vertex_positions: list[tuple[float, float, float]] = []
         for element in connected:

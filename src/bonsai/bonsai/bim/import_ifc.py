@@ -43,7 +43,7 @@ import numpy.typing as npt
 from ifcopenshell.util.shape import MatrixType
 
 import bonsai.tool as tool
-from bonsai.bim.ifc import IFC_CONNECTED_TYPE, IfcStore
+from bonsai.bim.ifc import IFC_CONNECTED_TYPE, IfcStore, get_cache_or_detect_lock
 from bonsai.tool.loader import OBJECT_DATA_TYPE
 
 
@@ -722,7 +722,7 @@ class IfcImporter:
                 settings, self.file, include=products, geometry_library=self.ifc_import_settings.geometry_library
             )
         if self.ifc_import_settings.should_cache:
-            cache = IfcStore.get_cache()
+            cache = get_cache_or_detect_lock()
             if cache:
                 iterator.set_cache(cache)
         valid_file = iterator.initialize()
@@ -1219,8 +1219,8 @@ class IfcImporter:
                         if element not in elements_to_import:
                             continue
                     for i in range(len(data)):
-                        tool.Blender.Modifier.Array.set_children_lock_state(element, i, True)
-                        tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+                        tool.Array.set_children_lock_state(element, i, True)
+                        tool.Array.constrain_children_to_parent(element)
 
     def update_linked_aggregates(self):
         # TODO Remove this after a while. See commit 17d6b8a

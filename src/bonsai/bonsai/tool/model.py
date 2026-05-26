@@ -1230,6 +1230,15 @@ class Model(bonsai.core.tool.Model):
             tool.Ifc.get(), pset=pset, properties={"Data": json_data, "Parent": parent_element.GlobalId}
         )
 
+        # Post-condition: parent is selected on return. duplicate_ifc_objects
+        # deselects the source on every call inside the regen loop; without
+        # this restore, callers get a deselected parent for arrays with N >= 2.
+        # TODO: batch the per-child duplicate_ifc_objects([parent]) calls into
+        # a single N-way duplicate — N depsgraph churns + N select/deselect
+        # flips is wasteful, and a batched duplicate would also remove the
+        # need for this restore.
+        parent_obj.select_set(True)
+
     @classmethod
     def mirror_parent_void_fillings_to_children(
         cls,

@@ -264,7 +264,7 @@ class DumbSlabPlaner:
         custom_offset = tool.Model.get_material_layer_custom_offset(element, obj)
         layer_offset = (custom_offset * self.unit_scale) if custom_offset is not None else layer_params["offset"]
 
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         if representation:
             extrusion = tool.Model.get_extrusion(representation)
             if extrusion:
@@ -377,7 +377,7 @@ class EnableEditingSketchExtrusionProfile(bpy.types.Operator, tool.Ifc.Operator)
             bpy.ops.view3d.slvs_set_all_constraints_visibility(visibility="SHOW")
             return {"FINISHED"}
 
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         extrusion = tool.Model.get_extrusion(body)
         profile = extrusion.SweptArea
         if extrusion.Position:
@@ -495,7 +495,7 @@ class EditSketchExtrusionProfile(bpy.types.Operator, tool.Ifc.Operator):
         obj = context.active_object
         element = tool.Ifc.get_entity(obj)
 
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         extrusion = tool.Model.get_extrusion(representation)
         if extrusion.Position:
             position = Matrix(ifcopenshell.util.placement.get_axis2placement(extrusion.Position).tolist())
@@ -585,7 +585,7 @@ def disable_editing_extrusion_profile(context):
 
     obj = context.active_object
     element = tool.Ifc.get_entity(obj)
-    body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+    body = tool.Geometry.get_body_representation(element)
 
     bonsai.core.geometry.switch_representation(
         tool.Ifc,
@@ -631,7 +631,7 @@ class EnableEditingExtrusionProfile(bpy.types.Operator, tool.Ifc.Operator):
 
         element = tool.Ifc.get_entity(obj)
 
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         body = ifcopenshell.util.representation.resolve_representation(body)
         extrusion = tool.Model.get_extrusion(body)
         existing_x_angle = tool.Model.get_existing_x_angle(extrusion)
@@ -683,7 +683,7 @@ class EditExtrusionProfile(bpy.types.Operator, tool.Ifc.Operator):
         obj = context.active_object
         element = tool.Ifc.get_entity(obj)
 
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         body = ifcopenshell.util.representation.resolve_representation(body)
         extrusion = tool.Model.get_extrusion(body)
         existing_x_angle = tool.Model.get_existing_x_angle(extrusion)

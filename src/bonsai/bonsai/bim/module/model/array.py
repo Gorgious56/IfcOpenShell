@@ -29,6 +29,7 @@ from mathutils import Matrix, Vector
 import bonsai.bim.module.drawing.gizmos as gizmo
 import bonsai.tool as tool
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
+from bonsai.bim.parametric_lifecycle import ParametricEditMixinBase
 
 
 def _wipe_array_children(layers: list) -> None:
@@ -123,7 +124,7 @@ class AddArray(bpy.types.Operator, tool.Ifc.Operator):
             "z": self.z,
             "use_local_space": True,
             "method": "OFFSET",
-            "mirror_to_host": True,
+            "per_child_opening": True,
         }
 
         pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
@@ -142,14 +143,10 @@ class AddArray(bpy.types.Operator, tool.Ifc.Operator):
             properties={"Parent": element.GlobalId, "Data": ifc_file.create_entity("IfcText", json.dumps(data))},
         )
 
-        # Materialize the children for non-trivial counts. The historical
-        # default (count=1, offsets=0) generated no children, so the original
-        # operator skipped regen — but callers passing count >= 2 (e.g.
-        # ``AddArrayFromFeatureEdit``) need the second+ instance to appear
-        # immediately, otherwise the array looks like it didn't take effect.
-        # ``regenerate_array`` is a no-op for count=1 layers; safe to always call.
+        # Always regenerate so callers passing count >= 2 see the second+ instance
+        # appear immediately. No-op for count=1 layers.
         tool.Model.regenerate_array(obj, data)
-        tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+        tool.Array.constrain_children_to_parent(element)
 
 
 class DisableEditingArray(bpy.types.Operator):
@@ -168,8 +165,8 @@ class DisableEditingArray(bpy.types.Operator):
 class EnableEditingArrayItem(bpy.types.Operator):
     """Per-item array layer editing: hydrates props from one BBIM_Array layer.
 
-    The element-wide ``bim.enable_editing_array`` (parametric triad) coexists with
-    this operator. They target different state: ``is_editing`` for the triad,
+    The element-wide ``bim.enable_editing_array`` (parametric edit lifecycle) coexists with
+    this operator. They target different state: ``is_editing`` for the edit lifecycle,
     ``editing_item_index`` for the per-item panel UI."""
 
     bl_idname = "bim.enable_editing_array_item"
@@ -200,7 +197,7 @@ class EnableEditingArrayItem(bpy.types.Operator):
         props.z = data["z"] * si_conversion
         props.use_local_space = data.get("use_local_space", False)
         props.method = data.get("method", "OFFSET")
-        props.mirror_to_host = data.get("mirror_to_host", True)
+        props.per_child_opening = data.get("per_child_opening", data.get("mirror_to_host", True))
 
         props.editing_item_index = self.item
         return {"FINISHED"}
@@ -229,7 +226,7 @@ class EditArray(bpy.types.Operator, tool.Ifc.Operator):
             "z": props.z / si_conversion,
             "use_local_space": props.use_local_space,
             "method": props.method,
-            "mirror_to_host": props.mirror_to_host,
+            "per_child_opening": props.per_child_opening,
         }
 
         props.editing_item_index = -1
@@ -240,22 +237,22 @@ class EditArray(bpy.types.Operator, tool.Ifc.Operator):
         except:
             return {"FINISHED"}
 
-        tool.Blender.Modifier.Array.remove_constraints(parent_element)
+        tool.Array.remove_constraints(parent_element)
         # Conditional wipe-and-rebuild — only when the parent's geometry
         # differs from the children's. See ``_parent_geometry_changed`` for
         # the bbox-dim heuristic and its known false-negative case.
         if _parent_geometry_changed(parent, data):
             _wipe_array_children(data)
         tool.Model.regenerate_array(parent, data)
-        tool.Blender.Modifier.Array.set_children_lock_state(element, self.item, True)
-        tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+        tool.Array.set_children_lock_state(element, self.item, True)
+        tool.Array.constrain_children_to_parent(element)
 
         # clears the relating_array_object so it doesn't show again next time
         props.relating_array_object = None
 
 
-class _ArrayEditMixin:
-    """Array edit triad scoped to one layer at a time.
+class _ArrayEditMixin(ParametricEditMixinBase):
+    """Array edit lifecycle scoped to one layer at a time.
 
     ``is_editing`` is paired with ``editing_item_index`` so Finish/Cancel
     know which layer to commit/discard. Gizmo drag mutates props in place;
@@ -265,7 +262,7 @@ class _ArrayEditMixin:
 
     @classmethod
     def _is_element_type(cls, element):
-        return tool.Blender.Modifier.is_array(element)
+        return tool.Parametric.is_array(element)
 
     @classmethod
     def _get_props(cls, obj: bpy.types.Object):
@@ -295,7 +292,7 @@ class _ArrayEditMixin:
         props.z = layer["z"] * si_conversion
         props.use_local_space = layer.get("use_local_space", True)
         props.method = layer.get("method", "OFFSET")
-        props.mirror_to_host = layer.get("mirror_to_host", True)
+        props.per_child_opening = layer.get("per_child_opening", layer.get("mirror_to_host", True))
 
     @classmethod
     def _set_children_visibility(cls, element, hidden: bool) -> None:
@@ -322,6 +319,7 @@ class _ArrayEditMixin:
         if resolved is None:
             return
         element, props = resolved
+        cls._handle_drift_on_enable(obj)
         source_layers = cls._layers_from_relating(props) or cls._read_layers(element)
         if item < 0 or item >= len(source_layers):
             return
@@ -377,14 +375,14 @@ class _ArrayEditMixin:
         layers[item]["z"] = props.z / si_conversion
         layers[item]["use_local_space"] = props.use_local_space
         layers[item]["method"] = props.method
-        layers[item]["mirror_to_host"] = props.mirror_to_host
+        layers[item]["per_child_opening"] = props.per_child_opening
         # Note: ``tool.Model.regenerate_array`` below removes and re-adds the
         # BBIM_Array pset with the in-memory ``layers`` data ([tool/model.py:
         # 1163-1167](src/bonsai/bonsai/tool/model.py#L1163-L1167)), so an
         # explicit ``edit_pset`` call here would just be overwritten — and
         # each redundant call adds an entry to the IFC owner-history audit
         # trail. Rely on the regenerator's pset write instead.
-        tool.Blender.Modifier.Array.remove_constraints(element)
+        tool.Array.remove_constraints(element)
         # Wipe-and-rebuild only when the parent's geometry differs from the
         # children's (cheap bbox-dim compare). For pure count / offset edits
         # the children are already valid and ``regenerate_array``'s in-place
@@ -393,8 +391,8 @@ class _ArrayEditMixin:
         if _parent_geometry_changed(obj, layers):
             _wipe_array_children(layers)
         tool.Model.regenerate_array(obj, layers)
-        tool.Blender.Modifier.Array.set_children_lock_state(element, item, True)
-        tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+        tool.Array.set_children_lock_state(element, item, True)
+        tool.Array.constrain_children_to_parent(element)
         # Set only on success: if any IFC op above raised, the draft survives for retry.
         props.is_editing = False
         props.editing_item_index = -1
@@ -436,36 +434,21 @@ class _ArrayEditMixin:
         return {"FINISHED"}
 
 
-class EnableEditingArray(_ArrayEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.enable_editing_array"
-    bl_label = "Enable Editing Array"
-    bl_description = "Edit this array — drag the offset arrows, adjust the count, switch the spacing method"
-    bl_options = {"REGISTER", "UNDO"}
-
-    item: bpy.props.IntProperty(name="Layer Index", default=0, min=0)
-
-    def _execute(self, context):
-        return self._enable_targets(context, item=self.item)
-
-
-class FinishEditingArray(_ArrayEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.finish_editing_array"
-    bl_label = "Finish Editing Array"
-    bl_description = "Save the array changes and rebuild the copies"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._finish_targets(context)
-
-
-class CancelEditingArray(_ArrayEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.cancel_editing_array"
-    bl_label = "Cancel Editing Array"
-    bl_description = "Discard the array changes and leave the existing copies as they were"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._cancel_targets(context)
+EnableEditingArray, FinishEditingArray, CancelEditingArray = tool.Parametric.build_edit_lifecycle(
+    "array",
+    _ArrayEditMixin,
+    labels=(
+        (
+            "Enable Editing Array",
+            "Edit this array — drag the offset arrows, adjust the count, switch the spacing method",
+        ),
+        ("Finish Editing Array", "Save the array changes and rebuild the copies"),
+        ("Cancel Editing Array", "Discard the array changes and leave the existing copies as they were"),
+    ),
+    enable_extra_props={"item": bpy.props.IntProperty(name="Layer Index", default=0, min=0)},
+    enable_extra_kwargs=lambda self: {"item": self.item},
+    module_name=__name__,
+)
 
 
 class ApplyArray(bpy.types.Operator, tool.Ifc.Operator):
@@ -493,11 +476,19 @@ class RegenerateArray(bpy.types.Operator, tool.Ifc.Operator):
         obj = context.active_object
         element = tool.Ifc.get_entity(obj)
         pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+        if not pset or "Parent" not in pset:
+            self.report({"ERROR"}, "Active object is not part of a Bonsai parametric array.")
+            return {"CANCELLED"}
         try:
             parent_element = tool.Ifc.get().by_guid(pset["Parent"])
-            parent = tool.Ifc.get_object(parent_element)
-        except:
-            return {"FINISHED"}
+        except RuntimeError:
+            self.report(
+                {"ERROR"},
+                f"Array parent GlobalId {pset['Parent']!r} not found — the array's parent "
+                "element was deleted externally. Reseat the array by re-creating it.",
+            )
+            return {"CANCELLED"}
+        parent = tool.Ifc.get_object(parent_element)
         pset = ifcopenshell.util.element.get_pset(parent_element, "BBIM_Array")
         arrays = json.loads(pset["Data"])
         pset = tool.Ifc.get().by_id(pset["id"])
@@ -512,7 +503,7 @@ class RegenerateArray(bpy.types.Operator, tool.Ifc.Operator):
         # ``element`` directly would feed a child to ``regenerate_array`` and
         # constrain children against a sibling, silently corrupting the array.
         tool.Model.regenerate_array(parent, arrays)
-        tool.Blender.Modifier.Array.constrain_children_to_parent(parent_element)
+        tool.Array.constrain_children_to_parent(parent_element)
 
 
 class RemoveArray(bpy.types.Operator, tool.Ifc.Operator):
@@ -548,12 +539,12 @@ class RemoveArray(bpy.types.Operator, tool.Ifc.Operator):
             return {"FINISHED"}
 
         if self.keep_objs:
-            tool.Blender.Modifier.Array.bake_children_transform(element, self.item)
-            tool.Blender.Modifier.Array.set_children_lock_state(element, self.item, False)
+            tool.Array.bake_children_transform(element, self.item)
+            tool.Array.set_children_lock_state(element, self.item, False)
 
         if not self.keep_objs:
             data[self.item]["count"] = 1
-        tool.Blender.Modifier.Array.remove_constraints(parent_element)
+        tool.Array.remove_constraints(parent_element)
         tool.Model.regenerate_array(parent, data, array_layers_to_apply=[self.item] if self.keep_objs else [])
 
         pset = tool.Pset.get_element_pset(element, "BBIM_Array")
@@ -563,7 +554,7 @@ class RemoveArray(bpy.types.Operator, tool.Ifc.Operator):
             del data[self.item]
             data = tool.Ifc.get().createIfcText(json.dumps(data))
             ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=pset, properties={"Data": data})
-            tool.Blender.Modifier.Array.constrain_children_to_parent(element)
+            tool.Array.constrain_children_to_parent(element)
 
 
 class SelectArrayParent(bpy.types.Operator):
@@ -633,7 +624,7 @@ class SelectAllArrayObjects(bpy.types.Operator):
                         self.report({"ERROR"}, f"Objects that don't have an array parent, were deselected.")
                         object.select_set(False)
 
-                    array_objects = tool.Blender.Modifier.Array.get_all_objects(parent_element)
+                    array_objects = tool.Array.get_all_objects(parent_element)
                     tool.Blender.set_objects_selection(
                         context,
                         active_object=array_objects[0],
@@ -706,7 +697,7 @@ class ArrayParentGizmoClick(bpy.types.Operator):
         except RuntimeError:
             self.report({"ERROR"}, f"Couldn't find array parent by guid '{array_pset['Parent']}'")
             return {"CANCELLED"}
-        all_objects = tool.Blender.Modifier.Array.get_all_objects(parent_element)
+        all_objects = tool.Array.get_all_objects(parent_element)
         parent_obj = tool.Ifc.get_object(parent_element)
         children = [o for o in all_objects if o is not parent_obj]
         if not children:
@@ -845,8 +836,7 @@ class AddArrayFromFeatureEdit(bpy.types.Operator, tool.Ifc.Operator):
     MIN_DEFAULT_OFFSET = 0.3
 
     def invoke(self, context, event):
-        # Modifier-aware axis pick. Plain click stays on X to preserve the
-        # historical default; Shift / Ctrl shift it sideways / vertical.
+        # Modifier-aware axis pick: X by default, Shift → Y, Ctrl → Z.
         if event.shift:
             self.axis = "Y"
         elif event.ctrl:
@@ -859,7 +849,7 @@ class AddArrayFromFeatureEdit(bpy.types.Operator, tool.Ifc.Operator):
         obj = context.active_object
         if obj is None:
             return {"CANCELLED"}
-        # Commit any in-progress parametric triad on this object first — the
+        # Commit any in-progress parametric edit lifecycle on this object first — the
         # user expects "Add Array" to also finalise whatever they were editing
         # so they don't lose their draft changes.
         editing = tool.Parametric.is_object_editing(obj, skip_name="array")
@@ -885,7 +875,7 @@ class AddArrayFromFeatureEdit(bpy.types.Operator, tool.Ifc.Operator):
             return result
         # Restore selection to just the parent. ``regenerate_array`` calls
         # ``tool.Geometry.duplicate_ifc_objects`` which leaves the newly-created
-        # child selected alongside the parent. The triad gizmos poll on a
+        # child selected alongside the parent. The edit-lifecycle gizmos poll on a
         # single-selected parent, so with both selected the gizmos wouldn't
         # surface and "ARRAY → enter edit" would feel broken.
         tool.Blender.select_and_activate_single_object(context, active_object=obj)
@@ -981,7 +971,7 @@ class ToggleArrayMethod(bpy.types.Operator):
     DISTRIBUTE: instances are spread evenly between the parent and the offset
     endpoint — total span is fixed at ``(x, y, z)``, spacing scales with count.
 
-    No-op outside an active triad edit so the operator can't bypass the Finish
+    No-op outside an active edit lifecycle so the operator can't bypass the Finish
     commit lifecycle by quietly flipping the method during a non-editing state."""
 
     bl_idname = "bim.toggle_array_method"
@@ -1005,7 +995,7 @@ class RemoveArrayLayerFromEdit(bpy.types.Operator, tool.Ifc.Operator):
 
     Bound to the trash gizmo at the far right of the edit row. Reads the
     currently-edited layer from ``props.editing_item_index``, cancels the
-    triad (unhides children, clears editing flags), then routes through
+    edit lifecycle (unhides children, clears editing flags), then routes through
     ``bim.remove_array`` to delete the layer from the BBIM_Array pset.
     Existing children of that layer are deleted as part of remove_array.
 
@@ -1056,7 +1046,7 @@ class RemoveArrayLayerFromEdit(bpy.types.Operator, tool.Ifc.Operator):
 
 class InputArrayCount(bpy.types.Operator):
     """Open a number-input dialog so the user can type a new ``count`` during
-    an active triad edit. Bound to the world-space count gizmo in the edit
+    an active edit lifecycle. Bound to the world-space count gizmo in the edit
     row (between cancel and minus) — for users who'd rather type a value than
     repeatedly click +/-."""
 
@@ -1089,10 +1079,10 @@ class InputArrayCount(bpy.types.Operator):
 
 
 class AdjustArrayCount(bpy.types.Operator):
-    """Bump props.count by ``increment`` during an active element-wide triad edit.
+    """Bump props.count by ``increment`` during an active element-wide edit lifecycle.
 
     Bound to the +/- icon gizmos flanking the count drag handle. No-ops outside
-    a triad edit so accidentally invoking it doesn't bypass the commit lifecycle —
+    an edit lifecycle so accidentally invoking it doesn't bypass the commit lifecycle —
     Finish writes IFC; this operator only touches the draft props."""
 
     bl_idname = "bim.adjust_array_count"
@@ -1113,7 +1103,7 @@ class AdjustArrayCount(bpy.types.Operator):
 
 
 class GizmoArrayEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
-    """Viewport gizmos for the array edit triad (single-layer arrays only).
+    """Viewport gizmos for the array edit lifecycle (single-layer arrays only).
     Drag/+/- mutate draft props in place; commit happens at Finish."""
 
     bl_idname = "OBJECT_GGT_bim_array_edition"
@@ -1251,9 +1241,9 @@ class GizmoArrayEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
     @classmethod
     def is_element_type(cls, element: "ifcopenshell.entity_instance") -> bool:
         """Poll for any array parent — multi-layer is fully supported now via
-        the per-layer ARRAY icons. The triad reads ``editing_item_index`` to
+        the per-layer ARRAY icons. The edit lifecycle reads ``editing_item_index`` to
         pick the target layer."""
-        return tool.Blender.Modifier.is_array(element)
+        return tool.Parametric.is_array(element)
 
     def setup_element_specific_gizmos(self, context: bpy.types.Context) -> None:
         """Create the +/- count adjusters, the method toggle, and the
@@ -1505,7 +1495,7 @@ class GizmoArrayChild(bpy.types.GizmoGroup):
 
     Standalone gizmo group (not a ``BaseParametricGizmoGroup`` subclass) because
     the base's ``poll`` early-returns on array children (the mutual-exclusion
-    safeguard for the per-feature gizmo groups) and none of the editing-triad
+    safeguard for the per-feature gizmo groups) and none of the editing-lifecycle
     scaffolding applies — there's nothing to edit on a managed replica.
 
     Two navigation icons:

@@ -60,6 +60,7 @@ import bonsai.core.root
 import bonsai.core.spatial
 import bonsai.tool as tool
 from bonsai.bim.ifc import IfcStore
+from bonsai.bim.module.model import preview_base
 from bonsai.bim.module.model.decorator import ProfileDecorator
 
 if TYPE_CHECKING:
@@ -806,27 +807,83 @@ def count_implicit_array_children_in_selection(selected_objects: set[bpy.types.O
     implicit_children: set[bpy.types.Object] = set()
     for obj in selected_objects:
         element = tool.Ifc.get_entity(obj)
-        if not element or not tool.Blender.Modifier.is_array(element):
+        if not element or not tool.Parametric.is_array(element):
             continue
-        for child_obj in tool.Blender.Modifier.Array.get_all_children_objects(element):
+        for child_obj in tool.Array.get_all_children_objects(element):
             if child_obj not in selected_objects:
                 implicit_children.add(child_obj)
     return len(implicit_children)
 
 
-def has_blocked_array_child_in_selection(selected_objects: set[bpy.types.Object]) -> bool:
-    """True if any array child in the selection has its parent outside the selection.
+def compute_array_dismantle_plan(
+    selected_objects: set[bpy.types.Object],
+    ifc_file: ifcopenshell.file,
+) -> tuple[dict[ifcopenshell.entity_instance, list[int]], set[bpy.types.Object]]:
+    """For a delete selection, return ``(plan, dismantled_children)``.
 
-    Such children are silently skipped by the IFC delete pipeline; a consumer
-    can use this predicate to surface the constraint in a modal popup before
-    the destructive operation runs."""
+    ``plan`` maps each array parent that will be touched to the layer
+    indices that will be removed, in reverse-walk order — matching the
+    break-on-partial semantic used when consuming the plan. ``dismantled_children``
+    is every child object the plan will delete.
+
+    A predicate built on this helper agrees with the executor by
+    construction: the delete pipeline consumes the same plan, so the
+    dialog and the actual outcome cannot drift apart."""
+    array_parents: set[ifcopenshell.entity_instance] = set()
+    for obj in selected_objects:
+        element = tool.Ifc.get_entity(obj)
+        if not element:
+            continue
+        pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
+        if not pset:
+            continue
+        try:
+            array_parents.add(ifc_file.by_guid(pset["Parent"]))
+        except RuntimeError:
+            # Orphan child whose stored Parent GUID does not resolve in the
+            # current file — tolerated; logged by callers that care.
+            print(f"BBIM_Array Parent guid {pset['Parent']!r} not resolvable in file")
+
+    plan: dict[ifcopenshell.entity_instance, list[int]] = {}
+    dismantled_children: set[bpy.types.Object] = set()
+    for array_parent in array_parents:
+        array_parent_obj = tool.Ifc.get_object(array_parent)
+        full_dismantle = array_parent_obj in selected_objects
+        layers: list[int] = []
+        for i, modifier_data in reversed(list(enumerate(tool.Array.get_modifiers_data(array_parent)))):
+            children = set(tool.Array.get_children_objects(modifier_data))
+            if full_dismantle or children.issubset(selected_objects):
+                layers.append(i)
+                dismantled_children |= children
+            else:
+                break  # mirrors the executor: only the trailing layers may dismantle
+        if layers:
+            plan[array_parent] = layers
+    return plan, dismantled_children
+
+
+def has_blocked_array_child_in_selection(
+    selected_objects: set[bpy.types.Object],
+    ifc_file: ifcopenshell.file,
+) -> bool:
+    """True iff some array child in the selection will neither be dismantled
+    by the array path nor deleted by the main loop — i.e. the delete
+    pipeline will silently skip it.
+
+    A consumer surfaces the constraint in a modal popup before the
+    destructive operation runs; the predicate stays quiet whenever the
+    pipeline will in fact remove every selected child."""
+    _, dismantled = compute_array_dismantle_plan(selected_objects, ifc_file)
     for obj in selected_objects:
         element = tool.Ifc.get_entity(obj)
         if not element or not tool.Blender.Modifier.is_array_child(element):
             continue
-        parent_obj = tool.Blender.Modifier.Array.get_parent_object(element)
-        if parent_obj is not None and parent_obj not in selected_objects:
-            return True
+        parent_obj = tool.Array.get_parent_object(element)
+        if parent_obj is None or parent_obj in selected_objects:
+            continue
+        if obj in dismantled:
+            continue
+        return True
     return False
 
 
@@ -852,13 +909,13 @@ def _draw_array_warning(layout: bpy.types.UILayout, implicit_count: int, has_blo
         layout.row().label(text="Delete the array parent, or remove the array via the Array panel.")
 
 
-def _maybe_open_array_dialog(op, context, selected_objects):
+def _maybe_open_array_dialog(op, context, selected_objects, ifc_file):
     """Compute array-delete constraints from ``selected_objects``, write them
     onto ``op`` for the paired draw step to read, and open the wide dialog
     when any apply. Returns the dialog's return value, or ``None`` when no
     array constraints fire."""
     op.implicit_array_children_count = count_implicit_array_children_in_selection(selected_objects)
-    op.has_blocked_array_child = has_blocked_array_child_in_selection(selected_objects)
+    op.has_blocked_array_child = has_blocked_array_child_in_selection(selected_objects, ifc_file)
     if op.implicit_array_children_count == 0 and not op.has_blocked_array_child:
         return None
     kwargs = {"width": _ARRAY_DELETE_DIALOG_WIDTH}
@@ -931,7 +988,7 @@ class OverrideDelete(bpy.types.Operator):
             return bpy.ops.object.delete("INVOKE_DEFAULT", use_global=self.use_global, confirm=self.confirm)
         else:
             self.is_batch = calc_delete_is_batch(ifc_file, context)
-            array_dialog = _maybe_open_array_dialog(self, context, set(context.selected_objects))
+            array_dialog = _maybe_open_array_dialog(self, context, set(context.selected_objects), ifc_file)
             if array_dialog is not None:
                 return array_dialog
             if self.is_batch:
@@ -1106,32 +1163,12 @@ class OverrideDelete(bpy.types.Operator):
 
     def process_arrays(self, context: bpy.types.Context) -> None:
         ifc_file = tool.Ifc.get()
-        selected_objects = set(context.selected_objects)
-        array_parents: set[ifcopenshell.entity_instance] = set()
-        for obj in context.selected_objects:
-            element = tool.Ifc.get_entity(obj)
-            if not element:
-                continue
-            pset = ifcopenshell.util.element.get_pset(element, "BBIM_Array")
-            if not pset:
-                continue
-            array_parents.add(ifc_file.by_guid(pset["Parent"]))
-
-        for array_parent in array_parents:
+        plan, _ = compute_array_dismantle_plan(set(context.selected_objects), ifc_file)
+        for array_parent, layer_indices in plan.items():
             array_parent_obj = tool.Ifc.get_object(array_parent)
-            data = [(i, data) for i, data in enumerate(tool.Blender.Modifier.Array.get_modifiers_data(array_parent))]
-            # Parents picked directly are dismantled across every layer so the
-            # parent can be deleted in the main loop without leaving children
-            # pointing at a dead Parent GlobalId.
-            full_dismantle = array_parent_obj in selected_objects
-            # NOTE: there is a way to remove arrays more precisely but it's more complex
-            for i, modifier_data in reversed(data):
-                children = set(tool.Blender.Modifier.Array.get_children_objects(modifier_data))
-                if full_dismantle or children.issubset(selected_objects):
-                    with context.temp_override(active_object=array_parent_obj):
-                        bpy.ops.bim.remove_array(item=i)
-                else:
-                    break  # allows to remove only n last layers of an array
+            for i in layer_indices:
+                with context.temp_override(active_object=array_parent_obj):
+                    bpy.ops.bim.remove_array(item=i)
 
 
 class SelectedIdsData(NamedTuple):
@@ -1196,7 +1233,7 @@ class OverrideOutlinerDelete(bpy.types.Operator, tool.Ifc.Operator):
             self.is_batch = calc_delete_is_batch(ifc_file, context)
             # Flatten the Outliner selection (collections / other IDs) to objects.
             selected = self.get_selected_ids_data(context).objects
-            array_dialog = _maybe_open_array_dialog(self, context, selected)
+            array_dialog = _maybe_open_array_dialog(self, context, selected, ifc_file)
             if array_dialog is not None:
                 return array_dialog
             if self.is_batch:
@@ -1348,11 +1385,14 @@ class OverrideDuplicateMove(bpy.types.Operator):
                 if parent_aggregate:
                     parent_aggregates[element] = parent_aggregate
 
+        tool.Duplicate.consume_warnings()  # drop anything buffered by an earlier internal flow
         old_to_new, new_active_obj = tool.Geometry.duplicate_ifc_objects(
             expanded_objects,
             linked=linked,
             active_object=context.active_object,
         )
+        for warning in tool.Duplicate.consume_warnings():
+            self.report({"WARNING"}, warning)
 
         # Restore parent aggregate relationships, but only for parents that were NOT duplicated
         for old_elem, new_elems in old_to_new.items():
@@ -2332,6 +2372,8 @@ class OverrideEscape(bpy.types.Operator):
             bpy.ops.bim.hide_all_openings()
         elif tool.Aggregate.get_aggregate_props().in_aggregate_mode:
             bpy.ops.bim.disable_aggregate_mode()
+        elif preview_base.try_cancel_active_preview(context):
+            pass
         elif active_object := context.active_object:
             if tool.Blender.Modifier.try_canceling_editing_modifier_parameters_or_path(active_object):
                 pass
@@ -2594,9 +2636,9 @@ class OverrideModeSetObject(bpy.types.Operator, tool.Ifc.Operator):
                     profile = tool.Ifc.get().by_id(profile_id)
                     if tool.Ifc.get_object(profile):  # We are editing an arbitrary profile
                         bpy.ops.bim.edit_arbitrary_profile()
-                elif tool.Blender.Modifier.is_railing(element):
+                elif tool.Parametric.is_railing(element):
                     bpy.ops.bim.finish_editing_railing_path()
-                elif tool.Blender.Modifier.is_roof(element):
+                elif tool.Parametric.is_roof(element):
                     bpy.ops.bim.finish_editing_roof_path()
                 elif tool.Model.get_usage_type(element) == "PROFILE":
                     bpy.ops.bim.edit_extrusion_axis()
@@ -3034,7 +3076,7 @@ class DirectProfileEdit(bpy.types.Operator, tool.Ifc.Operator):
                 return bpy.ops.bim.edit_extrusion_axis()
 
             # Otherwise, we're editing a profile
-            body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            body = tool.Geometry.get_body_representation(element)
             if body:
                 body = ifcopenshell.util.representation.resolve_representation(body)
                 extrusion = tool.Model.get_extrusion(body)
@@ -3093,7 +3135,7 @@ class DirectProfileEdit(bpy.types.Operator, tool.Ifc.Operator):
 
         # Check if this is an element with an extrusion profile (LAYER3, etc)
         try:
-            body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            body = tool.Geometry.get_body_representation(element)
             if body:
                 body = ifcopenshell.util.representation.resolve_representation(body)
                 extrusion = tool.Model.get_extrusion(body)

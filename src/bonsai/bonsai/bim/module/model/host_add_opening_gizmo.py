@@ -46,7 +46,7 @@ def is_supported_host(element) -> bool:
     IfcSlab / IfcRoof qualifies regardless of parametric modifier state."""
     if element is None:
         return False
-    return tool.Blender.Modifier.is_wall(element) or element.is_a("IfcSlab") or element.is_a("IfcRoof")
+    return tool.Parametric.is_wall(element) or element.is_a("IfcSlab") or element.is_a("IfcRoof")
 
 
 def _world_aabb_z(obj: bpy.types.Object) -> tuple[float, float]:
@@ -118,7 +118,7 @@ class GizmoHostAddOpening(bpy.types.GizmoGroup, WallGeomCachedBillboardingMixin)
         if not element:
             return
 
-        if tool.Blender.Modifier.is_wall(element):
+        if tool.Parametric.is_wall(element):
             world_pos = wall_anchor(context, self, host_obj, other)
         else:
             world_pos = layer3_anchor(host_obj, other)

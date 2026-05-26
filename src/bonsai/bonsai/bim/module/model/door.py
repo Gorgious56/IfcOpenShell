@@ -18,7 +18,6 @@
 
 
 import collections.abc
-import json
 from typing import TYPE_CHECKING
 
 import bmesh
@@ -39,7 +38,7 @@ from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.wall_offset_gizmos import WALL_OFFSET_GIZMO_CONFIGS
 from bonsai.bim.module.model.window import create_bm_box, create_bm_window
-from bonsai.bim.parametric_lifecycle import FeatureModifierEditMixin
+from bonsai.bim.parametric_lifecycle import FeatureModifierEditMixin, PickTypeMixin
 from bonsai.tool.cad import WELD_TOLERANCE
 
 if TYPE_CHECKING:
@@ -165,7 +164,7 @@ def update_door_modifier_representation(obj: bpy.types.Object) -> None:
         element.OperationType = props.door_type
 
     # occurrences attributes
-    occurrences = tool.Ifc.get_all_element_occurrences(element)
+    occurrences = tool.Array.get_parametric_propagation_targets(element)
     for occurrence in occurrences:
         occurrence.OverallWidth = props.overall_width / si_conversion
         occurrence.OverallHeight = props.overall_height / si_conversion
@@ -553,16 +552,7 @@ class AddDoor(bpy.types.Operator, tool.Ifc.Operator):
 
         door_data["lining_properties"] = lining_props
         door_data["panel_properties"] = panel_props
-        pset = tool.Pset.get_element_pset(element, "BBIM_Door")
-
-        if not pset:
-            pset = ifcopenshell.api.pset.add_pset(tool.Ifc.get(), product=element, name="BBIM_Door")
-
-        ifcopenshell.api.pset.edit_pset(
-            tool.Ifc.get(),
-            pset=pset,
-            properties={"Data": tool.Ifc.get().createIfcText(json.dumps(door_data, default=list))},
-        )
+        tool.Pset.write_bbim_data(element, "BBIM_Door", door_data)
         update_door_modifier_representation(obj)
 
     def _execute(self, context: bpy.types.Context) -> set[str]:  # noqa: ARG002
@@ -586,7 +576,7 @@ class _DoorEditMixin(FeatureModifierEditMixin):
 
     @classmethod
     def _is_element_type(cls, element):
-        return tool.Blender.Modifier.is_door(element)
+        return tool.Parametric.is_door(element)
 
     @classmethod
     def _get_props(cls, obj: bpy.types.Object):
@@ -597,34 +587,19 @@ class _DoorEditMixin(FeatureModifierEditMixin):
         update_door_modifier_representation(obj)
 
 
-class CancelEditingDoor(_DoorEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.cancel_editing_door"
-    bl_label = "Cancel Editing Door on Selected Objects"
-    bl_description = "Cancel editing and revert door parameters to their previous values"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        return self._cancel_targets(context)
-
-
-class FinishEditingDoor(_DoorEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.finish_editing_door"
-    bl_label = "Finish Editing Door on Selected Objects"
-    bl_description = "Apply changes and finish editing door parameters"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        return self._finish_targets(context)
-
-
-class EnableEditingDoor(_DoorEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.enable_editing_door"
-    bl_label = "Enable Editing Door on Selected Objects"
-    bl_description = "Enter edit mode to modify door parameters interactively"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context: bpy.types.Context) -> set[str]:
-        return self._enable_targets(context)
+EnableEditingDoor, FinishEditingDoor, CancelEditingDoor = tool.Parametric.build_edit_lifecycle(
+    "door",
+    _DoorEditMixin,
+    labels=(
+        ("Enable Editing Door on Selected Objects", "Enter edit mode to modify door parameters interactively"),
+        ("Finish Editing Door on Selected Objects", "Apply changes and finish editing door parameters"),
+        (
+            "Cancel Editing Door on Selected Objects",
+            "Cancel editing and revert door parameters to their previous values",
+        ),
+    ),
+    module_name=__name__,
+)
 
 
 class RemoveDoor(bpy.types.Operator, tool.Ifc.Operator):
@@ -635,7 +610,7 @@ class RemoveDoor(bpy.types.Operator, tool.Ifc.Operator):
     def remove_door_on_object(self, obj: bpy.types.Object) -> None:
         element = tool.Ifc.get_entity(obj)
         assert element
-        if not tool.Blender.Modifier.is_door(element):
+        if not tool.Parametric.is_door(element):
             return
         props = tool.Model.get_door_props(obj)
         props.is_editing = False
@@ -692,7 +667,7 @@ class ToggleDoorSwing(bpy.types.Operator, tool.Ifc.Operator):
         if not element:
             return {"CANCELLED"}
 
-        is_door = tool.Blender.Modifier.is_door(element)
+        is_door = tool.Parametric.is_door(element)
 
         if self.flip_geometry:
             tool.Geometry.flip_object(obj, self.flip_local_axes)
@@ -706,14 +681,14 @@ class ToggleDoorSwing(bpy.types.Operator, tool.Ifc.Operator):
         return {"FINISHED"}
 
 
-class PickDoorType(bpy.types.Operator, tool.Ifc.Operator, gizmo.PickTypeMixin):
+class PickDoorType(bpy.types.Operator, tool.Ifc.Operator, PickTypeMixin):
     """Pick a door type from a popup menu."""
 
     bl_idname = "bim.pick_door_type"
     bl_label = "Pick Door Type"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = tool.Blender.Modifier.is_door
+    element_checker = tool.Parametric.is_door
     props_getter = tool.Model.get_door_props
     type_literal = tool.Model.DoorType
     type_attr = "door_type"
@@ -847,7 +822,7 @@ class GizmoDoorEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
 
     @classmethod
     def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
-        return tool.Blender.Modifier.is_door(element)
+        return tool.Parametric.is_door(element)
 
     def get_icon_y_extent(self, props: "BIMDoorProperties") -> tuple[float, float]:
         """Get Y extents for door icon positioning.

@@ -231,7 +231,7 @@ class FilledOpeningGenerator:
         opening = filling.FillsVoids[0].RelatingOpeningElement
         voided_element = opening.VoidsElements[0].RelatingBuildingElement
 
-        opening_rep = ifcopenshell.util.representation.get_representation(opening, "Model", "Body", "MODEL_VIEW")
+        opening_rep = tool.Geometry.get_body_representation(opening)
         ifcopenshell.api.geometry.unassign_representation(tool.Ifc.get(), product=opening, representation=opening_rep)
         ifcopenshell.api.geometry.remove_representation(tool.Ifc.get(), representation=opening_rep)
 

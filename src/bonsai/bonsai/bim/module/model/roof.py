@@ -16,7 +16,6 @@
 # You should have received a copy of the GNU General Public License
 # along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
 
-import json
 from math import atan2, cos, degrees, pi, radians, tan
 from typing import Any, Literal, Union
 
@@ -36,7 +35,7 @@ from bonsai.bim.module.drawing import gizmos as gizmo
 from bonsai.bim.module.drawing.gizmos import DimensionGizmoConfig
 from bonsai.bim.module.model.data import RoofData, refresh
 from bonsai.bim.module.model.decorator import ProfileDecorator
-from bonsai.bim.parametric_lifecycle import PathPreservingEditMixin
+from bonsai.bim.parametric_lifecycle import CycleTypeMixin, PathPreservingEditMixin
 from bonsai.tool.cad import WELD_TOLERANCE
 
 # Roof generation tolerances.
@@ -448,11 +447,7 @@ def update_roof_modifier_ifc_data(context: bpy.types.Context) -> None:
 
 
 def update_bbim_roof_pset(element: ifcopenshell.entity_instance, roof_data: dict[str, Any]) -> None:
-    pset = tool.Pset.get_element_pset(element, "BBIM_Roof")
-    if not pset:
-        pset = ifcopenshell.api.pset.add_pset(tool.Ifc.get(), product=element, name="BBIM_Roof")
-    roof_data = tool.Ifc.get().createIfcText(json.dumps(roof_data, default=list))
-    ifcopenshell.api.pset.edit_pset(tool.Ifc.get(), pset=pset, properties={"Data": roof_data})
+    tool.Pset.write_bbim_data(element, "BBIM_Roof", roof_data)
 
 
 def update_roof_modifier_bmesh(obj: bpy.types.Object) -> None:
@@ -628,7 +623,7 @@ class _RoofEditMixin(PathPreservingEditMixin):
 
     @classmethod
     def _is_element_type(cls, element):
-        return tool.Blender.Modifier.is_roof(element)
+        return tool.Parametric.is_roof(element)
 
     @classmethod
     def _get_props(cls, obj: bpy.types.Object):
@@ -647,31 +642,16 @@ class _RoofEditMixin(PathPreservingEditMixin):
         update_roof_modifier_bmesh(obj)
 
 
-class EnableEditingRoof(_RoofEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.enable_editing_roof"
-    bl_label = "Enable Editing Roof"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._enable_targets(context)
-
-
-class CancelEditingRoof(_RoofEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.cancel_editing_roof"
-    bl_label = "Cancel Editing Roof"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._cancel_targets(context)
-
-
-class FinishEditingRoof(_RoofEditMixin, bpy.types.Operator, tool.Ifc.Operator):
-    bl_idname = "bim.finish_editing_roof"
-    bl_label = "Finish Editing Roof"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def _execute(self, context):
-        return self._finish_targets(context)
+EnableEditingRoof, FinishEditingRoof, CancelEditingRoof = tool.Parametric.build_edit_lifecycle(
+    "roof",
+    _RoofEditMixin,
+    labels=(
+        ("Enable Editing Roof", ""),
+        ("Finish Editing Roof", ""),
+        ("Cancel Editing Roof", ""),
+    ),
+    module_name=__name__,
+)
 
 
 # Fixed horizontal run for the slope gizmo: the draggable value is the
@@ -682,14 +662,14 @@ _ROOF_SLOPE_REFERENCE_RUN = 1.0
 _ROOF_MAX_SLOPE_ANGLE = pi / 2 - 0.001
 
 
-class CycleRoofGenerationMethod(bpy.types.Operator, tool.Ifc.Operator, gizmo.CycleTypeMixin):
+class CycleRoofGenerationMethod(bpy.types.Operator, tool.Ifc.Operator, CycleTypeMixin):
     """Cycle the roof generation method (HEIGHT ↔ ANGLE). Shift+click cycles in reverse."""
 
     bl_idname = "bim.cycle_roof_generation_method"
     bl_label = "Cycle Roof Generation Method"
     bl_options = {"REGISTER", "UNDO"}
 
-    element_checker = tool.Blender.Modifier.is_roof
+    element_checker = tool.Parametric.is_roof
     props_getter = tool.Model.get_roof_props
     type_literal = tool.Model.RoofGenerationMethod
     type_attr = "generation_method"
@@ -746,7 +726,7 @@ class GizmoRoofEdition(bpy.types.GizmoGroup, gizmo.BaseParametricGizmoGroup):
 
     @classmethod
     def is_element_type(cls, element: ifcopenshell.entity_instance) -> bool:
-        return tool.Blender.Modifier.is_roof(element)
+        return tool.Parametric.is_roof(element)
 
     def _get_footprint_extents(self) -> tuple[float, float, float, float, float] | None:
         """Footprint anchor in object-local SI units.

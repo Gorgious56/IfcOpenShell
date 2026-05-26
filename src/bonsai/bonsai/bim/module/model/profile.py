@@ -516,7 +516,7 @@ class DumbProfileJoiner:
                 return (position.Axis.DirectionRatios, position.RefDirection.DirectionRatios)
             return ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
 
-        old_body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        old_body = tool.Geometry.get_body_representation(element)
         new_body = ifcopenshell.api.geometry.add_profile_representation(
             tool.Ifc.get(),
             context=self.body_context,
@@ -1020,7 +1020,7 @@ class EnableEditingExtrusionAxis(bpy.types.Operator, tool.Ifc.Operator):
             position = obj.matrix_world.copy()
             tool.Model.import_axis(axis.Items[0], obj=obj)
         else:
-            body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            body = tool.Geometry.get_body_representation(element)
             extrusion = tool.Model.get_extrusion(body)
 
             if extrusion.Position:
@@ -1045,7 +1045,7 @@ def disable_editing_extrusion_axis(context):
 
     obj = context.active_object
     element = tool.Ifc.get_entity(obj)
-    body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+    body = tool.Geometry.get_body_representation(element)
 
     bonsai.core.geometry.switch_representation(
         tool.Ifc,
@@ -1107,7 +1107,7 @@ class EditExtrusionAxis(bpy.types.Operator, tool.Ifc.Operator):
 
         matrix.translation = start
 
-        body = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        body = tool.Geometry.get_body_representation(element)
         bonsai.core.geometry.switch_representation(
             tool.Ifc,
             tool.Geometry,

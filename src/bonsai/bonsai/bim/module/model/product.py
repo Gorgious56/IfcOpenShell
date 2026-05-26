@@ -438,7 +438,7 @@ class AddOccurrence(bpy.types.Operator, tool.Ifc.Operator):
         if existing_context:
             representation = ifcopenshell.util.representation.get_representation(element, existing_context)
         else:
-            representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+            representation = tool.Geometry.get_body_representation(element)
         if not representation and element.Representation:
             representation = element.Representation.Representations[0]
 
@@ -817,7 +817,7 @@ def regenerate_profile_usage(usecase_path, ifc_file, settings):
         obj = tool.Ifc.get_object_by_identifier(element.id())
         if not obj:
             continue
-        representation = ifcopenshell.util.representation.get_representation(element, "Model", "Body", "MODEL_VIEW")
+        representation = tool.Geometry.get_body_representation(element)
         if representation:
             bonsai.core.geometry.switch_representation(
                 tool.Ifc,

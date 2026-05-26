@@ -155,6 +155,7 @@ classes = (
     gizmos.GizmoArrayLayerIndicator,
     gizmos.GizmoMerge,
     gizmos.GizmoSplit,
+    gizmos.GizmoUnjoin,
     gizmos.GizmoExtend,
     gizmos.GizmoExtendVertical,
     gizmos.GizmoOffsetExterior,

@@ -238,7 +238,7 @@ class BIM_PT_array(bpy.types.Panel):
             data_dict = ArrayData.data["parameters"]["data_dict"]
             element = tool.Ifc.get_entity(obj)
             has_host = element is not None and tool.Spatial.get_host_element(element) is not None
-            # Element-wide triad UX surfaces only for single-layer arrays — that's
+            # Element-wide edit-lifecycle UX surfaces only for single-layer arrays — that's
             # the scope the parametric registry / gizmos commit to. Multi-layer
             # arrays continue to use the per-item flow below.
             if len(data_dict) == 1 and props.is_editing:
@@ -253,7 +253,7 @@ class BIM_PT_array(bpy.types.Panel):
                 row.prop(props, "use_local_space")
                 if has_host:
                     row = box.row(align=True)
-                    row.prop(props, "mirror_to_host")
+                    row.prop(props, "per_child_opening")
                 col = box.column()
                 row = col.row(align=True)
                 row.prop(props, "x")
@@ -281,7 +281,7 @@ class BIM_PT_array(bpy.types.Panel):
                     row.prop(props, "use_local_space")
                     if has_host:
                         row = box.row(align=True)
-                        row.prop(props, "mirror_to_host")
+                        row.prop(props, "per_child_opening")
                     col = box.column()
                     row = col.row(align=True)
                     row.prop(props, "x")
@@ -299,7 +299,7 @@ class BIM_PT_array(bpy.types.Panel):
                     name = f"{array['count']} Items ({array.get('method', 'OFFSET').capitalize()})"
                     row.label(text=name, icon="MOD_ARRAY")
                     if len(data_dict) == 1:
-                        # Element-wide triad entry; surfaces only for the
+                        # Element-wide edit-lifecycle entry; surfaces only for the
                         # single-layer scope the gizmo group also gates on.
                         row.operator("bim.enable_editing_array", icon="GREASEPENCIL", text="")
                     else:
@@ -309,11 +309,11 @@ class BIM_PT_array(bpy.types.Panel):
                     apply_button.enabled = i == len(data_dict) - 1
                     row.operator("bim.remove_array", icon="X", text="").item = i
                     if has_host:
-                        mirrors = array.get("mirror_to_host", True)
+                        per_child_opening = array.get("per_child_opening", array.get("mirror_to_host", True))
                         row = box.row(align=True)
                         row.label(
-                            text="Host: Mirror" if mirrors else "Host: Free",
-                            icon="MOD_BOOLEAN" if mirrors else "X",
+                            text="Host: Per-child opening" if per_child_opening else "Host: Single opening",
+                            icon="MOD_BOOLEAN" if per_child_opening else "X",
                         )
                     row = box.row(align=True)
                     icon = "EMPTY_ARROWS" if array.get("use_local_space", False) else "EMPTY_AXIS"
@@ -401,7 +401,7 @@ class BIM_PT_wall(bpy.types.Panel):
         if not obj:
             return False
         element = tool.Ifc.get_entity(obj)
-        return bool(element) and tool.Blender.Modifier.is_wall(element)
+        return bool(element) and tool.Parametric.is_wall(element)
 
     def draw(self, context):
         obj = context.active_object
@@ -653,7 +653,7 @@ class BIM_PT_railing(bpy.types.Panel):
                 row.operator("bim.enable_editing_railing", icon="GREASEPENCIL", text="")
                 row.operator("bim.copy_railing_parameters", icon="COPYDOWN", text="")
                 row.operator("bim.enable_editing_railing_path", icon="ANIM", text="")
-                # TODO: should only be reachable inside ``is_editing == True`` — currently writes to IFC outside the edit triad.
+                # TODO: should only be reachable inside ``is_editing == True`` — currently writes to IFC outside the edit lifecycle.
                 row.operator("bim.flip_railing_path_order", icon="ARROW_LEFTRIGHT", text="")
                 row.operator("bim.remove_railing", icon="X", text="")
 

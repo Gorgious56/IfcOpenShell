@@ -440,7 +440,7 @@ class BIMArrayProperties(PropertyGroup):
     is_editing: bpy.props.BoolProperty(
         name="Is Editing",
         default=False,
-        description="True while an element-wide array edit is in progress (parametric triad).",
+        description="True while an element-wide array edit is in progress (parametric edit lifecycle).",
     )
     editing_item_index: bpy.props.IntProperty(
         default=-1,
@@ -460,12 +460,12 @@ class BIMArrayProperties(PropertyGroup):
         name="Method",
         default="OFFSET",
     )
-    mirror_to_host: bpy.props.BoolProperty(
-        name="Mirror to Host",
+    per_child_opening: bpy.props.BoolProperty(
+        name="Per-Child Opening",
         description=(
             "When the array parent fills a wall (or any voidable host), give each array child its own opening + "
-            "filling against the same host so the host is cut once per child. Disable for a free-floating array "
-            "that leaves the host uncut"
+            "filling pair so the host is cut once per child. Disable to leave the host uncut by the children — "
+            "only the parent's original opening remains"
         ),
         default=True,
     )
@@ -485,7 +485,7 @@ class BIMArrayProperties(PropertyGroup):
         z: float
         use_local_space: bool
         method: Literal["OFFSET", "DISTRIBUTE"]
-        mirror_to_host: bool
+        per_child_opening: bool
         sync_children: bool
         relating_array_object: Union[bpy.types.Object, None]
 
