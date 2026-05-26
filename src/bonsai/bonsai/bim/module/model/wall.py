@@ -2294,13 +2294,19 @@ def _apply_wall_extend_flips(
     props: "BIMWallProperties",
     billboard_rot: Matrix,
 ) -> None:
-    """Mirror the extend arrows so they point toward the wall body.
-    Extend-X: view-aware flip when the wall origin projects to screen-right.
-    Extend-Z: flip when the cursor sits below the wall top (click would shrink)."""
-    if gz is group.extend_x_gizmo and gizmo.should_flip_extend_arrow(
-        world_pos, mw @ Vector((props.anchor_x, 0.0, 0.0)), billboard_rot
-    ):
-        gz.matrix_basis = gz.matrix_basis @ gizmo.EXTEND_FLIP_MIRROR_X
+    """Mirror the wall's extend arrows so each points toward the end the click will move.
+
+    Extend-X: arrow points away from the wall endpoint that the operator would
+    keep fixed, accounting for the camera's screen-X orientation. Extend-Z:
+    arrow flips downward when the cursor sits below the wall top."""
+    if gz is group.extend_x_gizmo:
+        if props.length > 0 and cursor_local.x > props.anchor_x + props.length / 2:
+            reference_x = props.anchor_x
+        else:
+            reference_x = props.anchor_x + props.length
+        reference_world = mw @ Vector((reference_x, 0.0, 0.0))
+        if gizmo.should_flip_extend_arrow(world_pos, reference_world, billboard_rot):
+            gz.matrix_basis = gz.matrix_basis @ gizmo.EXTEND_FLIP_MIRROR_X
     elif gz is group.extend_z_gizmo and cursor_local.z < props.height - gizmo.EXTEND_FLIP_EPSILON:
         gz.matrix_basis = gz.matrix_basis @ gizmo.EXTEND_FLIP_MIRROR_Y
 

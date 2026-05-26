@@ -381,6 +381,7 @@ def _run_cursor_gizmos(
     screen_up=(0.0, 1.0, 0.0),
     billboard_rot=None,
     anchor_x=0.0,
+    length=2.0,
 ):
     """Drive ``_position_cursor_anchored_gizmos`` with a stub ``self``.
 
@@ -399,7 +400,7 @@ def _run_cursor_gizmos(
     extend_z = _icon()
     split = _icon()
 
-    props = SimpleNamespace(anchor_x=anchor_x, length=2.0, height=3.0, x_angle=0.0)
+    props = SimpleNamespace(anchor_x=anchor_x, length=length, height=3.0, x_angle=0.0)
 
     self_stub = SimpleNamespace(
         extend_x_gizmo=extend_x,
@@ -475,7 +476,7 @@ def test_should_flip_extend_arrow_returns_true_when_origin_is_screen_right():
     assert (
         should_flip_extend_arrow(
             gizmo_world=Vector((1.0, 0.0, 0.0)),
-            origin_world=Vector((2.0, 0.0, 0.0)),
+            reference_world=Vector((2.0, 0.0, 0.0)),
             billboard_rot=Matrix.Identity(4),
         )
         is True
@@ -491,7 +492,7 @@ def test_should_flip_extend_arrow_returns_false_when_origin_is_screen_left():
     assert (
         should_flip_extend_arrow(
             gizmo_world=Vector((2.0, 0.0, 0.0)),
-            origin_world=Vector((0.0, 0.0, 0.0)),
+            reference_world=Vector((0.0, 0.0, 0.0)),
             billboard_rot=Matrix.Identity(4),
         )
         is False
@@ -511,7 +512,7 @@ def test_should_flip_extend_arrow_holds_canonical_in_epsilon_deadband():
     assert (
         should_flip_extend_arrow(
             gizmo_world=Vector((1.0, 0.0, 0.0)),
-            origin_world=Vector((1.0 + tiny, 0.0, 0.0)),
+            reference_world=Vector((1.0 + tiny, 0.0, 0.0)),
             billboard_rot=Matrix.Identity(4),
         )
         is False
@@ -526,7 +527,7 @@ def test_should_flip_extend_arrow_responds_to_view_rotation():
 
     from bonsai.bim.module.drawing.gizmos import should_flip_extend_arrow
 
-    args = dict(gizmo_world=Vector((2.0, 0.0, 0.0)), origin_world=Vector((0.0, 0.0, 0.0)))
+    args = dict(gizmo_world=Vector((2.0, 0.0, 0.0)), reference_world=Vector((0.0, 0.0, 0.0)))
     # Identity view: origin screen-left → no flip.
     assert should_flip_extend_arrow(billboard_rot=Matrix.Identity(4), **args) is False
     # Rotate the camera 180° about world-Z — origin now projects to screen-right.
@@ -570,6 +571,61 @@ def test_cursor_gizmos_extend_z_no_mirror_when_above_wall_height():
         cursor_local=(1.0, 0.0, 4.0),  # above height (3.0)
     )
     assert extend_z.matrix_basis.col[1].y == pytest.approx(1.0)
+
+
+def test_cursor_gizmos_extend_x_points_to_origin_when_cursor_in_first_half():
+    """Cursor in the wall's first half → click moves the start → arrow points at the origin."""
+    extend_x, _, _ = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(0.5, 0.0, 3.5),
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(-1.0)
+
+
+def test_cursor_gizmos_extend_x_points_to_end_when_cursor_in_second_half():
+    """Cursor in the wall's second half → click moves the end → arrow keeps the canonical
+    orientation pointing at the end."""
+    extend_x, _, _ = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(1.5, 0.0, 3.5),
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(1.0)
+
+
+def test_cursor_gizmos_extend_x_midpoint_matches_operator_dispatch():
+    """At the exact midpoint the click moves the origin, so the arrow points at the origin too —
+    pinning the visual to the operator's strict-inequality threshold."""
+    extend_x, _, _ = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(1.0, 0.0, 3.5),
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(-1.0)
+
+
+def test_cursor_gizmos_extend_x_cursor_side_independent_of_view_rotation():
+    """Cursor-side reference selection and view-aware flip compose: same cursor side as the
+    first-half scenario but with a 180° view rotation flips the arrow back to canonical."""
+    import math
+
+    from mathutils import Matrix
+
+    extend_x, _, _ = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(0.5, 0.0, 3.5),
+        billboard_rot=Matrix.Rotation(math.pi, 4, "Z"),
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(1.0)
+
+
+def test_cursor_gizmos_extend_x_falls_back_to_origin_reference_when_length_zero():
+    """Degenerate wall (non-positive length) keeps the historical origin reference rather than
+    routing through the new cursor-side branch."""
+    extend_x, _, _ = _run_cursor_gizmos(
+        top_down=False,
+        cursor_local=(0.0, 0.0, 3.5),
+        length=0.0,
+    )
+    assert extend_x.matrix_basis.col[0].x == pytest.approx(1.0)
 
 
 # ----------------------------------------------------------------------------

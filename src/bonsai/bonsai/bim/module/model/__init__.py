@@ -360,9 +360,6 @@ def register():
     # Install WallGizmoPreviewDecorator from load_post — registering here binds
     # to a _RestrictContext that crashes on first redraw.
 
-    # Bend preview's ESC rides on bim.override_escape; OverrideEscape checks
-    # BIMPreviewProperties.bend.is_active before the per-object cancel branch.
-
     workspace.load_custom_icons()
 
 

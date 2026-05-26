@@ -524,3 +524,79 @@ class PickTypeMixin(TypeAccessorBase):
         props = self.props_getter(obj)
         setattr(props, self.type_attr, self.value)
         return {"FINISHED"}
+
+
+# --- Undo / redo resync for active parametric drafts -------------------------
+#
+# Blender's undo restores PropertyGroup field values but does not refire
+# their ``update`` callbacks. Gizmo dimension widgets read field values
+# live, so they snap back to the restored numbers — but the preview mesh,
+# which is rebuilt only inside the update callback, stays at the pre-undo
+# geometry. The result is a visible desync (gizmo reads X, preview shows Y).
+#
+# Per-type entries map ``ParametricObject.name`` to the regenerator the
+# update callback would have called. Adding a parametric type that suffers
+# the same Ctrl+Z desync is one tuple entry. Other types whose preview is
+# IFC-derived (door / window / array …) leave themselves out — undo
+# restoring the IFC entity is enough for those.
+
+
+def _wall_undo_regenerator(obj: bpy.types.Object) -> None:
+    from bonsai.bim.module.model.wall import regenerate_wall_mesh_from_props
+
+    regenerate_wall_mesh_from_props(obj)
+
+
+def _stair_undo_regenerator(obj: bpy.types.Object) -> None:
+    from bonsai.bim.module.model.stair import regenerate_stair_mesh
+
+    regenerate_stair_mesh(obj)
+
+
+def _roof_undo_regenerator(obj: bpy.types.Object) -> None:
+    from bonsai.bim.module.model.roof import update_roof_modifier_bmesh
+
+    update_roof_modifier_bmesh(obj)
+
+
+def _pipe_segment_undo_regenerator(obj: bpy.types.Object) -> None:
+    from bonsai.bim.module.model.mep import regenerate_pipe_segment_mesh_from_props
+
+    regenerate_pipe_segment_mesh_from_props(obj)
+
+
+def _duct_segment_undo_regenerator(obj: bpy.types.Object) -> None:
+    from bonsai.bim.module.model.mep import regenerate_duct_segment_mesh_from_props
+
+    regenerate_duct_segment_mesh_from_props(obj)
+
+
+UNDO_REGENERATORS: dict[str, Callable[[bpy.types.Object], None]] = {
+    "wall": _wall_undo_regenerator,
+    "stair": _stair_undo_regenerator,
+    "roof": _roof_undo_regenerator,
+    "pipe_segment": _pipe_segment_undo_regenerator,
+    "duct_segment": _duct_segment_undo_regenerator,
+}
+
+
+def resync_parametric_drafts_after_undo() -> None:
+    """Re-render preview meshes for every parametric draft currently active.
+
+    Walks all objects, skips any that are not in a registered parametric
+    edit, dispatches to the per-type regenerator in ``UNDO_REGENERATORS``.
+    A type without an entry is left alone — its preview is either already
+    correct (IFC-derived) or has no draft preview mesh."""
+    for obj in bpy.data.objects:
+        feature = tool.Parametric.is_object_editing(obj)
+        if feature is None:
+            continue
+        regenerator = UNDO_REGENERATORS.get(feature.name)
+        if regenerator is None:
+            continue
+        regenerator(obj)
+    screen = getattr(bpy.context, "screen", None)
+    if screen is not None:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()

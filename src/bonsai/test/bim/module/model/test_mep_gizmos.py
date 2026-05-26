@@ -1753,7 +1753,7 @@ def test_mep_extend_gizmo_no_mirror_when_origin_is_screen_left():
     extend = _run_mep_refresh_element_specific(cursor_local=(0.0, 0.0, 2.0))
     # MEP segment extrudes along local Z; with identity view the screen-X delta
     # is the world-Z delta projected by billboard_rot.transposed() = identity →
-    # origin_world - gizmo_world has Z component only, X component is zero, so
+    # reference_world - gizmo_world has Z component only, X component is zero, so
     # no flip is triggered.
     assert extend.matrix_basis is not None
     assert extend.matrix_basis.col[0].x == pytest.approx(1.0)

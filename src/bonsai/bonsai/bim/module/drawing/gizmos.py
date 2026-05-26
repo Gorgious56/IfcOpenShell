@@ -1675,12 +1675,12 @@ EXTEND_FLIP_MIRROR_Y = Matrix.Diagonal(Vector((1.0, -1.0, 1.0, 1.0)))
 
 def should_flip_extend_arrow(
     gizmo_world: Vector,
-    origin_world: Vector,
+    reference_world: Vector,
     billboard_rot: Matrix,
 ) -> bool:
-    """True when ``origin_world`` projects to screen-right of ``gizmo_world`` —
-    mirror the extend arrow's local X so it points toward the element's body."""
-    screen_delta = billboard_rot.transposed() @ (origin_world - gizmo_world)
+    """True when ``reference_world`` projects to screen-right of ``gizmo_world`` —
+    mirror the extend arrow's local X so it points away from the reference in screen space."""
+    screen_delta = billboard_rot.transposed() @ (reference_world - gizmo_world)
     return screen_delta.x > EXTEND_FLIP_EPSILON
 
 
