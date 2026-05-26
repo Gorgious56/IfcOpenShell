@@ -89,11 +89,6 @@ def update_railing_modifier_ifc_data(context: bpy.types.Context) -> None:
     tool.Pset.upsert_pset(element, "Pset_RailingCommon", {"Height": props.height})
 
     if props.railing_type == "WALL_MOUNTED_HANDRAIL":
-        # Build the parametric rep first to populate ``obj.data`` with the
-        # kernel-tessellated bmesh; the trailing ``add_body_representation``
-        # then overwrites the committed body with a faceted version. The
-        # parametric rep uses ``IfcSweptDiskSolid`` which is not portable
-        # across IFC geometry kernels at typical import tolerances.
         body = ifcopenshell.util.representation.get_context(ifc_file, "Model", "Body", "MODEL_VIEW")
         pset_data = tool.Model.get_modeling_bbim_pset_data(obj, "BBIM_Railing")
         path_data = pset_data["data_dict"]["path_data"]
@@ -122,7 +117,8 @@ def update_railing_modifier_ifc_data(context: bpy.types.Context) -> None:
             bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
             tool.Blender.apply_bmesh(mesh, bm)
 
-    tool.Model.add_body_representation(obj)
+    elif props.railing_type == "FRAMELESS_PANEL":
+        tool.Model.add_body_representation(obj)
 
 
 def update_bbim_railing_pset(element: ifcopenshell.entity_instance, railing_data: dict[str, Any]) -> None:
@@ -422,6 +418,7 @@ class AddRailing(bpy.types.Operator, tool.Ifc.Operator):
         refresh()
         update_railing_modifier_bmesh(context)
         update_railing_modifier_ifc_data(context)
+        tool.Model.add_body_representation(obj)
 
 
 class CopyRailingParameters(bpy.types.Operator, tool.Ifc.Operator):
