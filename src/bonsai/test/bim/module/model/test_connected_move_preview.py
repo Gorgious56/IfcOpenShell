@@ -376,6 +376,29 @@ class TestLifecycle:
             bpy.ops.bim.post_connected_move_finalize()
             assert registered, "Second unsafe-pair detection MUST schedule recalc"
 
+    def test_pre_step_bails_on_multi_wall_selection(self, two_connected_walls):
+        """PoC scope-gate: when more than one IFC wall with connections is
+        in the moved set, the preview must NOT activate. Falls back to
+        vanilla Blender behaviour for multi-wall drags."""
+        a_obj, b_obj, a_el, b_el = two_connected_walls
+        bpy.context.view_layer.objects.active = a_obj
+        a_obj.select_set(True)
+        b_obj.select_set(True)
+        entity_map = {id(a_obj): a_el, id(b_obj): b_el}
+
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for p in _patched_tools(entity_map):
+                stack.enter_context(p)
+            stack.enter_context(patch.object(cmp, "sync_uncommitted_moves", side_effect=lambda objs: None))
+            bpy.ops.bim.pre_connected_move_preview()
+
+        cm = bpy.context.scene.BIMPreviewProperties.connected_move
+        assert cm.is_active is False
+        assert not cmp.WallConnectionPreviewDecorator.is_installed
+        assert cmp._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
+
     def test_pre_step_bails_when_addon_pref_disabled(self, two_connected_walls):
         """The global toggle short-circuits ``execute`` before any state
         mutation. The macro must still see ``{'FINISHED'}`` so the

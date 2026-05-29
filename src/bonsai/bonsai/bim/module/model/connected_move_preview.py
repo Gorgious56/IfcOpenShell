@@ -371,7 +371,10 @@ class PreConnectedMovePreview(Operator):
         props = preview.connected_move
 
         moved_walls = self._collect_walls_with_connections(context.selected_objects)
-        if not moved_walls:
+        # PoC scope: only activate on single-wall transforms. Multi-wall
+        # drags fall back to vanilla Blender + manual Update Geometry to
+        # avoid surprising users of existing multi-wall edit workflows.
+        if len(moved_walls) != 1:
             return {"FINISHED"}
 
         sync_uncommitted_moves(moved_walls)
