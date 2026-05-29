@@ -116,6 +116,51 @@ class TestProjectAxisIntersection:
         assert result[2] == pytest.approx(2.0)
 
 
+class TestIsUnsafeExtend:
+    """Pin: an EXTEND projection more than ``max_ratio`` × the original
+    axis length flags as unsafe; TRIM is always safe; degenerate segments
+    fail-closed."""
+
+    def test_trim_case_is_always_safe(self):
+        # Intersection inside the (0,0,0)→(10,0,0) axis.
+        assert not subject.is_unsafe_extend((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (3.0, 0.0, 0.0), max_ratio=2.0)
+
+    def test_extend_within_ratio_is_safe(self):
+        # 15m past the near endpoint of a 10m wall: 1.5× extension under 10× threshold.
+        assert not subject.is_unsafe_extend((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (-15.0, 0.0, 0.0), max_ratio=10.0)
+
+    def test_extend_beyond_ratio_is_unsafe(self):
+        # 50m past the near endpoint of a 1m wall: 50× extension above 10× threshold.
+        assert subject.is_unsafe_extend((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (-50.0, 0.0, 0.0), max_ratio=10.0)
+
+    def test_degenerate_segment_is_unsafe(self):
+        # Zero-length input fails closed rather than dividing by zero downstream.
+        assert subject.is_unsafe_extend((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), max_ratio=10.0)
+
+
+class TestClassifyAxisDelta:
+    """Pin: ``trim`` when intersection sits inside the segment; ``extend``
+    when it sits past either endpoint; ``None`` for a degenerate segment."""
+
+    def test_intersection_inside_is_trim(self):
+        assert subject.classify_axis_delta((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (3.0, 0.0, 0.0)) == "trim"
+
+    def test_intersection_past_near_endpoint_is_extend(self):
+        assert subject.classify_axis_delta((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (-2.0, 0.0, 0.0)) == "extend"
+
+    def test_intersection_past_far_endpoint_is_extend(self):
+        assert subject.classify_axis_delta((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (15.0, 0.0, 0.0)) == "extend"
+
+    def test_degenerate_segment_returns_none(self):
+        assert subject.classify_axis_delta((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)) is None
+
+
+class TestNearestAxisEndpoint:
+    def test_returns_closer_endpoint(self):
+        assert subject.nearest_axis_endpoint((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (1.0, 0.0, 0.0)) == (0.0, 0.0, 0.0)
+        assert subject.nearest_axis_endpoint((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (9.0, 0.0, 0.0)) == (10.0, 0.0, 0.0)
+
+
 class TestSlopeRoundTrip:
     def test_zero_angle_zero_displacement(self):
         assert subject.displacement_from_x_angle(3.0, 0.0) == pytest.approx(0.0)

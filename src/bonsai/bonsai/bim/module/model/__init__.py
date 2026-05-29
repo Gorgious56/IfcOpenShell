@@ -62,6 +62,8 @@ classes = (
     array.Input3DCursorXArray,
     array.Input3DCursorYArray,
     array.Input3DCursorZArray,
+    array.EnableEditingParametric,
+    array.AddArrayFromFeatureEdit,
     product.AddDefaultType,
     product.AddEmptyType,
     product.AddOccurrence,
@@ -93,6 +95,7 @@ classes = (
     wall.GizmoWallEdition,
     wall.GizmoWallExtendVertically,
     wall.GizmoWallJoinIntersection,
+    wall.GizmoWallUnjoinSingle,
     wall.JoinWallsIntersection,
     wall.MergeWall,
     wall.OffsetWalls,
@@ -101,6 +104,7 @@ classes = (
     wall.SplitWall,
     wall.SplitWallAtCursor,
     wall.ToggleWallOpenings,
+    wall.UnjoinWallPathConnection,
     wall.UnjoinWalls,
     opening.AddBoolean,
     opening.CloneOpening,
@@ -302,7 +306,6 @@ def register():
 
     bpy.types.VIEW3D_MT_add.prepend(ui.add_menu)
     bpy.app.handlers.load_post.append(handler.load_post)
-    bpy.app.handlers.load_post.append(connected_move_preview._clear_unsafe_pair_memory)
     bpy.app.handlers.undo_post.append(connected_move_preview._discard_on_undo_redo)
     bpy.app.handlers.redo_post.append(connected_move_preview._discard_on_undo_redo)
 
@@ -328,7 +331,6 @@ def unregister():
 
     bpy.app.handlers.load_post.remove(handler.load_post)
     for handler_list, fn in (
-        (bpy.app.handlers.load_post, connected_move_preview._clear_unsafe_pair_memory),
         (bpy.app.handlers.undo_post, connected_move_preview._discard_on_undo_redo),
         (bpy.app.handlers.redo_post, connected_move_preview._discard_on_undo_redo),
     ):

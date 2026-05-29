@@ -42,7 +42,7 @@ import bpy
 import pytest
 from mathutils import Vector
 
-from bonsai.bim.module.model import connected_move_preview as cmp
+from bonsai.bim.module.model import connected_move_preview as cmp_mod
 from bonsai.bim.module.model import preview_base
 
 pytestmark = pytest.mark.wall
@@ -57,46 +57,19 @@ def _require_real_bpy():
 @pytest.fixture(autouse=True)
 def _clean_preview_state():
     """Each test starts with no decorator registered and no watcher armed."""
-    if cmp.WallConnectionPreviewDecorator.is_installed:
-        cmp.WallConnectionPreviewDecorator.uninstall()
-    cmp._uninstall_cancel_watcher()
-    cmp._clear_preview_state(bpy.context.scene)
+    if cmp_mod.WallConnectionPreviewDecorator.is_installed:
+        cmp_mod.WallConnectionPreviewDecorator.uninstall()
+    cmp_mod._uninstall_cancel_watcher()
+    cmp_mod._clear_preview_state(bpy.context.scene)
     yield
-    if cmp.WallConnectionPreviewDecorator.is_installed:
-        cmp.WallConnectionPreviewDecorator.uninstall()
-    cmp._uninstall_cancel_watcher()
-    cmp._clear_preview_state(bpy.context.scene)
+    if cmp_mod.WallConnectionPreviewDecorator.is_installed:
+        cmp_mod.WallConnectionPreviewDecorator.uninstall()
+    cmp_mod._uninstall_cancel_watcher()
+    cmp_mod._clear_preview_state(bpy.context.scene)
 
 
-# --- _is_unsafe_extend math --------------------------------------------------
-
-
-class TestUnsafeExtendMath:
-    def test_trim_case_is_always_safe(self):
-        """Intersection inside the original segment = trim; bounded delta,
-        never unsafe regardless of the multiplier."""
-        p0, p1 = Vector((0, 0, 0)), Vector((10, 0, 0))
-        intersection = Vector((3, 0, 0))
-        assert not cmp._is_unsafe_extend(p0, p1, intersection, max_ratio=2.0)
-
-    def test_extend_within_ratio_is_safe(self):
-        """A 2× extension under a 10× threshold stays safe."""
-        p0, p1 = Vector((0, 0, 0)), Vector((10, 0, 0))
-        intersection = Vector((-15, 0, 0))  # 15 units past near=0,0,0; original=10
-        assert not cmp._is_unsafe_extend(p0, p1, intersection, max_ratio=10.0)
-
-    def test_extend_beyond_ratio_is_unsafe(self):
-        """An extension > max_ratio × original length flags as unsafe."""
-        p0, p1 = Vector((0, 0, 0)), Vector((1, 0, 0))  # 1m wall
-        intersection = Vector((-50, 0, 0))  # 50× extension
-        assert cmp._is_unsafe_extend(p0, p1, intersection, max_ratio=10.0)
-
-    def test_degenerate_segment_is_unsafe(self):
-        """Zero-length input is treated as unsafe — refuses to recalc rather
-        than risk dividing by zero downstream."""
-        p0 = p1 = Vector((0, 0, 0))
-        intersection = Vector((1, 0, 0))
-        assert cmp._is_unsafe_extend(p0, p1, intersection, max_ratio=10.0)
+# Pure math tests (is_unsafe_extend, classify_axis_delta, nearest_axis_endpoint)
+# live in test/core/test_model.py — they no longer depend on Blender.
 
 
 # --- PREVIEW_CANCEL_OPS registry contract ------------------------------------
@@ -131,22 +104,21 @@ class TestPreviewCancelOpsContract:
         Sits in TestPreviewCancelOpsContract because the contract being
         pinned is the same shape: a registry-level invariant that has to
         hold any time the addon is sitting idle."""
-        assert not cmp.WallConnectionPreviewDecorator.is_installed
-        assert cmp._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
+        assert not cmp_mod.WallConnectionPreviewDecorator.is_installed
+        assert cmp_mod._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         assert cm.is_active is False
         assert cm.has_seen_movement is False
         assert len(cm.moved_wall_ifc_ids) == 0
-        assert cmp._cancel_cleanup_scheduled is False
+        assert cmp_mod._cancel_cleanup_scheduled is False
 
-    def test_load_post_and_undo_post_handlers_registered(self):
-        """Pin: the three persistent handlers are wired into Blender's
+    def test_undo_post_handlers_registered(self):
+        """Pin: the two persistent handlers are wired into Blender's
         handler lists. A register/unregister symmetry break — or a
         partial hot-reload — would silently disable cancel detection on
-        Ctrl+Z and per-session unsafe-pair memory clearing."""
-        assert cmp._clear_unsafe_pair_memory in bpy.app.handlers.load_post
-        assert cmp._discard_on_undo_redo in bpy.app.handlers.undo_post
-        assert cmp._discard_on_undo_redo in bpy.app.handlers.redo_post
+        Ctrl+Z."""
+        assert cmp_mod._discard_on_undo_redo in bpy.app.handlers.undo_post
+        assert cmp_mod._discard_on_undo_redo in bpy.app.handlers.redo_post
 
     def test_connected_move_child_exists_on_preview_umbrella(self):
         """``Scene.BIMPreviewProperties.connected_move`` must be a populated
@@ -217,13 +189,13 @@ class TestLifecycle:
         with ExitStack() as stack:
             for p in _patched_tools(entity_map):
                 stack.enter_context(p)
-            stack.enter_context(patch.object(cmp, "sync_uncommitted_moves", side_effect=lambda objs: None))
+            stack.enter_context(patch.object(cmp_mod, "sync_uncommitted_moves", side_effect=lambda objs: None))
             bpy.ops.bim.pre_connected_move_preview()
 
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         assert cm.is_active is True
-        assert cmp.WallConnectionPreviewDecorator.is_installed
-        assert cmp._watch_for_preview_cancel in bpy.app.handlers.depsgraph_update_post
+        assert cmp_mod.WallConnectionPreviewDecorator.is_installed
+        assert cmp_mod._watch_for_preview_cancel in bpy.app.handlers.depsgraph_update_post
 
     def test_cancel_op_tears_down_everything(self, two_connected_walls):
         a_obj, b_obj, a_el, b_el = two_connected_walls
@@ -236,15 +208,15 @@ class TestLifecycle:
         with ExitStack() as stack:
             for p in _patched_tools(entity_map):
                 stack.enter_context(p)
-            stack.enter_context(patch.object(cmp, "sync_uncommitted_moves", side_effect=lambda objs: None))
+            stack.enter_context(patch.object(cmp_mod, "sync_uncommitted_moves", side_effect=lambda objs: None))
             bpy.ops.bim.pre_connected_move_preview()
         bpy.ops.bim.cancel_connected_move_preview()
 
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         assert cm.is_active is False
         assert len(cm.moved_wall_ifc_ids) == 0
-        assert not cmp.WallConnectionPreviewDecorator.is_installed
-        assert cmp._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
+        assert not cmp_mod.WallConnectionPreviewDecorator.is_installed
+        assert cmp_mod._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
 
     def test_watcher_first_moved_tick_flips_has_seen_movement(self, two_connected_walls):
         """Pin: on the first depsgraph tick where any tracked wall reports
@@ -267,7 +239,7 @@ class TestLifecycle:
             stack.enter_context(patch.object(_tool.Ifc, "get_object", return_value=a_obj))
             stack.enter_context(patch.object(_tool.Ifc, "is_moved", return_value=True))
 
-            cmp._watch_for_preview_cancel(bpy.context.scene, None)
+            cmp_mod._watch_for_preview_cancel(bpy.context.scene, None)
 
         assert cm.has_seen_movement is True
 
@@ -286,7 +258,7 @@ class TestLifecycle:
 
         from bonsai import tool as _tool
 
-        cmp._cancel_cleanup_scheduled = False
+        cmp_mod._cancel_cleanup_scheduled = False
         registered: list = []
         with ExitStack() as stack:
             ifc_stub = SimpleNamespace(by_id=lambda i: a_el if i == a_el.id() else None)
@@ -297,13 +269,13 @@ class TestLifecycle:
                 patch.object(bpy.app.timers, "register", side_effect=lambda fn, **kw: registered.append(fn))
             )
 
-            cmp._watch_for_preview_cancel(bpy.context.scene, None)
+            cmp_mod._watch_for_preview_cancel(bpy.context.scene, None)
             assert len(registered) == 1, "First baseline tick must schedule cleanup"
 
-            cmp._watch_for_preview_cancel(bpy.context.scene, None)
+            cmp_mod._watch_for_preview_cancel(bpy.context.scene, None)
             assert len(registered) == 1, "Second baseline tick must NOT stack a duplicate cleanup"
 
-        cmp._cancel_cleanup_scheduled = False
+        cmp_mod._cancel_cleanup_scheduled = False
 
     def test_watcher_self_uninstalls_when_inactive(self):
         """Pin: the watcher removes itself from ``depsgraph_update_post``
@@ -311,70 +283,11 @@ class TestLifecycle:
         against stale handler registrations after a missed teardown."""
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         cm.is_active = False
-        bpy.app.handlers.depsgraph_update_post.append(cmp._watch_for_preview_cancel)
+        bpy.app.handlers.depsgraph_update_post.append(cmp_mod._watch_for_preview_cancel)
 
-        cmp._watch_for_preview_cancel(bpy.context.scene, None)
+        cmp_mod._watch_for_preview_cancel(bpy.context.scene, None)
 
-        assert cmp._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
-
-    def test_unsafe_pair_warns_once_then_lets_recalc_proceed(self, two_connected_walls):
-        """Pin: the unsafe-pair gate blocks the recalc the FIRST time a pair
-        is flagged, then lets subsequent drags of the same pair proceed
-        silently.
-
-        The earlier bug-shape was ``if unsafe_pair: report + return`` with no
-        per-pair memory, so every retry of the same near-parallel
-        configuration fired the warning and skipped the recalc — locking
-        the user out of progress past a flagged configuration. The
-        regression guard here calls ``execute()`` twice with a forced
-        unsafe-pair detection and asserts the second call schedules a
-        timer (the recalc dispatch)."""
-        a_obj, b_obj, a_el, b_el = two_connected_walls
-
-        # Pre-populate preview state as if PreConnectedMovePreview just ran.
-        cm = bpy.context.scene.BIMPreviewProperties.connected_move
-        cm.is_active = True
-        item = cm.moved_wall_ifc_ids.add()
-        item.value = a_el.id()
-
-        cmp._warned_unsafe_pairs.clear()
-        fake_pair = (a_obj.name, b_obj.name, frozenset({a_el.id(), b_el.id()}))
-        from contextlib import ExitStack
-
-        with ExitStack() as stack:
-            from bonsai import tool as _tool
-
-            ifc_stub = SimpleNamespace(by_id=lambda i: a_el if i == a_el.id() else b_el)
-            stack.enter_context(patch.object(_tool.Ifc, "get", return_value=ifc_stub))
-            stack.enter_context(
-                patch.object(_tool.Ifc, "get_entity", side_effect=lambda obj: a_el if obj is a_obj else b_el)
-            )
-            stack.enter_context(
-                patch.object(_tool.Ifc, "get_object", side_effect=lambda e: a_obj if e is a_el else b_obj)
-            )
-            stack.enter_context(patch.object(_tool.Ifc, "is_moved", return_value=True))
-            stack.enter_context(
-                patch.object(cmp.PostConnectedMoveFinalize, "_has_body_representation", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(cmp.PostConnectedMoveFinalize, "_first_unsafe_pair", return_value=fake_pair)
-            )
-            registered: list = []
-            stack.enter_context(
-                patch.object(bpy.app.timers, "register", side_effect=lambda fn, **kw: registered.append(fn))
-            )
-
-            # First call: pair is unflagged → warning + blocked recalc.
-            bpy.ops.bim.post_connected_move_finalize()
-            assert fake_pair[2] in cmp._warned_unsafe_pairs
-            assert not registered, "First unsafe-pair detection must NOT schedule recalc"
-
-            # Second call against the same pair: warning suppressed, recalc proceeds.
-            cm.is_active = True
-            item2 = cm.moved_wall_ifc_ids.add()
-            item2.value = a_el.id()
-            bpy.ops.bim.post_connected_move_finalize()
-            assert registered, "Second unsafe-pair detection MUST schedule recalc"
+        assert cmp_mod._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
 
     def test_pre_step_bails_on_multi_wall_selection(self, two_connected_walls):
         """PoC scope-gate: when more than one IFC wall with connections is
@@ -391,13 +304,13 @@ class TestLifecycle:
         with ExitStack() as stack:
             for p in _patched_tools(entity_map):
                 stack.enter_context(p)
-            stack.enter_context(patch.object(cmp, "sync_uncommitted_moves", side_effect=lambda objs: None))
+            stack.enter_context(patch.object(cmp_mod, "sync_uncommitted_moves", side_effect=lambda objs: None))
             bpy.ops.bim.pre_connected_move_preview()
 
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         assert cm.is_active is False
-        assert not cmp.WallConnectionPreviewDecorator.is_installed
-        assert cmp._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
+        assert not cmp_mod.WallConnectionPreviewDecorator.is_installed
+        assert cmp_mod._watch_for_preview_cancel not in bpy.app.handlers.depsgraph_update_post
 
     def test_pre_step_bails_when_addon_pref_disabled(self, two_connected_walls):
         """The global toggle short-circuits ``execute`` before any state
@@ -417,4 +330,4 @@ class TestLifecycle:
 
         cm = bpy.context.scene.BIMPreviewProperties.connected_move
         assert cm.is_active is False
-        assert not cmp.WallConnectionPreviewDecorator.is_installed
+        assert not cmp_mod.WallConnectionPreviewDecorator.is_installed

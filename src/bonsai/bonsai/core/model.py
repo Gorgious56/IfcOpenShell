@@ -317,6 +317,79 @@ def wall_join_preview_lines(
     ]
 
 
+def _near_far_t(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    intersection: tuple[float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], Optional[float]]:
+    """``(near, far, t)`` where ``t`` is the parametric position of
+    ``intersection`` along the segment from ``near`` to ``far``.
+
+    ``t in (0, 1)`` ⇒ intersection sits inside the segment (TRIM case);
+    otherwise it sits outside (EXTEND case). ``t is None`` ⇒ degenerate
+    zero-length segment."""
+    diff_0 = _vec_sub(p0, intersection)
+    diff_1 = _vec_sub(p1, intersection)
+    d0_sq = _vec_dot(diff_0, diff_0)
+    d1_sq = _vec_dot(diff_1, diff_1)
+    near, far = (p0, p1) if d0_sq <= d1_sq else (p1, p0)
+    inside = _vec_sub(far, near)
+    denom = _vec_dot(inside, inside)
+    if denom < 1e-9:
+        return near, far, None
+    t = _vec_dot(inside, _vec_sub(intersection, near)) / denom
+    return near, far, t
+
+
+def nearest_axis_endpoint(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    intersection: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Whichever of ``p0`` / ``p1`` is closer to ``intersection``."""
+    near, _, _ = _near_far_t(p0, p1, intersection)
+    return near
+
+
+def classify_axis_delta(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    intersection: tuple[float, float, float],
+) -> Optional[Literal["trim", "extend"]]:
+    """``"trim"`` when the intersection sits inside the (``p0``, ``p1``)
+    axis, ``"extend"`` when it sits past the nearest endpoint, ``None`` for
+    a degenerate zero-length segment."""
+    _, _, t = _near_far_t(p0, p1, intersection)
+    if t is None:
+        return None
+    return "trim" if 0.0 < t < 1.0 else "extend"
+
+
+def is_unsafe_extend(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    intersection: tuple[float, float, float],
+    max_ratio: float,
+) -> bool:
+    """True when extending the (``p0``→``p1``) axis to meet ``intersection``
+    would build a wall absurdly longer than the original.
+
+    Returns ``False`` for TRIM (intersection inside the original axis):
+    bounded by the segment length, always physically reasonable. Degenerate
+    zero-length inputs return ``True`` (treat as unsafe rather than divide
+    by zero downstream)."""
+    near, far, t = _near_far_t(p0, p1, intersection)
+    if t is None:
+        return True
+    if 0.0 < t < 1.0:
+        return False
+    inside = _vec_sub(far, near)
+    delta = _vec_sub(intersection, near)
+    original_len_sq = _vec_dot(inside, inside)
+    delta_len_sq = _vec_dot(delta, delta)
+    return delta_len_sq > (max_ratio**2) * original_len_sq
+
+
 def resolve_extend_walls_target(
     target_obj: Any,
     objs: list[Any],

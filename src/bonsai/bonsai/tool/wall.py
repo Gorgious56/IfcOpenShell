@@ -243,6 +243,29 @@ class Wall(bonsai.core.tool.Wall):
         return obj.matrix_world @ local_p1, obj.matrix_world @ local_p2
 
     @classmethod
+    def iter_path_connections(
+        cls,
+        element: ifcopenshell.entity_instance,
+    ):
+        """Yield ``(neighbour, this_conn_type, neighbour_conn_type)`` for each
+        ``IfcRelConnectsPathElements`` relation ``element`` participates in.
+
+        Direction-folded: whether ``element`` is the relating or related
+        side of the relation, the tuple is always
+        ``(neighbour_on_the_other_side, conn_type_of_element_side, conn_type_of_neighbour_side)``.
+        Callers don't have to special-case ConnectedTo vs ConnectedFrom."""
+        for rel in getattr(element, "ConnectedTo", None) or ():
+            if rel.is_a("IfcRelConnectsPathElements"):
+                yield rel.RelatedElement, getattr(rel, "RelatingConnectionType", None), getattr(
+                    rel, "RelatedConnectionType", None
+                )
+        for rel in getattr(element, "ConnectedFrom", None) or ():
+            if rel.is_a("IfcRelConnectsPathElements"):
+                yield rel.RelatingElement, getattr(rel, "RelatedConnectionType", None), getattr(
+                    rel, "RelatingConnectionType", None
+                )
+
+    @classmethod
     def walk_connected_walls(
         cls,
         start_element: ifcopenshell.entity_instance,
