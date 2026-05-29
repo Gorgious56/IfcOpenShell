@@ -2918,6 +2918,11 @@ class Model(bonsai.core.tool.Model):
                 if material.is_a("IfcMaterialLayerSetUsage") and custom_offset is not None:
                     material.OffsetFromReferenceLine = custom_offset
             cls.recreate_wall(element, wall)
+            # Flush Blender's depsgraph + UI caches between mesh swaps. Without
+            # this, the outliner's TreeElementIDObject tree can hold a stale
+            # pointer chain to the previous iteration's freed mesh and crash
+            # the next viewport redraw with a null-deref in expand().
+            bpy.context.view_layer.update()
 
     @classmethod
     def regenerate_slab(cls, obj: bpy.types.Object) -> None:

@@ -26,6 +26,7 @@ import bonsai.tool as tool
 
 from . import (
     array,
+    connected_move_preview,
     covering,
     door,
     external,
@@ -234,6 +235,12 @@ classes = (
     mep.MEPAddTransition,
     mep.MEPAddBend,
     external.ApplyExternalParametricGeometry,
+    connected_move_preview.BIMConnectedMovePreviewWallId,
+    connected_move_preview.BIMConnectedMovePreviewProperties,
+    connected_move_preview.BIMPreviewProperties,
+    connected_move_preview.PreConnectedMovePreview,
+    connected_move_preview.PostConnectedMoveFinalize,
+    connected_move_preview.CancelConnectedMovePreview,
 )
 
 addon_keymaps = []
@@ -283,6 +290,7 @@ def register():
 
     bpy.types.Scene.BIMModelProperties = bpy.props.PointerProperty(type=prop.BIMModelProperties)
     bpy.types.Scene.BIMPolylineProperties = bpy.props.PointerProperty(type=prop.BIMPolylineProperties)
+    bpy.types.Scene.BIMPreviewProperties = bpy.props.PointerProperty(type=connected_move_preview.BIMPreviewProperties)
     bpy.types.Object.BIMArrayProperties = bpy.props.PointerProperty(type=prop.BIMArrayProperties)
     bpy.types.Object.BIMSverchokProperties = bpy.props.PointerProperty(type=prop.BIMSverchokProperties)
     # Per-parametric-type ``BIM<Name>Properties`` PointerProperties — driven by
@@ -294,6 +302,9 @@ def register():
 
     bpy.types.VIEW3D_MT_add.prepend(ui.add_menu)
     bpy.app.handlers.load_post.append(handler.load_post)
+    bpy.app.handlers.load_post.append(connected_move_preview._clear_unsafe_pair_memory)
+    bpy.app.handlers.undo_post.append(connected_move_preview._discard_on_undo_redo)
+    bpy.app.handlers.redo_post.append(connected_move_preview._discard_on_undo_redo)
 
     workspace.load_custom_icons()
 
@@ -303,14 +314,28 @@ def unregister():
         for tool_data in reversed(tools):
             bpy.utils.unregister_tool(tool_data.tool)
 
+    if connected_move_preview.WallConnectionPreviewDecorator.is_installed:
+        connected_move_preview.WallConnectionPreviewDecorator.uninstall()
+    connected_move_preview._uninstall_cancel_watcher()
+
     del bpy.types.Scene.BIMModelProperties
     del bpy.types.Scene.BIMPolylineProperties
+    del bpy.types.Scene.BIMPreviewProperties
     del bpy.types.Object.BIMArrayProperties
     del bpy.types.Object.BIMSverchokProperties
     tool.Parametric.unregister_object_properties()
     del bpy.types.Object.BIMExternalParametricGeometryProperties
 
     bpy.app.handlers.load_post.remove(handler.load_post)
+    for handler_list, fn in (
+        (bpy.app.handlers.load_post, connected_move_preview._clear_unsafe_pair_memory),
+        (bpy.app.handlers.undo_post, connected_move_preview._discard_on_undo_redo),
+        (bpy.app.handlers.redo_post, connected_move_preview._discard_on_undo_redo),
+    ):
+        try:
+            handler_list.remove(fn)
+        except ValueError:
+            pass
     bpy.types.VIEW3D_MT_add.remove(ui.add_menu)
 
     workspace.unload_custom_icons()

@@ -1288,9 +1288,7 @@ class OverrideDuplicateMove(bpy.types.Operator):
                                 all_objects_to_select.add(part_obj)
 
         # Non-IFC duplicates aren't tracked in old_to_new but are left selected by duplicate_ifc_objects
-        all_objects_to_select.update(
-            obj for obj in context.selected_objects if not tool.Ifc.get_entity(obj)
-        )
+        all_objects_to_select.update(obj for obj in context.selected_objects if not tool.Ifc.get_entity(obj))
 
         # Deselect everything first
         bpy.ops.object.select_all(action="DESELECT")
@@ -4005,6 +4003,13 @@ class OverrideMoveMacro(bpy.types.Macro):
     bl_idname = "bim.override_move_macro"
     bl_label = "IFC Move Aggregate"
     bl_description = "Move selected items.\n\nAutomatically select all parts of an aggregate/nesting to move."
+    bl_options = {"REGISTER", "UNDO"}
+
+
+class OverrideRotateMacro(bpy.types.Macro):
+    bl_idname = "bim.override_rotate_macro"
+    bl_label = "IFC Rotate Aggregate"
+    bl_description = "Rotate selected items.\n\nAutomatically select all parts of an aggregate/nesting to rotate."
     bl_options = {"REGISTER", "UNDO"}
 
 

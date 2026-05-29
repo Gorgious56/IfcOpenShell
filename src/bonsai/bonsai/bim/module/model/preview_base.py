@@ -153,6 +153,7 @@ def sync_uncommitted_moves(objects: list) -> None:
 PREVIEW_CANCEL_OPS: tuple[tuple[str, str], ...] = (
     ("bend", "cancel_bend_preview"),
     ("wall_fillet", "cancel_wall_fillet_preview"),
+    ("connected_move", "cancel_connected_move_preview"),
 )
 """Registry of ``(child PointerProperty on Scene.BIMPreviewProperties, bim
 operator name)`` consulted by the Esc handler. Adding a new preview means

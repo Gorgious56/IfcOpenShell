@@ -655,6 +655,16 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
             "If enabled, snapping will be enabled on new sessions.\n" "It is recommended to keep this `Enabled`"
         ),
     )
+    should_use_connected_move_preview: BoolProperty(
+        name="Live Preview for Connected-Wall Moves & Rotations",
+        default=True,
+        description=(
+            "When moving (G) or rotating (R) a wall that participates in IFC "
+            "path connections, render a ghost of how the connections would "
+            "re-join and auto-run Update Geometry on drop. Disable to fall "
+            "back to plain Blender transforms with manual Update Geometry."
+        ),
+    )
     should_play_chaching_sound: BoolProperty(name="Play A Cha-Ching Sound When Project Costs Updates", default=False)
     tmp_dir: StringProperty(
         name="Temporary Directory",
@@ -978,6 +988,7 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
         layout.prop(self, "occurrence_name_style")
         if self.occurrence_name_style == "CUSTOM":
             layout.prop(self, "occurrence_name_function")
+        layout.prop(self, "should_use_connected_move_preview")
         bonsai.bim.helper.draw_expandable_panel(
             layout,
             context,
