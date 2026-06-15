@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
 
+# This file was modified with the assistance of an AI coding tool.
+
 from __future__ import annotations
 
 import json
@@ -123,9 +125,7 @@ class Spatial(bonsai.core.tool.Spatial):
                 "IfcExternalSpatialStructureElement"
             ):
                 return False
-        if not hasattr(element, "ContainedInStructure"):
-            return False
-        return True
+        return element.is_a("IfcProduct")
 
     @classmethod
     def can_reference(
@@ -139,9 +139,7 @@ class Spatial(bonsai.core.tool.Spatial):
         else:
             if not structure.is_a("IfcSpatialElement"):
                 return False
-        if not hasattr(element, "ReferencedInStructures"):
-            return False
-        return True
+        return element.is_a("IfcProduct")
 
     @classmethod
     def disable_editing(cls, obj: bpy.types.Object) -> None:

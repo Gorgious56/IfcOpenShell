@@ -16,6 +16,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with IfcOpenShell.  If not, see <http://www.gnu.org/licenses/>.
 
+# This file was modified with the assistance of an AI coding tool.
+
+import ifcopenshell.api.grid
 import ifcopenshell.api.root
 import ifcopenshell.api.spatial
 import ifcopenshell.util.element
@@ -31,6 +34,19 @@ class TestReferenceStructure(test.bootstrap.IFC4):
             self.file, products=[subelement, subelement2], relating_structure=element
         )
         assert ifcopenshell.util.element.get_structure_referenced_elements(element) == {subelement, subelement2}
+
+    def test_skipping_non_product_inputs(self):
+        """RelatedElements is SET OF IfcProduct in every IFC schema, so any
+        non-product entry in the input must be dropped instead of being
+        written into a schema-invalid relationship."""
+        structure = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuilding")
+        wall = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcWall")
+        grid = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcGrid")
+        axis = ifcopenshell.api.grid.create_grid_axis(self.file, grid=grid, axis_tag="A", uvw_axes="UAxes")
+        ifcopenshell.api.spatial.reference_structure(
+            self.file, products=[wall, axis], relating_structure=structure
+        )
+        assert ifcopenshell.util.element.get_structure_referenced_elements(structure) == {wall}
 
     def test_doing_nothing_if_the_structure_is_already_referenced(self):
         element = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuilding")

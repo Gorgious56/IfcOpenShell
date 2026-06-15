@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with IfcOpenShell.  If not, see <http://www.gnu.org/licenses/>.
 
+# This file was modified with the assistance of an AI coding tool.
+
 from typing import Union
 
 import ifcopenshell
@@ -105,7 +107,11 @@ def assign_container(
     if not products:
         return
 
-    products_set = set(products)
+    # ContainedInStructure is only declared on IfcProduct; reject non-products
+    # to keep the read loop below safe regardless of caller hygiene.
+    products_set = {p for p in set(products) if p.is_a("IfcProduct")}
+    if not products_set:
+        return
     structure_rel = next(iter(relating_structure.ContainsElements), None)
 
     previous_containers_rels: set[ifcopenshell.entity_instance] = set()

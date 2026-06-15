@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with IfcOpenShell.  If not, see <http://www.gnu.org/licenses/>.
 
+# This file was modified with the assistance of an AI coding tool.
+
 from typing import Union
 
 import ifcopenshell
@@ -90,7 +92,9 @@ def reference_structure(
     """
 
     structure = relating_structure
-    products_set = set(products)
+    # RelatedElements is typed SET OF IfcProduct in the schema; drop anything
+    # else so a mixed selection cannot push an out-of-type instance into IFC.
+    products_set = {p for p in set(products) if p.is_a("IfcProduct")}
 
     if not products_set:
         return
