@@ -92,9 +92,20 @@ def reference_structure(
     """
 
     structure = relating_structure
-    # RelatedElements is typed SET OF IfcProduct in the schema; drop anything
-    # else so a mixed selection cannot push an out-of-type instance into IFC.
-    products_set = {p for p in set(products) if p.is_a("IfcProduct")}
+
+    # RelatedElements is typed SET OF IfcProduct in the IFC schema; refuse
+    # mixed-type batches at the boundary so caller bugs surface clearly
+    # instead of crashing later with an opaque AttributeError.
+    non_products = [p for p in products if not p.is_a("IfcProduct")]
+    if non_products:
+        examples = ", ".join(f"#{p.id()} {p.is_a()}" for p in non_products[:5])
+        raise TypeError(
+            f"reference_structure requires IfcProduct (schema: RelatedElements "
+            f"is SET OF IfcProduct), got {len(non_products)} non-product "
+            f"input(s): {examples}"
+        )
+
+    products_set = set(products)
 
     if not products_set:
         return

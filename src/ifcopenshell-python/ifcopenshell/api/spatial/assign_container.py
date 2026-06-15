@@ -107,11 +107,19 @@ def assign_container(
     if not products:
         return
 
-    # ContainedInStructure is only declared on IfcProduct; reject non-products
-    # to keep the read loop below safe regardless of caller hygiene.
-    products_set = {p for p in set(products) if p.is_a("IfcProduct")}
-    if not products_set:
-        return
+    # RelatedElements is typed SET OF IfcProduct in the IFC schema; refuse
+    # mixed-type batches at the boundary so caller bugs surface clearly
+    # instead of crashing later in the read loop with an opaque AttributeError.
+    non_products = [p for p in products if not p.is_a("IfcProduct")]
+    if non_products:
+        examples = ", ".join(f"#{p.id()} {p.is_a()}" for p in non_products[:5])
+        raise TypeError(
+            f"assign_container requires IfcProduct (schema: RelatedElements "
+            f"is SET OF IfcProduct), got {len(non_products)} non-product "
+            f"input(s): {examples}"
+        )
+
+    products_set = set(products)
     structure_rel = next(iter(relating_structure.ContainsElements), None)
 
     previous_containers_rels: set[ifcopenshell.entity_instance] = set()

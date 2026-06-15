@@ -18,7 +18,8 @@
 
 # This file was modified with the assistance of an AI coding tool.
 
-import ifcopenshell.api.grid
+import pytest
+
 import ifcopenshell.api.root
 import ifcopenshell.api.spatial
 import ifcopenshell.util.element
@@ -35,18 +36,19 @@ class TestReferenceStructure(test.bootstrap.IFC4):
         )
         assert ifcopenshell.util.element.get_structure_referenced_elements(element) == {subelement, subelement2}
 
-    def test_skipping_non_product_inputs(self):
-        """RelatedElements is SET OF IfcProduct in every IFC schema, so any
-        non-product entry in the input must be dropped instead of being
-        written into a schema-invalid relationship."""
+    def test_rejects_non_product_inputs(self):
+        """RelatedElements is SET OF IfcProduct in every IFC schema; the API
+        refuses any non-product input loudly so caller bugs surface with a
+        clear typed error. Atomic: nothing is referenced even when only one
+        input is bad."""
         structure = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuilding")
         wall = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcWall")
-        grid = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcGrid")
-        axis = ifcopenshell.api.grid.create_grid_axis(self.file, grid=grid, axis_tag="A", uvw_axes="UAxes")
-        ifcopenshell.api.spatial.reference_structure(
-            self.file, products=[wall, axis], relating_structure=structure
-        )
-        assert ifcopenshell.util.element.get_structure_referenced_elements(structure) == {wall}
+        beam_type = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBeamType")
+        with pytest.raises(TypeError, match="IfcProduct"):
+            ifcopenshell.api.spatial.reference_structure(
+                self.file, products=[wall, beam_type], relating_structure=structure
+            )
+        assert ifcopenshell.util.element.get_structure_referenced_elements(structure) == set()
 
     def test_doing_nothing_if_the_structure_is_already_referenced(self):
         element = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuilding")

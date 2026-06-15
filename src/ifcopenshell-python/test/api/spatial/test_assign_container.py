@@ -23,7 +23,6 @@ import pytest
 
 import ifcopenshell.api.aggregate
 import ifcopenshell.api.geometry
-import ifcopenshell.api.grid
 import ifcopenshell.api.root
 import ifcopenshell.api.spatial
 import ifcopenshell.api.unit
@@ -44,28 +43,19 @@ class TestAssignContainer(test.bootstrap.IFC4):
         assert ifcopenshell.util.element.get_container(subelement2) == element
         assert rel.is_a("IfcRelContainedInSpatialStructure")
 
-    def test_skipping_non_product_inputs(self):
-        """RelatedElements is SET OF IfcProduct in every IFC schema, so any
-        non-product entry in the input must be dropped instead of crashing
-        the read loop or being written into a schema-invalid relationship."""
+    def test_rejects_non_product_inputs(self):
+        """RelatedElements is SET OF IfcProduct in every IFC schema; the API
+        refuses any non-product input loudly so caller bugs surface with a
+        clear typed error instead of an opaque AttributeError later in the
+        read loop. Atomic: nothing is written even when only one input is bad."""
         structure = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuildingStorey")
         wall = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcWall")
-        grid = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcGrid")
-        axis = ifcopenshell.api.grid.create_grid_axis(self.file, grid=grid, axis_tag="A", uvw_axes="UAxes")
-        rel = ifcopenshell.api.spatial.assign_container(
-            self.file, products=[wall, axis], relating_structure=structure
-        )
-        assert ifcopenshell.util.element.get_container(wall) == structure
-        assert rel.is_a("IfcRelContainedInSpatialStructure")
-        assert set(rel.RelatedElements) == {wall}
-
-    def test_all_non_product_inputs_short_circuits(self):
-        structure = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuildingStorey")
-        grid = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcGrid")
-        axis = ifcopenshell.api.grid.create_grid_axis(self.file, grid=grid, axis_tag="A", uvw_axes="UAxes")
-        assert ifcopenshell.api.spatial.assign_container(
-            self.file, products=[axis], relating_structure=structure
-        ) is None
+        beam_type = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBeamType")
+        with pytest.raises(TypeError, match="IfcProduct"):
+            ifcopenshell.api.spatial.assign_container(
+                self.file, products=[wall, beam_type], relating_structure=structure
+            )
+        assert ifcopenshell.util.element.get_container(wall) is None
 
     def test_doing_nothing_if_the_container_is_already_assigned(self):
         element = ifcopenshell.api.root.create_entity(self.file, ifc_class="IfcBuilding")
